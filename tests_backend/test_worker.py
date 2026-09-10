@@ -215,6 +215,22 @@ class WorkerTests(unittest.TestCase):
         _, config = worker._cube(90)
         self.assertNotIn("proxy_port", config)
 
+    def test_resource_profile_selects_template_and_missing_profile_fails_closed(self) -> None:
+        worker = CubeWorker(replace(self.config, cube_templates={"small": "tpl-small", "large": "tpl-large"}), Api(None), Sandbox)
+        self.assertEqual(worker._cube(90, "small")[1]["template_id"], "tpl-small")
+        self.assertEqual(worker._cube(90, "large")[1]["template_id"], "tpl-large")
+        with self.assertRaisesRegex(WorkerError, "differently sized fallback"):
+            worker._cube(90, "standard")
+
+    def test_misconfigured_template_is_killed_before_codex(self) -> None:
+        from backend.resources import PROFILES
+        api = Api({"id": "sizing-mismatch", "resource_plan": {"profile": "small", **PROFILES["small"]}})
+        CubeWorker(replace(self.config, cube_templates={"small": "wrong-template"}), api, Sandbox).run_once()
+        instance = Sandbox.created[0][0]
+        self.assertGreater(instance.killed, 0)
+        self.assertEqual(instance.commands.runs, [])
+        self.assertIn("does not match", api.finished[0]["report"])
+
     def test_input_path_preserves_archive_suffix_without_traversal(self) -> None:
         self.assertEqual(_input_path("a/b", "../../data.tar.gz"), "inputs/a_b.tar.gz")
 
@@ -227,6 +243,18 @@ class WorkerTests(unittest.TestCase):
         CubeWorker._write_tree(type("Sandbox", (), {"files": files})(), self.config.runtime_dir, "/workspace")
         self.assertIn("/workspace/MAIN_PROMPT.md", files.values)
         self.assertFalse(any("pycache" in path or path.endswith(".pyc") for path in files.values))
+
+    def test_runtime_transfer_includes_real_hidden_skills_and_role_assets(self) -> None:
+        runtime = Path(__file__).parents[1] / "sandbox/runtime"
+        files = ExistingRootFiles()
+        CubeWorker._write_tree(type("Sandbox", (), {"files": files})(), runtime, "/workspace")
+        for relative in (".agents/skills/robot-analysis-context/SKILL.md",
+                         ".agents/skills/robot-evidence/SKILL.md",
+                         ".agents/skills/pdf-evidence/SKILL.md",
+                         ".codex/agents/log-investigator.toml",
+                         ".codex/agents/evidence-reviewer.toml",
+                         "MAIN_PROMPT.md", "ENVIRONMENT.md", "evidence.py"):
+            self.assertEqual(files.values[f"/workspace/{relative}"], (runtime / relative).read_bytes())
 
     def test_safe_report_keeps_markdown_line_breaks(self) -> None:
         from backend.worker import _safe_text

@@ -1,6 +1,7 @@
 name = "evidence_reviewer"
 description = "Review robot incident hypotheses against recovery, normal activity and supporting PDF/image/wiki evidence."
 developer_instructions = """
+Use /workspace/.agents/skills/robot-analysis-context/SKILL.md for assigned job resources, installed tools and wiki applicability.
 Use /workspace/.agents/skills/robot-evidence/SKILL.md for original logs/wiki; use /workspace/.agents/skills/pdf-evidence/SKILL.md when PDFs, diagrams or images matter.
 Check the main agent's proposed interpretation against exact sources and counterevidence. Missing evidence is not evidence of failure.
 Separate observation, hypothesis, and unverified claims. Flag unsupported cross-node/time/model correlations.

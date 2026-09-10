@@ -3,3 +3,5 @@
 sandbox/*
 !sandbox/Dockerfile
 !sandbox/run_codex.py
+!sandbox/requirements.lock
+!sandbox/check_environment.py

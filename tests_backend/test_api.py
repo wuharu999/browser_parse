@@ -70,6 +70,21 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(budget["active_reservations_usd"], 10)
         self.assertEqual(budget["running"], 2)
 
+    def test_budget_exposes_pending_slots_and_shanghai_reset(self):
+        initial = self.client.get("/api/budget").json()
+        self.assertEqual((initial["pending"], initial["queued"]), (0, 0))
+        self.assertTrue(initial["resets_at"].endswith("T00:00:00+08:00"))
+        self.assertGreater(initial["resets_at"][:10], initial["day"])
+        made = self.job()
+        draft = self.client.get("/api/budget").json()
+        self.assertEqual((draft["pending"], draft["queued"]), (1, 0))
+        self.submit(made)
+        queued = self.client.get("/api/budget").json()
+        self.assertEqual((queued["pending"], queued["queued"]), (1, 1))
+        self.claim_worker()
+        running = self.client.get("/api/budget").json()
+        self.assertEqual((running["pending"], running["queued"], running["running"]), (0, 0, 1))
+
     def test_public_cancel_and_worker_sees_it(self):
         jid = self.submit(self.job())
         running = self.claim_worker(); self.assertEqual(running["id"], jid)

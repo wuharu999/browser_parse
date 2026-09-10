@@ -16,6 +16,15 @@ Robot Log Workbench uses the following direct open-source dependencies. Exact in
 
 The candidate sandbox image also installs OpenAI Codex CLI (Apache-2.0), Node.js (MIT and bundled component notices), Python (PSF license), and Poppler utilities (GPL-family component licenses). Preserve image/package license notices and check redistribution obligations before distributing a built template. The supplied wiki and user uploads are private data, not licensed project dependencies, and are excluded from Git.
 
+The prepared image additionally uses uv, Tesseract and English/Chinese language
+data, jq, SQLite, compression utilities, and the Python packages listed in
+`sandbox/requirements.in` (numpy, pandas, matplotlib, Pillow, pypdf, PyYAML,
+h5py, mcap, mcap-ros2-support, rosbags, lz4 and zstandard). Exact Python versions,
+transitive resolutions and wheel hashes are in `sandbox/requirements.lock`.
+Their upstream license files remain in installed distributions; retain those
+and the OS package notices when distributing an image. These are sandbox
+dependencies, not packages added to the browser bundle or host Python runtime.
+
 Dependencies are installed through npm, not vendored into this repository. Their license files are distributed with the packages. Preserve applicable upstream notices when distributing dependencies or generated bundles.
 
-This notice documents third-party components only; it does not assign an open-source license to this project's own code. The repository is private, and no project-wide redistribution license has been selected by its owner.
+This notice documents third-party components only; it does not assign an open-source license to this project's own code. Public GitHub visibility does not itself grant a project-wide redistribution license; none has been selected by the owner.

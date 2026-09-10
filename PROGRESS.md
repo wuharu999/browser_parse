@@ -1,5 +1,74 @@
 # Analysis service progress
 
+## ECS/worker runbook and public-publication attempt — 2026-09-10
+
+- Added `docs/deploy-ecs-worker.md`: separate ECS/worker responsibilities,
+  HTTPS reverse proxy, secret separation, systemd services, Cube prerequisites,
+  template creation, private wiki transfer, resource/admission controls, smoke
+  tests, backups, upgrades and failure checks. These are deployment instructions,
+  not evidence of an actual ECS installation.
+- Updated README/navigation and publication boundaries. Private wiki, uploads,
+  credentials, VM data and local editor settings are excluded. Public visibility
+  does not automatically grant an open-source license or deploy a website.
+- Scanned all 141 historical Git blobs: no supported credential-pattern matches
+  or private-data path candidates. This is a bounded publication check, not a
+  guarantee that arbitrary sensitive text can never exist. No supplied token
+  was written to a file or Git configuration.
+- Retested: 70 Python and 48 TypeScript tests, production build and diff checks
+  pass. No new model request or cloud resource was created.
+- The newly supplied token authenticated as `wuharu999`, but private and public
+  repository creation both returned HTTP 403: `Resource not accessible by
+  personal access token`, requiring `administration=write`. The existing CLI
+  login was also denied creation. No browser session was available as an
+  alternative. The requested public `wuharu999/browser_parse` repository and
+  push remain blocked; local changes are ready for publication after permission
+  correction. Contents write permission is also needed to push.
+
+## Sandbox context, automatic sizing and clearer navigation — 2026-09-10
+
+- Added `robot-analysis-context` **for the agents inside each job sandbox**.
+  It is transferred to `/workspace/.agents/skills/`, referenced by the main
+  prompt and both native roles, and is not installed in personal Codex skills.
+  A bounded `evidence.py context` command supplies upload mappings, allocation
+  and wiki index status. Guidance routes to installed tools and original wiki
+  lines, checks robot applicability, keeps subagents from recursively spawning,
+  and addresses the prior UTC/synthetic-input provenance mistakes.
+- Built a prepared image with uv-managed Python 3.12.13, hashed dependencies,
+  PDF/OCR (English/Chinese), images, MCAP/ROS readers, HDF5 and data-analysis tools.
+  Environment checks passed with Docker networking disabled and in real small
+  and standard Cube sandboxes; skill assets, context and wiki indexing were
+  available there. Test VMs were destroyed. These checks passed no model key,
+  made no paid call and did not change admission accounting.
+- Submission now estimates small/standard/large CPU/RAM/disk profiles without
+  an LLM, using actual upload sizes and bounded browser hints. Atomic FIFO
+  admission reserves all three resources; cancellation retains reservations
+  until termination/expiry. Tests cover competing claims and mismatched Cube
+  templates. This is pre-run selection, not mid-run resizing or a performance
+  guarantee. See `docs/resource-profiles.md` for exact values and limits.
+- Registered matching small (1 CPU/2 GiB/8Gi disk) and standard (2 CPU/4 GiB/
+  16Gi disk) templates. The existing local outer guest is only 8 GiB, so the
+  local job pool is deliberately 4 GiB with one worker slot. Large jobs are
+  rejected locally; an 8-GiB large-profile/cloud-concurrency test is outstanding.
+  Cube's decimal `G` and binary `Gi` differ; final templates use `Gi`.
+- Added report-local Back to upload controls at top/bottom, preserving draft
+  description/selection. Shared EN/中文 allowance bar shows accounted estimates,
+  reservations, remaining allowance, reset date and pending slots. Capacity is
+  labelled as reserved, not live utilization. Existing sidebar navigation also
+  worked; the new report controls make the return path explicit.
+- Browser checks passed report return/draft preservation, Chinese 390px layout
+  without overflow, and UI-only mocked allowance states (available, exhausted,
+  full queue, occupied capacity, unavailable API). Mocks did not submit jobs or
+  alter the real budget. The real day's USD 10 allowance remains exhausted.
+- Read-only full-wiki index: 564 pages, zero skipped. Six literal searches found
+  canonical robot/component pages but English/Chinese and model-applicability
+  gaps. The prior AI pilot used only a synthetic one-page wiki, so it does not
+  establish full-wiki analysis quality. See `docs/wiki-review.md`.
+- Verification: **70 Python + 48 TypeScript = 118 tests pass**, production build
+  and diff checks pass; skill validator passes inside the prepared image. The
+  updated skill has not yet been evaluated in a new paid diagnosis. API/UI and
+  worker were restarted locally; original reports, wiki, credentials and job
+  database were preserved. No GitHub push or public cloud deployment claimed.
+
 ## Local Cube and exact DeepSeek vision ID — 2026-09-10
 
 - Configured exactly `deepseek-v4-flash-vision-exp` in the ignored, mode-0600 local environment and example configuration. DeepSeek's direct image test accepted this ID and read the screenshot heading correctly (214 input + 6 output tokens); its response reported serving model `deepseek-flash`, consistent with the documented retired-alias routing. The application does not substitute the requested ID.
@@ -50,13 +119,15 @@
 - [x] Real local CubeSandbox template boot, file transfer, tool execution and destruction.
 - [x] Completed Codex/DeepSeek synthetic log + image pilot and metadata-confirmed native subagents.
 - [ ] Representative large-log/PDF/full-wiki resource and concurrency benchmark.
-- [ ] Private GitHub push.
+- [ ] Public GitHub repository and push (latest user request supersedes private).
 
 ## Current external blockers
 
 CubeSandbox is now installed in the disposable local VM and its template has booted successfully; see the latest section above. Production cloud deployment still requires nested KVM support and an operationally secured worker. No host storage has been reformatted or reconfigured.
 
-GitHub repository creation failed with HTTP 403 using both available credentials. The cleanup commit is local; no successful push is claimed. Never put credentials in this file.
+GitHub repository creation still fails with HTTP 403 on the latest attempt;
+see the public-publication section above. Commits remain local; no successful
+push or visibility change is claimed. Never put credentials in this file.
 
 ## Resource estimates versus measurements
 

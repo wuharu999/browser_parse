@@ -1,5 +1,10 @@
 # Robot Log Workbench
 
+**Deploy on two machines:** [ECS web/API server + sandbox worker setup](docs/deploy-ecs-worker.md)
+includes HTTPS, configuration, systemd services, template creation, private wiki
+transfer, resource limits, acceptance tests and backups. This is an operator
+runbook; an ECS/cloud deployment has not yet been verified.
+
 A shared robot-incident analysis workbench with automatic in-browser log preprocessing and an optional CubeSandbox model worker. To create an analysis, choose log files or a folder, add any image/PDF attachments, describe the incident, choose the report language, and submit. The browser preprocesses recognizable logs in a Web Worker and then uploads the originals, attachments, and bounded evidence package to the shared backend. **Preprocessing itself needs no Codex, API key, model call, or LLM tokens.**
 
 The integrated EN/中文 interface has a shared history on the left and the selected analysis on the right. Everyone connected to the same backend can see active status and scrollable public session activity, open completed reports, or request the public hard stop. Structured results show the summary, source-grounded evidence chain, uncertainties, and an editable ordered workflow. Human reviews add a name, outcome, note, and edited workflow as a new immutable version; they remain separate from the model report.
@@ -62,7 +67,7 @@ The evidence budget reserves 75% for fault candidates, 15% for lifecycle/recover
 
 - `robot-log-brief/v1`: bounded summary, source names, coverage/omission warnings, and archive/subsystem-diverse excerpts without duplicated raw/context blocks. It can omit an important event present in the larger package. Do not diagnose from the brief alone.
 - Full evidence export: optional local inspection artifact, deliberately larger because it preserves context. It is not the default LLM prompt.
-- Context reader: choose **any readable file**, including one with no retained evidence, and a starting line; or click **Read wider context**. Each UI page contains at most 20 lines and 12,000 serialized UTF-8 bytes. Clipped lines are marked. Next-page/download/cancel controls are provided.
+- Developer context reader: request **any readable file**, including one with no retained evidence, and a starting line. Each response contains at most 20 lines and 12,000 serialized UTF-8 bytes. Clipped lines are marked. This is an internal API; the simplified upload/report UI does not expose replay or download controls.
 - Source IDs include selection order and archive-member ordinal, so duplicate member names remain distinct. Keep the original selection and browser session open. Closing/changing it invalidates access; an exported JSON alone cannot fetch local originals.
 - ZIP accesses the target member; TAR/GZIP must stream through preceding data. A late-line query can be expensive and is cancellable. Early-stop context replay does **not** revalidate the entire archive checksum (`integrity: not-revalidated`). Raw files are never modified.
 
@@ -109,6 +114,12 @@ uv run --env-file .env python -m backend.worker
 
 Each job receives its own Cube VM. Native Codex subagents share that VM, with full permissions inside it, not separate VMs per child. The main prompt and two bounded roles live in `sandbox/runtime/`; raw logs and wiki pages are data, not instructions. The worker streams and hashes original uploads and supplies bounded local evidence tools instead of putting whole archives/wiki into the prompt. The complete local wiki is in ignored `knowledge/wiki/`: 564 Markdown pages were indexed, including pages absent from its navigation index. Raw evidence and page context remain retrievable by source/line. Activity exposes coarse lifecycle events, not private reasoning or raw shell output.
 
+The new [sandbox context skill](sandbox/runtime/.agents/skills/robot-analysis-context/SKILL.md) is copied into `/workspace/.agents/skills/` for **the agents inside each job**, not installed in your personal Codex environment. The main prompt and both roles reference it. Its token-bounded `evidence.py context` helper exposes upload mappings, assigned resources and wiki index status; the skill routes agents to preinstalled tools and applicable original wiki lines. See [wiki review](docs/wiki-review.md) for measured retrieval limits.
+
+Resource sizing is automatic and token-free: small (1 CPU/2 GiB), standard (2 CPU/4 GiB), or large (4 CPU/8 GiB), selected from uploaded sizes, file types and browser expansion hints. Configure matching `CUBE_TEMPLATES_JSON` IDs and the API's resource pool before starting the worker; missing/mismatched templates fail closed. The current local VM supports small/standard only. See [resource profiles](docs/resource-profiles.md) for thresholds, queue reservations, prepared packages and the no-model sandbox verification command.
+
+Reports include **Back to upload** controls that preserve the current draft. The shared daily allowance bar distinguishes accounted estimates, running reservations and remaining allowance; it indicates when new work can queue or when pending slots are full. It is not a provider billing or real-time CPU/RAM usage meter.
+
 The model key enters the sandbox and is accessible to a full-permission agent. Use a dedicated, restricted-budget provider key and limit sandbox network access externally. Provider replacement uses `ROBOT_CODEX_PROVIDER_URL`, `ROBOT_CODEX_API_KEY_ENV` and `ROBOT_CODEX_MODEL`; the endpoint must be compatible with Codex's Responses protocol. Arbitrary providers are not automatically supported.
 
 Defaults admit at most two concurrent jobs, with 20 pending/uploading jobs and a USD 5 reservation per job against a **USD 10 Asia/Shanghai-day admission cap**. Active reservations count across midnight. Unknown actual cost is conservatively settled at the reservation. This is **not verified billing or a hard USD 10 final-charge ceiling**: in-flight jobs finish and can exceed estimates. The requested DeepSeek vision alias completed a 93-second synthetic log/image pilot with two native subagents; the aggregate provider bill remains unknown. The local pilot uses one worker and a 600-second timeout. CPU/RAM/disk allocation is selected in the Cube template; tiny-case observations and provisional cloud sizing are separated in [resource profiles](docs/resource-profiles.md).
@@ -120,6 +131,18 @@ npm run build
 ```
 
 See [PROGRESS.md](PROGRESS.md) for implemented/tested versus externally blocked work.
+
+## Publication and private data
+
+Only application source, synthetic examples, tests and deployment documentation
+belong in GitHub. `.env`, credentials, `data/`, uploaded logs, VM images, local
+editor settings and `knowledge/wiki/` stay outside the published source. Copy
+an approved wiki separately to the worker; it is not included in a fresh clone.
+Making the repository public does not deploy the service or make private input
+data safe to publish. No project-wide open-source redistribution license has
+been selected; dependency licenses are listed in [third-party notices](THIRD_PARTY_NOTICES.md).
+The npm `private` flag prevents accidental npm publication and does not control
+GitHub visibility.
 
 ## DeepSeek / Qwen and estimated cost
 

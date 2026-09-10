@@ -14,6 +14,44 @@ spec.loader.exec_module(evidence)
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_job_context_preserves_allocation_and_bounds_upload_summary(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            plan = {"profile": "small", "cpu_milli": 1000, "memory_mb": 2048, "disk_mb": 8192}
+            job = {"id": "test", "description": "场景" * 1500, "language": "zh", "resource_plan": plan,
+                   "private_field": "not part of orientation",
+                   "files": [{"id": str(n), "name": f"robot-{n}.log", "size": 10,
+                              "local_path": f"inputs/{n}.log", "private_field": "omit"} for n in range(25)]}
+            (root / "job.json").write_text(json.dumps(job))
+            result = evidence.job_context(root, root / "wiki", root / "wiki.sqlite3")
+            self.assertEqual(result["resource_plan"], plan)
+            self.assertEqual(result["uploaded_file_count"], 25)
+            self.assertEqual(len(result["results"]), 20)
+            self.assertTrue(result["description_clipped"])
+            self.assertTrue(result["truncated"])
+            self.assertFalse(result["wiki_available"])
+            self.assertIsNone(result["wiki_indexed_pages"])
+            self.assertFalse((root / "wiki.sqlite3").exists())
+            encoded = evidence.bounded(result)
+            self.assertLessEqual(len(encoded.encode()), 12000)
+            self.assertNotIn("private_field", encoded)
+            self.assertEqual(json.loads(encoded)["results"][0]["local_path"], "inputs/0.log")
+
+    def test_job_context_reports_existing_wiki_index_without_modifying_it(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "job.json").write_text('{"files": []}')
+            wiki = root / "wiki"
+            wiki.mkdir()
+            (wiki / "motor.md").write_text("encoder observations")
+            database = root / "wiki.sqlite3"
+            evidence.index_wiki(wiki, database)
+            original = database.read_bytes()
+            result = evidence.job_context(root, wiki, database)
+            self.assertTrue(result["wiki_available"])
+            self.assertEqual(result["wiki_indexed_pages"], 1)
+            self.assertEqual(database.read_bytes(), original)
+
     def test_index_all_pages_and_bounded_context(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

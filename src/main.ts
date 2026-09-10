@@ -1,9 +1,10 @@
 import './style.css';
 import { DEFAULT_LIMITS, type LogPackage, type WorkerResponse } from './types';
 import { parseReport } from './report';
+import { availability, type Budget } from './budget';
 import { onUiLanguage, setUiLanguage, t, uiLanguage } from './i18n';
 
-type Job = { id: string; description: string; status: string; created_at: string; cancel_requested: boolean; report?: string; review_claim?: { name: string; expires_at: string } | null };
+type Job = { id: string; description: string; status: string; created_at: string; cancel_requested: boolean; report?: string; resource_plan?: { profile: string; cpu_milli: number; memory_mb: number; disk_mb: number } | null; review_claim?: { name: string; expires_at: string } | null };
 type Version = { id: number; reviewer_name: string; success: boolean; note: string; procedure: string; created_at: string };
 type Event = { seq: number; agent: string; kind: string; message: string; created_at?: string };
 type Draft = { name: string; procedure: string; note: string; verdict: string; token?: string; expires_at?: string };
@@ -28,13 +29,14 @@ const statusBadge = (job: Job) => el('span', `status-badge ${job.status}`, statu
 
 let jobs: Job[] = [], active: Job[] = [], cursor: string | null = null, selected: string | null = null, historyInitialized = false;
 let online = false, busy = false, files: File[] = [], description = '', outputLanguage = uiLanguage(), outputChosen = false;
+let budget: Budget | null = null;
 let submitMessage = '', controller: AbortController | undefined, selectedJob: Job | undefined, selectedVersions: Version[] = [];
 let selectedEvents: Event[] = [], detailSignature = '', detailSequence = 0, detailNeedsRender = false, refreshing = false;
 const drafts = new Map<string, Draft>(), events = new Map<string, Event[]>();
 const sessionViews = new Map<string, { open: boolean; top: number; following: boolean }>();
 const pausedSessions = new Set<string>();
 const app = document.querySelector<HTMLDivElement>('#app')!;
-let history: HTMLElement, content: HTMLElement, activity: HTMLElement, connection: HTMLElement, banner: HTMLElement, activityCount: HTMLElement;
+let history: HTMLElement, content: HTMLElement, activity: HTMLElement, connection: HTMLElement, banner: HTMLElement, activityCount: HTMLElement, usage: HTMLElement;
 
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(`/api${path}`, init);
@@ -62,9 +64,42 @@ function buildShell(): void {
   languageButton.setAttribute('aria-label', 'Switch interface language / 切换界面语言'); tools.append(activityCount, languageButton); topbar.append(tools);
   banner = el('div', 'notice'); banner.hidden = true; banner.setAttribute('role', 'status');
   activity = el('section', 'live-panel'); activity.setAttribute('aria-label', t('Shared processes', '共享进程'));
-  content = el('div', 'content'); main.append(topbar, banner, activity, content); shell.append(sidebar, main); app.append(shell);
-  renderHistory(); renderActivity(); updateConnection();
+  usage = el('section', 'usage-panel'); usage.setAttribute('aria-label', t('Daily analysis allowance', '每日分析额度'));
+  content = el('div', 'content'); main.append(topbar, banner, usage, activity, content); shell.append(sidebar, main); app.append(shell);
+  renderHistory(); renderActivity(); updateConnection(); renderBudget();
   if (selected && selectedJob) renderResult(); else renderNew();
+}
+function submissionLabel(): string {
+  const state = availability(budget).state;
+  return busy ? t('Working…', '处理中…') : state === 'unknown' ? t('Checking availability…', '正在检查额度…') : state === 'queue_full' ? t('Queue full', '队列已满') : state === 'available' ? t('Analyze incident  →', '开始分析  →') : t('Queue analysis  →', '加入分析队列  →');
+}
+function renderBudget(): void {
+  const state = availability(budget), money = (value: number) => `$${value.toFixed(2)}`;
+  usage.replaceChildren();
+  if (!budget || state.state === 'unknown') {
+    usage.append(el('p', 'usage-status', t('Daily allowance unavailable. Checking again; your upload draft is preserved.', '暂时无法读取每日额度，正在重试；上传草稿已保留。')));
+  } else {
+    const top = el('div', 'usage-heading');
+    top.append(el('strong', '', t("Today's analysis allowance", '今日分析额度')), el('span', '', `${money(budget.admission_used_usd)} / ${money(budget.daily_limit_usd)}`));
+    const bar = el('div', 'usage-bar'); bar.setAttribute('role', 'progressbar'); bar.setAttribute('aria-label', t('Accounted usage and active reservations', '已计入用量和运行预留额度'));
+    bar.setAttribute('aria-valuemin', '0'); bar.setAttribute('aria-valuemax', String(budget.daily_limit_usd || 1)); bar.setAttribute('aria-valuenow', String(Math.min(budget.daily_limit_usd, budget.admission_used_usd)));
+    bar.setAttribute('aria-valuetext', `${money(budget.admission_used_usd)} / ${money(budget.daily_limit_usd)}`);
+    const settled = el('span', 'usage-settled'), reserved = el('span', 'usage-reserved'); settled.style.width = `${state.settledPercent}%`; reserved.style.width = `${state.reservedPercent}%`; bar.append(settled, reserved);
+    const messages: Record<string, string> = {
+      available: t('You can submit a new analysis. It starts when a worker is ready.', '可以提交新分析；工作器就绪后开始。'),
+      budget_wait: t('You can queue a new analysis, but it must wait for enough allowance to become available.', '可以新建排队任务，但需等待可用额度足够后再开始。'),
+      capacity_wait: t('Workers are at capacity. New analyses will queue.', '运行名额已满，新分析将排队。'),
+      queue_wait: t('You can submit; queued analyses are ahead of the new task.', '可以提交新分析；已有排队任务将先处理。'),
+      queue_full: t('Queue full. Wait for a pending slot before submitting a new analysis.', '队列已满。请等待出现空位后再提交新分析。'),
+    };
+    usage.append(top, bar, el('p', 'usage-breakdown', t(`Accounted: ${money(budget.spent_usd)} · Running reservations: ${money(budget.active_reservations_usd)} · Remaining: ${money(state.remaining)}`, `已计入：${money(budget.spent_usd)} · 运行预留：${money(budget.active_reservations_usd)} · 剩余：${money(state.remaining)}`)), el('p', 'usage-status', messages[state.state]), el('p', 'usage-note', t(`${state.reservations} job reservations available at ${money(budget.estimated_per_job_usd)} each · ${budget.pending}/${budget.max_pending} pending slots used. Daily reset: ${budget.resets_at.slice(0, 10)} 00:00 (Asia/Shanghai); running reservations carry over. Estimates/reservations, not a verified provider bill.`, `每个任务预留 ${money(budget.estimated_per_job_usd)}，额度可覆盖 ${state.reservations} 个任务 · 待处理名额 ${budget.pending}/${budget.max_pending}。每日重置：${budget.resets_at.slice(0, 10)} 00:00（Asia/Shanghai）；运行中的预留额度跨日保留。这里是估算／预留额度，并非已核实的供应商账单。`)));
+    if (budget.resource_pool && budget.resources_used) {
+      const pool = budget.resource_pool, used = budget.resources_used;
+      usage.append(el('p', 'usage-note', t(`Sandbox capacity reserved: ${used.cpu_milli / 1000}/${pool.cpu_milli / 1000} CPU · ${used.memory_mb / 1024}/${pool.memory_mb / 1024} GiB RAM. Resource reservations, not live utilization.`, `沙箱容量预留：CPU ${used.cpu_milli / 1000}/${pool.cpu_milli / 1000} 核 · 内存 ${used.memory_mb / 1024}/${pool.memory_mb / 1024} GiB。这是容量预留，并非实时利用率。`)));
+    }
+  }
+  const start = content.querySelector<HTMLButtonElement>('.start-analysis');
+  if (start) { start.textContent = submissionLabel(); start.disabled = busy || !state.canSubmit; }
 }
 function updateConnection(): void {
   connection.replaceChildren(el('span', `connection-dot ${online ? 'online' : ''}`), el('span', '', online ? t('Shared with everyone', '所有人共享') : t('Connecting to server…', '正在连接服务器…')));
@@ -142,7 +177,7 @@ async function stopJob(job: Job): Promise<void> {
   try { await api(`/jobs/${job.id}/cancel`, { method: 'POST' }); notice(t('Stop requested. Running work stops when the worker confirms termination.', '已请求停止。工作器确认终止后，运行任务才会结束。')); await refresh(); }
   catch (error) { notice(`${t('Could not stop analysis', '无法停止分析')}：${error}`, true); }
 }
-function showNew(): void { selected = null; selectedJob = undefined; detailSequence++; detailSignature = ''; notice(''); renderHistory(); renderNew(); }
+function showNew(): void { selected = null; selectedJob = undefined; detailSequence++; detailSignature = ''; notice(''); renderHistory(); renderNew(); window.scrollTo({ top: 0 }); const heading = content.querySelector('h1'); if (heading) { heading.tabIndex = -1; heading.focus({ preventScroll: true }); } }
 function addFiles(incoming: FileList | File[]): void {
   if (busy) return;
   const all = new Map(files.map(file => [`${file.webkitRelativePath || file.name}:${file.size}:${file.lastModified}`, file]));
@@ -174,7 +209,7 @@ function renderNew(): void {
   const bottom = el('div', 'form-bottom'), language = el('select'); language.id = 'output-language';
   for (const [value, label] of [['en', 'English'], ['zh', '中文']]) { const option = el('option', '', label); option.value = value; language.append(option); }
   language.value = outputLanguage; language.disabled = busy; language.addEventListener('change', () => { outputLanguage = language.value as 'en' | 'zh'; outputChosen = true; });
-  const start = el('button', 'button primary start-analysis', busy ? t('Working…', '处理中…') : t('Analyze incident  →', '开始分析  →')); start.type = 'submit'; start.disabled = busy;
+  const start = el('button', 'button primary start-analysis', submissionLabel()); start.type = 'submit'; start.disabled = busy || !availability(budget).canSubmit;
   bottom.append(field(t('Report language', '报告语言'), language), start); form.append(bottom);
   form.append(el('p', 'privacy-note', t('Submitting uploads the selected files to this shared workspace. Everyone can see the analysis and review it.', '提交后，所选文件将上传到共享工作台。所有人都可以查看分析并进行审核。')));
   const progress = el('p', 'submit-progress', submitMessage); progress.id = 'submit-progress'; progress.setAttribute('role', 'status'); form.append(progress);
@@ -207,6 +242,8 @@ async function submit(): Promise<void> {
   busy = true; controller = new AbortController(); const signal = controller.signal; let createdId: string | undefined;
   notice(''); progress(t('Preparing your files…', '正在准备文件…')); renderNew();
   try {
+    budget = await api<Budget>('/budget', { signal }); renderBudget();
+    if (!availability(budget).canSubmit) throw new Error(t('No pending slot is available. Your upload draft is preserved.', '暂无待处理空位，上传草稿已保留。'));
     const media = (file: File) => /\.(pdf|png|jpe?g|webp|gif|bmp|tiff?)$/i.test(file.name) || /^(image\/|application\/pdf)/.test(file.type);
     const logs = files.filter(file => !media(file)), attachments = files.filter(media);
     const evidence = logs.length ? await prepare(logs, signal) : undefined;
@@ -245,7 +282,12 @@ async function loadDetail(force = false): Promise<void> {
 function reportSection(number: string, name: string): HTMLElement { const section = el('section', 'report-section'); const heading = el('div', 'report-section-heading'); heading.append(el('span', 'section-number', number), el('h2', '', name)); section.append(heading); return section; }
 function renderResult(): void {
   const job = selectedJob; if (!job || selected !== job.id) return; content.replaceChildren(); const page = el('article', 'result-page');
+  const navigation = el('div', 'report-navigation'); navigation.append(button(t('← Back to upload', '← 返回上传'), 'button secondary back-to-upload', showNew)); page.append(navigation);
   const meta = el('div', 'report-meta'); meta.append(statusBadge(job), el('span', 'muted', date(job.created_at))); page.append(meta, el('h1', '', title(job)), el('p', 'incident-description', job.description.replace(/^\[DEMO\]\s*/, '')));
+  if (job.resource_plan) {
+    const plan = job.resource_plan;
+    page.append(el('p', 'sandbox-profile', t(`Auto-sized sandbox (${plan.profile}): ${plan.cpu_milli / 1000} CPU · ${plan.memory_mb / 1024} GiB RAM · ${plan.disk_mb / 1024} GiB disk. Estimated from uploads, not guaranteed workload usage.`, `自动选择沙箱（${plan.profile}）：${plan.cpu_milli / 1000} 核 CPU · ${plan.memory_mb / 1024} GiB 内存 · ${plan.disk_mb / 1024} GiB 磁盘。依据上传内容估算，并非实际用量保证。`)));
+  }
   if (!terminal(job)) { page.append(el('div', 'waiting-panel', job.status === 'queued' ? t('Your analysis is queued. It starts when a worker and budget are available. You can leave this page and return from history.', '分析已排队。有可用工作器和预算时会开始。你可以离开本页，稍后从历史记录返回。') : t('Analysis is in progress. Everyone can follow the activity above.', '分析正在进行，所有人都可以在上方查看活动。'))); content.append(page); return; }
   const report = parseReport(job.report);
   if (report.demo) page.append(el('div', 'demo-notice', t('Synthetic demo · no AI agent ran. Use this example to test the evidence and editing experience.', '合成示例 · 没有运行 AI 代理。此示例用于测试证据展示和编辑体验。')));
@@ -276,7 +318,7 @@ function renderResult(): void {
   }
   page.append(workflow);
   if (selectedVersions.length) { const revisions = el('details', 'revision-history'); revisions.append(el('summary', '', t(`Review history (${selectedVersions.length} versions)`, `审核历史（${selectedVersions.length} 个版本）`))); for (const version of [...selectedVersions].reverse()) { const item = el('div', 'revision'); item.append(el('strong', '', `v${version.id} · ${version.reviewer_name} · ${version.success ? t('Successful', '成功') : t('Unsuccessful', '未成功')}`), el('p', 'muted', date(version.created_at)), el('p', '', version.note), el('p', 'workflow-text', version.procedure)); revisions.append(item); } page.append(revisions); }
-  page.append(sessionPanel(job.id, events.get(job.id) ?? selectedEvents)); content.append(page);
+  page.append(sessionPanel(job.id, events.get(job.id) ?? selectedEvents), button(t('← Back to upload', '← 返回上传'), 'button secondary back-to-upload', showNew)); content.append(page);
 }
 function renderEditor(section: HTMLElement, job: Job, draft: Draft): void {
   const form = el('form', 'workflow-editor');
@@ -303,7 +345,8 @@ function renderEditor(section: HTMLElement, job: Job, draft: Draft): void {
 async function refresh(): Promise<void> {
   if (refreshing) return; refreshing = true;
   try {
-    const [page, activePage] = await Promise.all([api<{ items: Job[]; next_cursor: string | null }>('/jobs?limit=50'), api<{ items: Job[] }>('/jobs/active')]);
+    const [page, activePage, currentBudget] = await Promise.all([api<{ items: Job[]; next_cursor: string | null }>('/jobs?limit=50'), api<{ items: Job[] }>('/jobs/active'), api<Budget>('/budget').catch(() => null)]);
+    budget = currentBudget; renderBudget();
     const firstLoad = jobs.length === 0;
     const disappeared = active.filter(job => !activePage.items.some(current => current.id === job.id));
     const finished = await Promise.all(disappeared.map(job => api<Job>(`/jobs/${job.id}`).catch(() => job)));
@@ -313,7 +356,7 @@ async function refresh(): Promise<void> {
     updateConnection(); renderHistory(); renderActivity();
     if (firstLoad && !selected && !busy && !description && !files.length) renderNew();
     if (selected) await loadDetail();
-  } catch { online = false; updateConnection(); notice(t('The server is unavailable. Your selected files are still here; please retry when it reconnects.', '服务器暂不可用。所选文件仍保留在此处，请在恢复连接后重试。'), true); }
+  } catch { online = false; budget = null; renderBudget(); updateConnection(); notice(t('The server is unavailable. Your selected files are still here; please retry when it reconnects.', '服务器暂不可用。所选文件仍保留在此处，请在恢复连接后重试。'), true); }
   finally { refreshing = false; }
 }
 onUiLanguage(() => { if (!outputChosen) outputLanguage = uiLanguage(); buildShell(); });

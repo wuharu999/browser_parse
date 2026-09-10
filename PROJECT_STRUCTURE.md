@@ -19,19 +19,23 @@ browser_parse/
 ├── PROGRESS.md                # Implementation, validation and external blockers
 ├── THIRD_PARTY_NOTICES.md     # Direct dependency licenses and attribution
 ├── docs/
+│   ├── deploy-ecs-worker.md   # Two-machine deployment, services, TLS and operations
 │   ├── open-source-options.md # Archive-library decision and format boundaries
 │   ├── model-providers.md     # DeepSeek setup, Qwen/OpenCode option and cost assumptions
 │   ├── local-sandbox.md       # Disposable local Cube VM and forwarded networking
-│   └── resource-profiles.md   # Provisional cloud sizing and measurement boundaries
+│   ├── wiki-review.md         # Prior pilot limitations and full-index search probes
+│   └── resource-profiles.md   # Automatic sizing, prepared tools and measurement limits
 ├── scripts/
 │   ├── estimate_cost.py       # Dependency-free offline multi-agent cost estimator
 │   ├── seed_demo.py           # Idempotent completed synthetic UI examples
 │   ├── cube_local.sh          # Conservative local VM start/status/ssh/stop
+│   ├── check_sandbox_runtime.py # No-model Cube runtime/skill/package check
 │   └── benchmark_resources.py # Bounded, credential-free Linux resource sampling
 ├── public/examples/           # Downloadable synthetic log for upload testing
 ├── src/
 │   ├── main.ts                # Integrated submission, history, status, reports and reviews
 │   ├── report.ts              # Structured robot-analysis/v1 parser and safe fallback
+│   ├── budget.ts              # Allowance, queue eligibility and bar calculations
 │   ├── i18n.ts                # Persistent English/Chinese interface selection
 │   ├── style.css              # Responsive UI styles
 │   ├── preprocess.worker.ts   # Worker message dispatch: preprocess or context
@@ -45,16 +49,20 @@ browser_parse/
 ├── backend/
 │   ├── app.py                 # Public API, bounded uploads, private worker routes
 │   ├── store.py               # SQLite queue, budget reservations, claims and versions
+│   ├── resources.py           # Deterministic upload-driven CPU/RAM/disk profiles
 │   └── worker.py              # Cube-only transfers, concurrency, cancel and timeout
 ├── sandbox/
 │   ├── Dockerfile             # Boot-tested reusable Cube image; Codex + Poppler
+│   ├── requirements.in / .lock # Hashed Python analysis dependencies, built with uv
+│   ├── check_environment.py   # Offline file-format/OCR/import fixtures
 │   ├── HostVM.Dockerfile       # Unprivileged Docker wrapper for local QEMU tools
 │   ├── run_codex.py           # In-VM headless runner and bounded public telemetry
 │   └── runtime/
 │       ├── MAIN_PROMPT.md     # Main analysis prompt shared across jobs
+│       ├── ENVIRONMENT.md     # File-type tools and prebuilt image constraints
 │       ├── evidence.py        # Bounded wiki/log retrieval and SQLite FTS index
 │       ├── .codex/agents/     # Log investigator and evidence reviewer roles
-│       └── .agents/skills/    # Robot evidence and PDF-reading instructions
+│       └── .agents/skills/    # Sandbox context, robot evidence and PDF-reading skills
 ├── knowledge/
 │   ├── README.md              # Wiki location and indexing guidance
 │   └── wiki/                  # Local wiki copy, intentionally Git-ignored
@@ -94,7 +102,7 @@ The simplified UI has no manual preprocessing, export, or context-replay control
 | Browser File, Streams, TextDecoder and Worker APIs | Local input, UTF-8 decoding and background execution |
 | TypeScript, Vite and Vitest | Type checking, bundling/development server and tests |
 
-The app is not a fork of an entire log-analysis project. It composes existing libraries with robot-specific preprocessing. The optional worker uses the official `cubesandbox` SDK and native Codex subagents, not an additional agent framework. `fflate` and MCAP/ROS decoders are not installed. See [the dependency decision](docs/open-source-options.md) for archive licenses and unsupported formats.
+The app is not a fork of an entire log-analysis project. It composes existing libraries with robot-specific preprocessing. The optional worker uses the official `cubesandbox` SDK and native Codex subagents, not an additional agent framework. `fflate` is not installed. MCAP/ROS readers are prepared in the sandbox image, not the browser; browser preprocessing still marks unsupported binary contents as coverage gaps. See [the dependency decision](docs/open-source-options.md) for archive licenses and browser format boundaries.
 
 ## Developer commands
 

@@ -12,6 +12,7 @@ import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from .resources import allocation, estimate_resources
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -57,7 +58,7 @@ def clean_report(value: str) -> str:
 
 class Store:
     # ponytail: a process-wide SQLite lock; move writes behind a DB service only if traffic needs it.
-    def __init__(self, db_path: str, upload_dir: str, *, estimate: float = 5, daily_limit: float = 10, max_running: int = 2, max_pending: int = 20, lease_seconds: int = 1800, runtime_seconds: int = 1800):
+    def __init__(self, db_path: str, upload_dir: str, *, estimate: float = 5, daily_limit: float = 10, max_running: int = 2, max_pending: int = 20, lease_seconds: int = 1800, runtime_seconds: int = 1800, pool_cpu_milli: int = 4000, pool_memory_mb: int = 8192, pool_disk_mb: int = 32768):
         if not math.isfinite(estimate) or estimate <= 0 or not math.isfinite(daily_limit) or daily_limit <= 0 or estimate > daily_limit:
             raise ValueError("budget settings must be positive finite numbers")
         if not 1 <= max_running <= 2 or not 1 <= max_pending <= 100 or not 1 <= lease_seconds <= 1800 or not 1 <= runtime_seconds <= 1800:
@@ -68,6 +69,9 @@ class Store:
         self.estimate, self.daily_limit = estimate, daily_limit
         self.max_running, self.max_pending = max_running, max_pending
         self.lease_seconds, self.runtime_seconds = lease_seconds, runtime_seconds
+        if pool_cpu_milli < 1000 or pool_memory_mb < 2048 or pool_disk_mb < 8192:
+            raise ValueError("resource pool must fit at least one small sandbox")
+        self.resource_pool = {"cpu_milli": pool_cpu_milli, "memory_mb": pool_memory_mb, "disk_mb": pool_disk_mb}
         self.lock = threading.RLock()
         self.db = sqlite3.connect(self.path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
@@ -109,7 +113,7 @@ class Store:
         """)
         # Keep local development databases usable after additive schema changes.
         columns = {row["name"] for row in self.db.execute("PRAGMA table_info(jobs)")}
-        for name, sql in (("run_deadline", "TEXT"), ("finished_day", "TEXT"), ("upload_reserved", "INTEGER NOT NULL DEFAULT 0")):
+        for name, sql in (("run_deadline", "TEXT"), ("finished_day", "TEXT"), ("upload_reserved", "INTEGER NOT NULL DEFAULT 0"), ("resource_plan", "TEXT")):
             if name not in columns:
                 self.db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {sql}")
         self.db.commit()
@@ -132,6 +136,7 @@ class Store:
         for key in ("token_hash", "evidence", "lease_until", "run_deadline", "reservation_day", "finished_day", "upload_reserved"):
             item.pop(key, None)
         item["cancel_requested"] = bool(item["cancel_requested"])
+        item["resource_plan"] = json.loads(item["resource_plan"]) if item.get("resource_plan") else None
         claim = self.db.execute("SELECT name,expires_at FROM claims WHERE job_id=? AND expires_at>?", (item["id"], stamp())).fetchone()
         item["review_claim"] = dict(claim) if claim else None
         return item
@@ -200,8 +205,13 @@ class Store:
             row = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             if not row: self.db.rollback(); raise KeyError(job_id)
             if row["status"] != "draft": self.db.rollback(); raise ValueError("only draft jobs can be submitted")
-            when = stamp()
-            self.db.execute("UPDATE jobs SET status='queued',submitted_at=?,updated_at=? WHERE id=?", (when, when, job_id))
+            if row["upload_reserved"]: self.db.rollback(); raise ValueError("wait for active uploads before submitting")
+            plan = estimate_resources(self._files(job_id), json.loads(row["evidence"]) if row["evidence"] else None)
+            if any(plan[key] > total for key, total in self.resource_pool.items()):
+                self.db.rollback(); raise ValueError(f"upload needs the {plan['profile']} sandbox, larger than this worker resource pool; use a larger worker or a smaller evidence set")
+            when = now().isoformat(timespec="microseconds")
+            self.db.execute("UPDATE jobs SET status='queued',submitted_at=?,updated_at=?,resource_plan=? WHERE id=?", (when, when, json.dumps(plan), job_id))
+            self._event(job_id, "system", "api", f"Assigned {plan['profile']} sandbox: {plan['cpu_milli'] // 1000} CPU, {plan['memory_mb']} MiB RAM, {plan['disk_mb']} MiB writable disk (estimate).")
             self._event(job_id, "system", "api", "Job queued for a worker.")
             self.db.commit()
             return self.get(job_id)
@@ -244,12 +254,21 @@ class Store:
             return [dict(row) for row in rows], rows[-1]["seq"] if rows else None
 
     def budget(self) -> dict:
-        day = datetime.now(SHANGHAI).date().isoformat()
+        current = datetime.now(SHANGHAI)
+        day = current.date().isoformat()
+        resets_at = (current + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
         with self.lock:
             spent = self.db.execute("SELECT COALESCE(SUM(cost_usd),0) n FROM jobs WHERE finished_day=?", (day,)).fetchone()["n"]
             reserved = self.db.execute("SELECT COALESCE(SUM(reservation),0) n FROM jobs WHERE status='running'", ()).fetchone()["n"]
             running = self.db.execute("SELECT count(*) n FROM jobs WHERE status='running'", ()).fetchone()["n"]
-        return {"day": day, "timezone": "Asia/Shanghai", "daily_limit_usd": self.daily_limit, "estimated_per_job_usd": self.estimate, "spent_usd": spent, "active_reservations_usd": reserved, "admission_used_usd": spent + reserved, "max_running": self.max_running, "running": running, "max_pending": self.max_pending, "note": "Admission control, not a hard billing ceiling; actual worker cost may overrun its estimate."}
+            pending = self.db.execute("SELECT count(*) n FROM jobs WHERE status IN ('draft','queued')").fetchone()["n"]
+            queued = self.db.execute("SELECT count(*) n FROM jobs WHERE status='queued'").fetchone()["n"]
+            allocations = [allocation(json.loads(row["resource_plan"]) if row["resource_plan"] else None) for row in self.db.execute("SELECT resource_plan FROM jobs WHERE status='running'")]
+            used = {key: sum(item[key] for item in allocations) for key in self.resource_pool}
+            next_row = self.db.execute("SELECT resource_plan FROM jobs WHERE status='queued' AND cancel_requested=0 ORDER BY submitted_at,rowid LIMIT 1").fetchone()
+            next_plan = json.loads(next_row["resource_plan"]) if next_row and next_row["resource_plan"] else None
+            resource_wait = bool(next_row) and any(used[key] + allocation(next_plan)[key] > total for key, total in self.resource_pool.items())
+        return {"day": day, "timezone": "Asia/Shanghai", "resets_at": resets_at, "daily_limit_usd": self.daily_limit, "estimated_per_job_usd": self.estimate, "spent_usd": spent, "active_reservations_usd": reserved, "admission_used_usd": spent + reserved, "max_running": self.max_running, "running": running, "max_pending": self.max_pending, "pending": pending, "queued": queued, "resource_pool": self.resource_pool, "resources_used": used, "resource_wait": resource_wait, "note": "Admission control, not a hard billing ceiling; actual worker cost may overrun its estimate."}
 
     def _expire_leases(self) -> None:
         expired = self.db.execute("SELECT id,reservation FROM jobs WHERE status='running' AND (lease_until<? OR run_deadline<?)", (stamp(), stamp())).fetchall()
@@ -264,11 +283,14 @@ class Store:
             budget = self.budget()
             if budget["running"] >= self.max_running or budget["admission_used_usd"] + self.estimate > self.daily_limit:
                 self.db.commit(); return None, budget
-            row = self.db.execute("SELECT * FROM jobs WHERE status='queued' AND cancel_requested=0 ORDER BY submitted_at,id LIMIT 1").fetchone()
+            row = self.db.execute("SELECT * FROM jobs WHERE status='queued' AND cancel_requested=0 ORDER BY submitted_at,rowid LIMIT 1").fetchone()
             if not row: self.db.commit(); return None, budget
+            plan = json.loads(row["resource_plan"]) if row["resource_plan"] else estimate_resources(self._files(row["id"]), json.loads(row["evidence"]) if row["evidence"] else None)
+            if any(budget["resources_used"][key] + plan[key] > total for key, total in self.resource_pool.items()):
+                self.db.commit(); return None, budget
             until = stamp(now() + timedelta(seconds=self.lease_seconds)); current = stamp(); day = datetime.now(SHANGHAI).date().isoformat()
             deadline = stamp(now() + timedelta(seconds=self.runtime_seconds))
-            self.db.execute("UPDATE jobs SET status='running',reservation=?,reservation_day=?,lease_until=?,run_deadline=?,updated_at=? WHERE id=?", (self.estimate, day, until, deadline, current, row["id"]))
+            self.db.execute("UPDATE jobs SET status='running',reservation=?,reservation_day=?,lease_until=?,run_deadline=?,updated_at=?,resource_plan=? WHERE id=?", (self.estimate, day, until, deadline, current, json.dumps(plan), row["id"]))
             self._event(row["id"], "system", "api", "Worker lease granted.")
             updated = self.db.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()
             self.db.commit()

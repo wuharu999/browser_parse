@@ -16,11 +16,12 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from .resources import PROFILES
 
 
 TRANSFER_CHUNK_BYTES = 8 * 1024 * 1024
@@ -111,6 +112,7 @@ class WorkerConfig:
     runtime_dir: Path
     wiki_dir: Path | None
     parallel: int
+    cube_templates: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_env(cls) -> "WorkerConfig":
@@ -128,6 +130,12 @@ class WorkerConfig:
             raise WorkerError("CUBE_PROXY_PORT_HTTP must be an integer") from exc
         if proxy_port is not None and not 1 <= proxy_port <= 65535:
             raise WorkerError("CUBE_PROXY_PORT_HTTP must be between 1 and 65535")
+        try:
+            templates = json.loads(_env("CUBE_TEMPLATES_JSON", "{}"))
+        except ValueError as exc:
+            raise WorkerError("CUBE_TEMPLATES_JSON must be a JSON object") from exc
+        if not isinstance(templates, dict) or any(key not in PROFILES or not isinstance(value, str) or not value.strip() for key, value in templates.items()):
+            raise WorkerError("CUBE_TEMPLATES_JSON must map small/standard/large to template IDs")
         return cls(
             api_url=_env("ROBOT_API_URL", "http://127.0.0.1:8000").rstrip("/"),
             worker_token=_env("ROBOT_WORKER_TOKEN", required=True),
@@ -145,6 +153,7 @@ class WorkerConfig:
             runtime_dir=runtime,
             wiki_dir=Path(wiki).resolve() if wiki else (default_wiki.resolve() if default_wiki.is_dir() else None),
             parallel=max(1, min(2, int(_env("ROBOT_WORKER_PARALLEL", "2")))),
+            cube_templates=templates,
         )
 
 
@@ -224,9 +233,16 @@ class CubeWorker:
         self._sandbox_class = sandbox_class
         self._secrets = (config.worker_token, config.cube_api_key, config.codex_api_key)
 
-    def _cube(self, timeout_seconds: int) -> tuple[Any, Any]:
+    def _cube(self, timeout_seconds: int, profile: str | None = None) -> tuple[Any, Any]:
+        template = self.config.cube_template_id
+        if profile is not None:
+            template = self.config.cube_templates.get(profile, "")
+            if not template:
+                raise WorkerError(f"No Cube template is configured for the {profile} resource profile; refusing a differently sized fallback")
         if self._sandbox_class is not None:
-            return self._sandbox_class, self._config_object(timeout_seconds)
+            values = self._config_object(timeout_seconds)
+            values["template_id"] = template
+            return self._sandbox_class, values
         try:
             from cubesandbox import Config, Sandbox
         except ImportError as exc:  # installation is an explicit deployment prerequisite
@@ -234,7 +250,7 @@ class CubeWorker:
         values: dict[str, Any] = {
             "api_url": self.config.cube_api_url,
             "api_key": self.config.cube_api_key,
-            "template_id": self.config.cube_template_id,
+            "template_id": template,
             "timeout": timeout_seconds,
             # The e2b-connect code path keeps a distinct request timeout.
             "request_timeout": timeout_seconds + 30,
@@ -436,8 +452,16 @@ class CubeWorker:
         started = time.monotonic()
         deadline = started + timeout_seconds
         try:
-            Sandbox, cube_config = self._cube(timeout_seconds)
+            plan = job.get("resource_plan")
+            profile = plan.get("profile") if isinstance(plan, dict) else None
+            if plan is not None and (profile not in PROFILES or any(plan.get(key) != value for key, value in PROFILES[profile].items())):
+                raise WorkerError("Job resource plan does not match a supported profile")
+            Sandbox, cube_config = self._cube(timeout_seconds, profile)
             sandbox = Sandbox.create(config=cube_config, env_vars=self._sandbox_env(timeout_seconds), timeout=timeout_seconds)
+            if profile:
+                info = sandbox.get_info()
+                if any(getattr(info, key, None) != PROFILES[profile][key] for key in ("cpu_milli", "memory_mb")):
+                    raise WorkerError("Cube template CPU/RAM does not match the reserved resource plan")
             self._event(job_id, "progress", "Sandbox created; preparing evidence.")
             self._ensure_dir(sandbox, "/workspace")
             self._write_tree(sandbox, self.config.runtime_dir, "/workspace")

@@ -50,7 +50,7 @@ The Cube one-click installer runs as root inside the guest. Installation used th
 bash scripts/cube_local.sh ssh curl -fsS http://127.0.0.1:3000/health
 ```
 
-The current reusable template was created successfully with:
+The original paid-pilot template was created successfully with:
 
 ```sh
 bash scripts/cube_local.sh ssh cubemastercli tpl create-from-image \
@@ -71,6 +71,17 @@ CUBE_TEMPLATE_ID=<ready-template-id>
 Use the cluster's configured API key policy; a placeholder is suitable only while local Cube authentication is disabled. The native `cubesandbox` SDK keeps the virtual `*.cube.app` Host header while dialing the forwarded proxy directly, so no host DNS entry is needed.
 
 Provider credentials and model selection remain separate from Cube. This checkout selects exactly `deepseek-v4-flash-vision-exp`, as requested. DeepSeek documents this as a retired compatibility alias served by `deepseek-flash`; the exact alias passed a tiny image-reading test but must not be assumed to remain available forever. Keep `ROBOT_CODEX_MODEL` consistent with [the provider guide](model-providers.md) and use a restricted-budget key. Local Cube health and a ready template do not by themselves prove native subagent execution.
+
+The newer prepared image and automatic profiles supersede that fixed-template
+configuration for new jobs. Current local IDs are small
+`tpl-5dc519104a1f43628d0193cb` (1000m CPU, 2048 MiB, `8Gi`) and standard
+`tpl-dd7fefce285841a48ad9236a` (2000m CPU, 4096 MiB, `16Gi`). These IDs are
+cluster-specific. Configure the single-quoted `CUBE_TEMPLATES_JSON` map and
+resource pool as described in [resource profiles](resource-profiles.md).
+The local outer guest remains 8 GiB; the job RAM pool is capped at 4 GiB and
+the worker remains single-slot. An 8-GiB large job needs a larger worker and
+has not been boot/load-tested here. Old templates remain available; no VM disk
+or historical job data was removed during this update.
 
 ## Boundaries and recovery
 

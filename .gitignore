@@ -7,6 +7,7 @@ dist/
 *.local
 *.tsbuildinfo
 coverage/
+.vscode/
 test-results/
 .playwright-mcp/
 robot-log-demo.png
