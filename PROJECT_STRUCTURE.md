@@ -1,6 +1,6 @@
 # Project structure
 
-Robot Log Workbench is a standalone, browser-only TypeScript application. It reuses open-source archive readers; robot-log recognition, bounded sampling, and the UI are project-specific. There is no backend, AI runtime, shell executor, or worker-computer integration.
+Robot Log Workbench has a standalone browser preprocessing path and an optional shared Python analysis queue. It reuses open-source archive readers, FastAPI and CubeSandbox. Real sandbox execution requires an external Cube endpoint/template; the local demo does not silently execute agents on its host.
 
 ## Source tree
 
@@ -10,14 +10,20 @@ browser_parse/
 ├── package.json               # Dependencies and development commands
 ├── package-lock.json          # Reproducible dependency resolutions
 ├── tsconfig.json              # Strict TypeScript configuration
+├── vite.config.ts             # Development API proxy
+├── pyproject.toml / uv.lock    # Python API and optional Cube worker dependencies
+├── .env.example               # Model/provider and worker configuration placeholders
 ├── .gitignore                 # Excludes generated output, logs, and credentials
 ├── README.md                  # Setup, supported formats, limits, verification
 ├── PROJECT_STRUCTURE.md       # This architecture and navigation guide
+├── PROGRESS.md                # Implementation, validation and external blockers
 ├── THIRD_PARTY_NOTICES.md     # Direct dependency licenses and attribution
 ├── docs/
 │   └── open-source-options.md # Archive-library decision and format boundaries
 ├── src/
 │   ├── main.ts                # File selection, worker lifecycle, results, downloads
+│   ├── dashboard.ts           # Shared jobs, uploads, activity and review versions
+│   ├── i18n.ts                # Persistent English/Chinese interface selection
 │   ├── style.css              # Responsive UI styles
 │   ├── preprocess.worker.ts   # Worker message dispatch: preprocess or context
 │   ├── sources.ts             # Streaming inputs, archive safety, stable source IDs
@@ -27,6 +33,22 @@ browser_parse/
 │   ├── brief.ts               # Compact, byte-budgeted analysis brief
 │   ├── context.ts             # Bounded local source replay and pagination
 │   └── types.ts               # Shared schemas, worker messages, default limits
+├── backend/
+│   ├── app.py                 # Public API, bounded uploads, private worker routes
+│   ├── store.py               # SQLite queue, budget reservations, claims and versions
+│   └── worker.py              # Cube-only transfers, concurrency, cancel and timeout
+├── sandbox/
+│   ├── Dockerfile             # Unverified Cube template candidate; Codex + Poppler
+│   ├── run_codex.py           # In-VM headless runner and bounded public telemetry
+│   └── runtime/
+│       ├── MAIN_PROMPT.md     # Main analysis prompt shared across jobs
+│       ├── evidence.py        # Bounded wiki/log retrieval and SQLite FTS index
+│       ├── .codex/agents/     # Log investigator and evidence reviewer roles
+│       └── .agents/skills/    # Robot evidence and PDF-reading instructions
+├── knowledge/
+│   ├── README.md              # Wiki location and indexing guidance
+│   └── wiki/                  # Local wiki copy, intentionally Git-ignored
+├── tests_backend/             # API, mocked Cube worker, runner and evidence checks
 └── tests/
     ├── sources.test.ts        # TAR/GZIP/ZIP, safety limits and source identities
     ├── lines.test.ts          # UTF-8, CRLF, oversized and damaged lines
@@ -36,6 +58,8 @@ browser_parse/
 ```
 
 `node_modules/`, `dist/`, browser-test artifacts, uploaded logs, and downloaded evidence are not source files and are excluded from Git. Tests construct synthetic fixtures rather than committing private robot logs.
+
+Explicit shared submission follows `dashboard.ts → backend/app.py → store.py` (persistent queue), then `worker.py → Cube job VM → run_codex.py → Codex/native subagents`. Only private worker routes can retrieve originals or finish jobs; public visitors can read shared results, stop jobs, and claim/append human reviews. Local preprocessing remains usable when the API is offline.
 
 ## Processing paths
 
@@ -59,7 +83,7 @@ The browser retains access to the selected originals during the session. A conte
 | Browser File, Streams, TextDecoder and Worker APIs | Local input, UTF-8 decoding and background execution |
 | TypeScript, Vite and Vitest | Type checking, bundling/development server and tests |
 
-The app is not a fork of an entire log-analysis project. It composes these existing libraries with robot-specific preprocessing. `fflate`, MCAP/ROS decoders, model SDKs, and multi-agent frameworks are not installed. See [the dependency decision](docs/open-source-options.md) for licenses and unsupported formats.
+The app is not a fork of an entire log-analysis project. It composes existing libraries with robot-specific preprocessing. The optional worker uses the official `cubesandbox` SDK and native Codex subagents, not an additional agent framework. `fflate` and MCAP/ROS decoders are not installed. See [the dependency decision](docs/open-source-options.md) for archive licenses and unsupported formats.
 
 ## Developer commands
 

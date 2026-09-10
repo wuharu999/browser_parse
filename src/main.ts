@@ -1,5 +1,7 @@
 import './style.css';
 import { buildBrief } from './brief';
+import { mountDashboard } from './dashboard';
+import { onUiLanguage, setUiLanguage, setUiText, translateTree, uiLanguage } from './i18n';
 import { DEFAULT_LIMITS, type Evidence, type FileReport, type LogPackage, type Progress, type Severity, type WorkerRequest, type WorkerResponse } from './types';
 
 const app = document.querySelector<HTMLDivElement>('#app');
@@ -48,7 +50,10 @@ const header = el('header', 'hero');
 const eyebrow = el('p', 'eyebrow', 'LOCAL LOG PREPROCESSOR');
 const title = el('h1', undefined, 'Robot log workbench');
 const subtitle = el('p', 'hero-copy', 'Prepare logs locally, download a compact analysis brief, and retrieve more context when needed. No model calls or tokens are used during preprocessing.');
-header.append(eyebrow, title, subtitle);
+const uiLanguagePicker = button(uiLanguage() === 'zh' ? 'English' : '中文', 'button ui-language');
+uiLanguagePicker.dataset.i18nSkip = ''; uiLanguagePicker.setAttribute('aria-label', 'Switch interface language / 切换界面语言'); uiLanguagePicker.setAttribute('aria-pressed', String(uiLanguage() === 'zh'));
+uiLanguagePicker.addEventListener('click', () => setUiLanguage(uiLanguage() === 'zh' ? 'en' : 'zh'));
+header.append(eyebrow, title, subtitle, uiLanguagePicker);
 
 const controls = el('section', 'panel controls-panel');
 controls.setAttribute('aria-labelledby', 'input-heading');
@@ -56,7 +61,7 @@ const controlsHead = el('div', 'section-heading');
 const inputHeading = el('h2', undefined, '1. Upload compressed logs'); inputHeading.id = 'input-heading';
 controlsHead.append(el('div', undefined), inputHeading);
 controlsHead.firstElementChild?.append(el('p', 'section-kicker', 'INPUT'));
-const localNote = el('p', 'local-note', 'Original files stay local and unchanged.');
+const localNote = el('p', 'local-note', 'Original files stay local during preprocessing. Creating shared analysis uploads selected originals and evidence to the backend.');
 controlsHead.append(localNote);
 
 const pickerRow = el('div', 'picker-row');
@@ -124,6 +129,11 @@ contextPanel.append(contextControls, contextStatus, contextContent);
 shell.append(header, controls, statusPanel, resultsPanel, contextPanel);
 app.append(shell);
 
+const dashboard = mountDashboard({ getInput: () => ({ logs: selectedFiles, evidence: result, preprocessing: running }) });
+shell.append(dashboard);
+onUiLanguage(next => { uiLanguagePicker.textContent = next === 'zh' ? 'English' : '中文'; uiLanguagePicker.setAttribute('aria-pressed', String(next === 'zh')); translateTree(shell); });
+translateTree(shell);
+
 function clearChildren(node: HTMLElement): void { node.replaceChildren(); }
 
 function resetResults(message = 'Results will appear after a successful local preprocessing run.'): void {
@@ -151,7 +161,7 @@ function setSelection(files: FileList | null): void {
   selectedFiles = Array.from(files);
   const total = selectedFiles.reduce((sum, file) => sum + file.size, 0);
   selection.textContent = `${selectedFiles.length.toLocaleString()} file${selectedFiles.length === 1 ? '' : 's'} selected · ${bytes(total)} source bytes`;
-  runState.textContent = 'Ready for local preprocessing.';
+  setUiText(runState, 'Ready for local preprocessing.');
   progressBar.classList.remove('indeterminate'); progressValue.style.width = '0%'; progressBar.setAttribute('aria-valuetext', 'No active preprocessing run'); progressMeta.textContent = 'No active file.';
   resetResults('Selection changed. Start a new local preprocessing run.');
   syncControls();
@@ -300,6 +310,7 @@ function renderResult(packageResult: LogPackage): void {
     const option = el('option'); option.value = file.sourceId; option.textContent = `${file.sourceId} · ${file.path}`; contextFile.append(option);
   }
   contextPanel.hidden = contextFile.options.length === 0;
+  translateTree(resultsPanel); translateTree(contextPanel);
 }
 
 function updateProgress(progress: Progress): void {
@@ -309,14 +320,14 @@ function updateProgress(progress: Progress): void {
 
 function finishRun(message: string, completed = false): void {
   const elapsed = elapsedText();
-  running = false; worker?.terminate(); worker = undefined; progressBar.classList.remove('indeterminate'); progressValue.style.width = completed ? '100%' : '0%'; runState.textContent = `${message} · ${elapsed} elapsed.`; startedAt = undefined; syncControls();
+  running = false; worker?.terminate(); worker = undefined; progressBar.classList.remove('indeterminate'); progressValue.style.width = completed ? '100%' : '0%'; const stateText = el('span'); setUiText(stateText, message); runState.replaceChildren(stateText, document.createTextNode(` · ${elapsed} elapsed.`)); startedAt = undefined; syncControls();
 }
 
 function start(): void {
   if (running || selectedFiles.length === 0) return;
   const currentRun = ++runId;
   resetResults('Preprocessing is running locally. Results replace any prior run.');
-  running = true; startedAt = performance.now(); runState.textContent = 'Worker is preprocessing selected sources locally.';
+  running = true; startedAt = performance.now(); setUiText(runState, 'Worker is preprocessing selected sources locally.');
   progressBar.classList.add('indeterminate'); progressValue.style.width = '45%'; progressBar.setAttribute('aria-valuetext', 'Starting local preprocessing worker'); progressMeta.textContent = 'Starting worker…'; syncControls();
   try {
     const nextWorker = new Worker(new URL('./preprocess.worker.ts', import.meta.url), { type: 'module' });
@@ -343,7 +354,7 @@ startButton.addEventListener('click', start);
 cancelButton.addEventListener('click', () => {
   if (!running) return;
   runId += 1; worker?.terminate(); worker = undefined; running = false;
-  progressBar.classList.remove('indeterminate'); progressValue.style.width = '0%'; progressBar.setAttribute('aria-valuetext', 'Run cancelled'); resetResults('Run cancelled. No partial package is available for export.'); runState.textContent = `Run cancelled · ${elapsedText()} elapsed.`; startedAt = undefined; progressMeta.textContent = 'No active file.'; syncControls();
+  progressBar.classList.remove('indeterminate'); progressValue.style.width = '0%'; progressBar.setAttribute('aria-valuetext', 'Run cancelled'); resetResults('Run cancelled. No partial package is available for export.'); const stateText = el('span'); setUiText(stateText, 'Run cancelled'); runState.replaceChildren(stateText, document.createTextNode(` · ${elapsedText()} elapsed.`)); startedAt = undefined; setUiText(progressMeta, 'No active file.'); syncControls();
 });
 exportButton.addEventListener('click', () => {
   if (!result) return;

@@ -1,6 +1,6 @@
 # Third-party notices
 
-Robot Log Workbench uses the following direct open-source dependencies. Exact installed versions and transitive dependencies are recorded in `package-lock.json`; upstream packages retain their own license and copyright notices.
+Robot Log Workbench uses the following direct open-source dependencies. Exact installed versions and transitive dependencies are recorded in `package-lock.json` and `uv.lock`; upstream packages retain their own license and copyright notices.
 
 | Package | Purpose | License | Upstream |
 | --- | --- | --- | --- |
@@ -9,6 +9,12 @@ Robot Log Workbench uses the following direct open-source dependencies. Exact in
 | `typescript` | Type checking | Apache-2.0 | [TypeScript](https://github.com/microsoft/TypeScript) |
 | `vite` | Development server and production bundling | MIT | [Vite](https://github.com/vitejs/vite) |
 | `vitest` | Automated tests | MIT | [Vitest](https://github.com/vitest-dev/vitest) |
+| `fastapi` | Python HTTP API | MIT | [FastAPI](https://github.com/fastapi/fastapi) |
+| `uvicorn` | ASGI server | BSD-3-Clause | [Uvicorn](https://github.com/encode/uvicorn) |
+| `httpx` | API test transport | BSD-3-Clause | [HTTPX](https://github.com/encode/httpx) |
+| `cubesandbox` (optional) | Sandbox SDK | Apache-2.0 | [CubeSandbox](https://github.com/TencentCloud/CubeSandbox) |
+
+The candidate sandbox image also installs OpenAI Codex CLI (Apache-2.0), Node.js (MIT and bundled component notices), Python (PSF license), and Poppler utilities (GPL-family component licenses). Preserve image/package license notices and check redistribution obligations before distributing a built template. The supplied wiki and user uploads are private data, not licensed project dependencies, and are excluded from Git.
 
 Dependencies are installed through npm, not vendored into this repository. Their license files are distributed with the packages. Preserve applicable upstream notices when distributing dependencies or generated bundles.
 

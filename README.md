@@ -1,6 +1,8 @@
 # Robot Log Workbench
 
-A standalone browser tool for preprocessing compressed robot logs. Select archives or a folder, click **Preprocess logs**, then **Download analysis brief**. Reading, decompression, parsing, and context retrieval happen locally in Web Workers. **No Codex, API key, model calls, or LLM tokens are required.** Worker-agent integration is not part of this step.
+A browser tool for preprocessing compressed robot logs, with an optional shared Python analysis queue. Select archives or a folder, click **Preprocess logs**, then **Download analysis brief**. Reading, decompression, parsing, and local context retrieval happen in Web Workers. **Preprocessing needs no Codex, API key, model calls, or LLM tokens.** Only explicitly submitting a shared analysis uploads originals, evidence and attachments to the server.
+
+The **EN / 中文** interface switch remembers your selection. The analysis output-language selector is separate: it follows the interface until you choose it explicitly.
 
 The default brief is at most **16,000 UTF-8 bytes** of serialized JSON; this is a byte budget, not an exact token count. Keep the larger **Export JSON** package local and use **Read original context** for bounded, on-demand excerpts. The brief is a starting point, not exhaustive evidence or a diagnosis.
 
@@ -59,9 +61,46 @@ The UI shows at most 100 reports, candidates, and patterns per section; the expo
 
 These bounds constrain retained text/evidence and streamed payloads. Archive-library metadata overhead and browser file-list overhead still depend on the input; the demo is intended for trusted robot log exports, not as a hardened service for arbitrary hostile archives.
 
-## Next worker stage
+## Local shared analysis demo
 
-Worker transport and agent diagnosis are deliberately outside this demo. A future worker endpoint should validate `schemaVersion`, inspect coverage/omission fields before reasoning, and treat log text as untrusted data rather than agent instructions. The JSON export is the current handoff; there is no claim that a worker has received or analyzed it.
+Use Python through [uv](https://docs.astral.sh/uv/). From this checkout:
+
+```sh
+uv sync
+npm run build
+uv run uvicorn backend.app:app --host 127.0.0.1 --port 8000
+```
+
+Open http://127.0.0.1:8000. This serves the built UI and persistent SQLite API together. For frontend development, keep the API running and use `npm run dev -- --port 5173 --strictPort`; Vite proxies `/api`. Preprocess logs first, add an optional scene description and image/PDF attachments, select the report language, then explicitly submit. Image/PDF-only jobs are allowed. The queue works without a model, but such jobs remain queued; no analysis is fabricated.
+
+All visitors see job descriptions, activity summaries, finished reports and immutable review versions. Anyone can request a hard stop. A running job remains **stopping** until the worker confirms sandbox termination or its lease expires; the API cannot itself kill a disconnected remote VM. The worker also configures a maximum 30-minute sandbox lifetime. Reviews require a name, success/failure, an explanation and edited debugging procedure. Claims expire after 30 minutes; saving releases the claim and creates a new version. Names are not verified identities. Version-list and append endpoints provide the extension point for future version management; existing versions are not overwritten.
+
+Data stays in ignored `data/` until the operator removes it. Keep the database and upload folder together in backups. No automatic public URL, TLS, cleanup, user accounts or production abuse protection is configured. This is a local integration demo, **not a hardened internet deployment**. Public reports may contain sensitive excerpts; best-effort credential redaction is not a privacy guarantee. Do not publish confidential logs/wiki content without permission.
+
+### Configure the sandbox worker
+
+Copy `.env.example` to an ignored `.env`, replace the worker secret, and supply your Cube API URL/key/template and model key. Restart the API using `uv run --env-file .env uvicorn backend.app:app --host 127.0.0.1 --port 8000`, then in another terminal:
+
+```sh
+uv sync --extra worker
+uv run --env-file .env python -m backend.worker
+```
+
+`sandbox/Dockerfile` is a candidate Cube template based on the upstream envd image, with pinned Codex and Poppler for PDF text/page inspection. It has **not** been built, registered or boot-tested here. Follow [CubeSandbox's deployment/template instructions](https://github.com/TencentCloud/CubeSandbox) on a suitable host; do not treat an ordinary Docker container as a verified Cube template. This checkout does not install privileged Cube services or change storage. Missing Cube configuration fails closed: Codex is never launched unrestricted on the host.
+
+Each job receives its own Cube VM. Native Codex subagents share that VM, with full permissions inside it, not separate VMs per child. The main prompt and two bounded roles live in `sandbox/runtime/`; raw logs and wiki pages are data, not instructions. The worker streams and hashes original uploads and supplies bounded local evidence tools instead of putting whole archives/wiki into the prompt. The complete local wiki is in ignored `knowledge/wiki/`: 564 Markdown pages were indexed, including pages absent from its navigation index. Raw evidence and page context remain retrievable by source/line. Activity exposes coarse lifecycle events, not private reasoning or raw shell output.
+
+The model key enters the sandbox and is accessible to a full-permission agent. Use a dedicated, restricted-budget provider key and limit sandbox network access externally. Provider replacement uses `ROBOT_CODEX_PROVIDER_URL`, `ROBOT_CODEX_API_KEY_ENV` and `ROBOT_CODEX_MODEL`; the endpoint must be compatible with Codex's Responses protocol. Arbitrary providers are not automatically supported.
+
+Defaults admit at most two concurrent jobs, with 20 pending/uploading jobs and a USD 5 reservation per job against a **USD 10 Asia/Shanghai-day admission cap**. Active reservations count across midnight. Unknown actual cost is conservatively settled at the reservation. This is **not verified billing or a hard USD 10 final-charge ceiling**: in-flight jobs finish and can exceed estimates. No paid benchmark has run; the requested Luna pilot (10 minutes, below USD 5) requires a separately enforced provider spending guard before execution. CPU/RAM/disk allocation is selected in the Cube template; current metrics are not a benchmark or a sizing recommendation.
+
+```sh
+uv run python -m unittest discover -s tests_backend -v
+npm test
+npm run build
+```
+
+See [PROGRESS.md](PROGRESS.md) for implemented/tested versus externally blocked work.
 
 Library selection and format boundaries are recorded in [docs/open-source-options.md](docs/open-source-options.md). The small custom parser is limited to robot-specific normalization, source provenance, and evidence selection; archive and compression formats use existing implementations.
 
