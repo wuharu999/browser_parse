@@ -1,5 +1,17 @@
 # Analysis service progress
 
+## Public GitHub publication completed — 2026-09-10
+
+- Created public `https://github.com/wuharu999/browser_parse` and pushed `main`.
+  Initial published commit `7060ccb9ccf442a60e8da12363cc148d9cffa6d3` matched
+  the GitHub branch SHA. The earlier token-permission blocker below is resolved.
+- README, ECS/worker deployment guide, sandbox skills, automatic resource
+  profiles and tested source are published. Credentials, private wiki, uploads,
+  VM data and local editor settings remain excluded. The publication token was
+  used transiently, not stored in a file or Git configuration.
+- Public source availability does not mean the website is deployed on ECS;
+  cloud installation and representative workload/concurrency checks remain open.
+
 ## ECS/worker runbook and public-publication attempt — 2026-09-10
 
 - Added `docs/deploy-ecs-worker.md`: separate ECS/worker responsibilities,
@@ -119,15 +131,15 @@
 - [x] Real local CubeSandbox template boot, file transfer, tool execution and destruction.
 - [x] Completed Codex/DeepSeek synthetic log + image pilot and metadata-confirmed native subagents.
 - [ ] Representative large-log/PDF/full-wiki resource and concurrency benchmark.
-- [ ] Public GitHub repository and push (latest user request supersedes private).
+- [x] Public GitHub repository and push (latest user request supersedes private).
 
 ## Current external blockers
 
 CubeSandbox is now installed in the disposable local VM and its template has booted successfully; see the latest section above. Production cloud deployment still requires nested KVM support and an operationally secured worker. No host storage has been reformatted or reconfigured.
 
-GitHub repository creation still fails with HTTP 403 on the latest attempt;
-see the public-publication section above. Commits remain local; no successful
-push or visibility change is claimed. Never put credentials in this file.
+GitHub publication is complete; earlier HTTP 403 failures are retained above as
+historical attempts. ECS deployment and representative cloud load testing remain
+outstanding. Never put credentials in this file.
 
 ## Resource estimates versus measurements
 
