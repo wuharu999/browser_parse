@@ -6,6 +6,7 @@ from pathlib import Path
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("evidence", Path(__file__).parents[1] / "sandbox/runtime/evidence.py")
 evidence = importlib.util.module_from_spec(spec)
@@ -49,6 +50,21 @@ class EvidenceTests(unittest.TestCase):
             (root / "job.json").write_text(json.dumps(job))
             result = evidence.log_context(root, "source-0/entry-1", 1, 20)
             self.assertEqual(result["lines"][0]["text"], "ERROR motor 33 code 16")
+
+    def test_log_context_hashes_upload_without_python_311_file_digest(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            path = root / "robot.log"
+            path.write_bytes(b"motor recovered\n")
+            job = {"files": [{"name": "robot.log", "local_path": "robot.log", "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}], "evidence": {
+                "source": {"catalog": [{"name": "robot.log"}]}, "files": [{"sourceId": "source-0", "sourceIndex": 0,
+                "path": "robot.log", "retrieval": "direct"}]}}
+            (root / "job.json").write_text(json.dumps(job))
+
+            with patch.object(evidence.hashlib, "file_digest", None, create=True):
+                result = evidence.log_context(root, "source-0", 1, 20)
+
+            self.assertEqual(result["lines"][0]["text"], "motor recovered")
 
 
 if __name__ == "__main__":

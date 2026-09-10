@@ -26,6 +26,13 @@ def encode(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def sha256_stream(stream) -> str:
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
 def bounded(value: dict, limit: int = 12000) -> str:
     limit = max(2048, min(65536, limit))
     key = "lines" if "lines" in value else "results"
@@ -165,7 +172,7 @@ def log_context(workspace: Path, source_id: str, start: int, count: int) -> dict
     artifact = files[index]
     path = inside(workspace, artifact["local_path"])
     with path.open("rb") as original:
-        digest = hashlib.file_digest(original, "sha256").hexdigest()
+        digest = sha256_stream(original)
     if digest != artifact.get("sha256"):
         raise ValueError("Original upload digest does not match its immutable job manifest")
     member_name = report["path"].split("!/", 1)[1] if "!/" in report["path"] else None

@@ -1,5 +1,21 @@
 # Analysis service progress
 
+## Local Cube and exact DeepSeek vision ID — 2026-09-10
+
+- Configured exactly `deepseek-v4-flash-vision-exp` in the ignored, mode-0600 local environment and example configuration. DeepSeek's direct image test accepted this ID and read the screenshot heading correctly (214 input + 6 output tokens); its response reported serving model `deepseek-flash`, consistent with the documented retired-alias routing. The application does not substitute the requested ID.
+- Installed CubeSandbox v0.7.0 inside its official OpenCloudOS development VM, using nested KVM in an unprivileged Docker/QEMU wrapper. Health checks passed. No Ubuntu host filesystem, DNS or privileged Cube service was reconfigured. Upstream source revision: `adbb358dc7c184fb7ef979739e0962debc885c62`.
+- Built the reusable Codex 0.153.4 / Python 3.10.12 / Poppler 22.02 / ripgrep image. Refreshed local template `tpl-000995539963488d9fbd5ca8` is READY with 2000m CPU, 4096 MiB RAM and 12G writable layer. A real SDK smoke test passed file transfer, command execution and sandbox destruction. The local-only registry and VM manager are documented in `docs/local-sandbox.md`.
+- First browser-submitted TAR.GZ + screenshot pilot reached a real sandbox, then failed before model execution because Cube rejects creating an existing `/workspace`. Added a realistic regression and SDK-aware directory handling. The failed job is retained in history; its USD 5 settlement is a conservative unknown-cost reservation, not a provider charge measurement.
+- Added forwarded proxy-port support without host DNS changes, resource sampling, provisional 8-vCPU/16-GiB cloud profiles, and Vitest discovery restricted to this project's tests (not the ignored Cube source tree).
+- Fixed the custom model catalog's required baseline instructions after a no-paid Codex startup test caught the missing field; rebuilt and registered the image. Startup then emitted real thread/turn events against a deliberately unreachable local dummy provider.
+- **Real UI → preprocessing → upload → queue → Cube → Codex/DeepSeek → report completed**, job `d864a5e8797a6da75ad753fa847fd412`, in **93.287 seconds** (runner 88.286 seconds). Inputs were a seven-line synthetic TAR.GZ and a UI PNG (~126 KB combined), with a tiny synthetic wiki fixture, not the full wiki. The browser displayed summary, nine evidence items, uncertainties, eight workflow steps, review entry and persisted session activity without horizontal overflow.
+- **Two actual native child sessions verified** from safe session metadata: `01a08a1d-1d07-7621-9495-ab0e574f3bc4` and `01a08a1d-24d5-7cb1-8579-7b822ca7190c`, both marked `source.subagent`, alongside the parent session. Private reasoning/transcripts were not exported. They shared job VM `331f53479de542f497a13b9322545de6`; Cube reported zero live sandboxes after completion. Automatic UI child-event attribution is still incomplete; this proof came from a separate metadata-only diagnostic.
+- The run exposed a Python 3.10 incompatibility (`hashlib.file_digest`, added in 3.11). The model used a bounded direct archive-reading fallback and completed. The helper now uses streaming SHA-256 with regression coverage for the image's Python version.
+- Model report is preserved verbatim, **not human-verified**: it correctly avoids inventing a physical cause, but incorrectly says timezone is missing despite `Z` timestamps, and repeats the fixture's “no model output” wording even though this report was model-generated. The ISO-prefixed fixture's severity metadata was unknown and the agent flagged it. These remain quality/recognition follow-ups, not evidence of a solved real incident.
+- Cost remains **unknown** across all child requests; reported parent/session counters were 129115 input, 112512 cached input, 7435 output and 2016 reasoning-output tokens. Do not add reasoning to output without checking provider semantics. The two pilot admissions consumed the day's USD 10 conservative reservation allowance (including the pre-execution failure); this is not a measured USD 10 bill and the cap was not bypassed.
+- A representative PDF workload, full-wiki transfer benchmark, two-job cloud load test, VPN-free connectivity and public production deployment remain unverified. See `docs/resource-profiles.md` for measured tiny-case versus provisional sizing.
+- Final verification: **56 Python + 43 TypeScript = 99 passing tests**, production build/typecheck and diff checks pass. Evidence tests also pass offline in the actual image's Python 3.10.12. API/UI remains at `http://127.0.0.1:8000`; the single worker is running with the normal wiki path restored. Today's reservation allowance is exhausted, so further submitted jobs queue until the next Asia/Shanghai day rather than bypassing the cap.
+
 ## Simplified frontend and session view — 2026-09-10
 
 - Replaced the separate preprocessing/dashboard controls with one upload-files/folder + incident-description form. Browser preprocessing is automatic and token-free; no intermediate exports/settings are exposed. Existing streaming archive libraries and preprocessing modules remain intact.
@@ -19,7 +35,7 @@
 - Daily USD 10 admission budget; already-running work finishes. This cannot guarantee a USD 10 final bill when in-flight work costs more than reserved.
 - Full command permissions only inside a CubeSandbox job VM. No unrestricted host Codex fallback. Native Codex subagents share that job VM.
 - Any visitor may hard-stop any analysis job; a job also hard-stops after 30 minutes. Stopping destroys the job sandbox and child processes, not unrelated host processes.
-- First paid benchmark: Luna only, at most 10 minutes and below USD 5. No paid run has been performed yet.
+- Original benchmark request was Luna, at most 10 minutes and below USD 5; the user subsequently selected DeepSeek and explicitly reconfirmed `deepseek-v4-flash-vision-exp`. Local pilot timeout is 600 seconds with one worker; provider-enforced spending limits remain separate from the application's reservation accounting.
 
 ## Checklist
 
@@ -31,12 +47,14 @@
 - [x] CubeSandbox worker, cancellation and bounded process telemetry implemented and mock-tested, not VM-validated.
 - [x] Runtime roles, PDF/evidence skills and indexed wiki tools. Local wiki copy is ignored by Git.
 - [x] Local API/UI integration and focused input/concurrency checks; not a production penetration test.
-- [ ] Real CubeSandbox boot, Codex native-subagent proof and Luna resource benchmark.
+- [x] Real local CubeSandbox template boot, file transfer, tool execution and destruction.
+- [x] Completed Codex/DeepSeek synthetic log + image pilot and metadata-confirmed native subagents.
+- [ ] Representative large-log/PDF/full-wiki resource and concurrency benchmark.
 - [ ] Private GitHub push.
 
 ## Current external blockers
 
-CubeSandbox is not installed. Real sandbox validation needs a configured API endpoint and template; installing its privileged host services/storage is not part of ordinary local app setup. No host storage has been reformatted or reconfigured.
+CubeSandbox is now installed in the disposable local VM and its template has booted successfully; see the latest section above. Production cloud deployment still requires nested KVM support and an operationally secured worker. No host storage has been reformatted or reconfigured.
 
 GitHub repository creation failed with HTTP 403 using both available credentials. The cleanup commit is local; no successful push is claimed. Never put credentials in this file.
 

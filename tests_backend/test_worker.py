@@ -15,15 +15,47 @@ from backend.worker import CubeWorker, WorkerApi, WorkerConfig, WorkerError, _in
 class Files:
     def __init__(self) -> None:
         self.values: dict[str, bytes | str] = {}
+        self.directories: set[str] = set()
 
-    def make_dir(self, _path: str) -> None:
-        pass
+    def exists(self, path: str) -> bool:
+        return path in self.directories or path in self.values
+
+    def stat(self, path: str) -> dict[str, str]:
+        if path in self.directories:
+            return {"type": "FILE_TYPE_DIRECTORY"}
+        if path in self.values:
+            return {"type": "FILE_TYPE_REGULAR"}
+        raise FileNotFoundError(path)
+
+    def make_dir(self, path: str) -> None:
+        self.directories.add(path)
 
     def write(self, path: str, value: bytes | str) -> None:
         self.values[path] = value
 
     def read(self, path: str) -> bytes | str:
         return self.values[path]
+
+
+class ExistingRootFiles(Files):
+    def __init__(self) -> None:
+        super().__init__()
+        self.directories = {"/workspace"}
+
+    def exists(self, path: str) -> bool:
+        return path in self.directories or path in self.values
+
+    def stat(self, path: str) -> dict[str, str]:
+        if path in self.directories:
+            return {"type": "FILE_TYPE_DIRECTORY"}
+        if path in self.values:
+            return {"type": "FILE_TYPE_REGULAR"}
+        raise FileNotFoundError(path)
+
+    def make_dir(self, path: str) -> None:
+        if self.exists(path):
+            raise OSError(f"Filesystem MakeDir failed: already_exists: directory already exists: {path}")
+        self.directories.add(path)
 
 
 class Commands:
@@ -69,6 +101,17 @@ class Sandbox:
         return instance
 
 
+class ExistingRootSandbox(Sandbox):
+    @classmethod
+    def create(cls, *, config: object, env_vars: dict[str, str], timeout: int) -> SandboxInstance:
+        instance = SandboxInstance()
+        instance.files = ExistingRootFiles()
+        instance.commands = Commands(instance.files)
+        instance.timeout = timeout
+        cls.created.append((instance, config, env_vars))
+        return instance
+
+
 class Api:
     def __init__(self, job: dict | None, blobs: dict[str, bytes] | None = None) -> None:
         self.job, self.blobs = job, blobs or {}
@@ -103,7 +146,7 @@ class WorkerTests(unittest.TestCase):
         self.config = WorkerConfig(
             api_url="http://127.0.0.1:8000", worker_token="worker-token",
             cube_api_url="http://cube:3000", cube_api_key="cube-key", cube_template_id="template",
-            cube_proxy_node_ip=None, codex_model="gpt-5.6-luna", codex_provider_url=None,
+            cube_proxy_node_ip=None, cube_proxy_port_http=None, codex_model="gpt-5.6-luna", codex_provider_url=None,
             codex_api_key_env="OPENAI_API_KEY", codex_api_key="model-key", timeout_seconds=1800,
             poll_seconds=0.01, runtime_dir=runtime, wiki_dir=None,
             parallel=2,
@@ -134,6 +177,20 @@ class WorkerTests(unittest.TestCase):
         self.assertIsNone(api.finished[0]["cost_usd"])
         self.assertEqual(api.finished[0]["metrics"]["cost_source"], "unknown")
 
+    def test_run_job_accepts_existing_workspace_and_creates_transfer_directories(self) -> None:
+        data = b"synthetic log"
+        job = {"id": "job-existing-root", "files": [{
+            "id": "log", "name": "robot.log", "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }]}
+        api = Api(job, {"log": data})
+
+        self.assertTrue(CubeWorker(self.config, api, ExistingRootSandbox).run_once())
+
+        instance = ExistingRootSandbox.created[0][0]
+        self.assertEqual(api.finished[0]["status"], "completed")
+        self.assertTrue({"/workspace/inputs", "/workspace/.upload", "/workspace/.upload/log"}.issubset(instance.files.directories))
+
     def test_bad_manifest_hash_never_reaches_codex(self) -> None:
         job = {"id": "job-2", "files": [{"id": "x", "name": "x.log", "size": 1, "sha256": "0" * 64}]}
         api = Api(job, {"x": b"x"})
@@ -146,6 +203,17 @@ class WorkerTests(unittest.TestCase):
         CubeWorker(self.config, api, Sandbox).run_once()
         self.assertEqual(Sandbox.created, [])
         self.assertEqual(api.finished[0]["status"], "cancelled")
+
+    def test_cube_config_passes_optional_forwarded_proxy_port(self) -> None:
+        worker = CubeWorker(replace(self.config, cube_proxy_node_ip="127.0.0.1", cube_proxy_port_http=11080), Api(None), Sandbox)
+        _, config = worker._cube(90)
+        self.assertEqual(config["proxy_node_ip"], "127.0.0.1")
+        self.assertEqual(config["proxy_port"], 11080)
+
+    def test_cube_config_omits_proxy_port_to_preserve_sdk_default(self) -> None:
+        worker = CubeWorker(self.config, Api(None), Sandbox)
+        _, config = worker._cube(90)
+        self.assertNotIn("proxy_port", config)
 
     def test_input_path_preserves_archive_suffix_without_traversal(self) -> None:
         self.assertEqual(_input_path("a/b", "../../data.tar.gz"), "inputs/a_b.tar.gz")
@@ -262,4 +330,18 @@ class WorkerApiTests(unittest.TestCase):
     def test_from_env_fails_closed_without_cube_or_model_secret(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
             with self.assertRaises(WorkerError):
+                WorkerConfig.from_env()
+
+    def test_from_env_validates_optional_cube_proxy_port(self) -> None:
+        required = {
+            "ROBOT_WORKER_TOKEN": "worker",
+            "CUBE_API_URL": "http://127.0.0.1:13000",
+            "CUBE_API_KEY": "local",
+            "CUBE_TEMPLATE_ID": "template",
+            "OPENAI_API_KEY": "model",
+        }
+        with patch.dict("os.environ", {**required, "CUBE_PROXY_PORT_HTTP": "11080"}, clear=True):
+            self.assertEqual(WorkerConfig.from_env().cube_proxy_port_http, 11080)
+        with patch.dict("os.environ", {**required, "CUBE_PROXY_PORT_HTTP": "70000"}, clear=True):
+            with self.assertRaisesRegex(WorkerError, "between 1 and 65535"):
                 WorkerConfig.from_env()

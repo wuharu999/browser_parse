@@ -7,17 +7,17 @@ Checked 2026-09-10. Keep Codex for the first DeepSeek integration; do not replac
 The example environment now selects:
 
 ```dotenv
-ROBOT_CODEX_MODEL=deepseek-v4-flash
+ROBOT_CODEX_MODEL=deepseek-v4-flash-vision-exp
 ROBOT_CODEX_PROVIDER_URL=https://api.deepseek.com
 ROBOT_CODEX_API_KEY_ENV=DEEPSEEK_API_KEY
 DEEPSEEK_API_KEY=replace-locally-never-commit
 ```
 
-Keep the Cube settings from `.env.example`. Run the API and worker with `uv run --env-file .env ...` as described in the README. No host Codex fallback was added. The wrapper writes a job-local catalog for the three documented DeepSeek model IDs, uses environment-based credentials, disables WebSockets/web search, and retains the two native subagent roles. Its catalog was matched to the installed [Codex 0.153.4 schema](https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/protocol/src/openai_models.rs). Existing OpenAI/custom-provider settings still work; without explicit environment settings the worker's legacy default remains Luna.
+Keep the Cube settings from `.env.example`. Run the API and worker with `uv run --env-file .env ...` as described in the README. No host Codex fallback was added. The wrapper writes a job-local catalog for the current `deepseek-flash` and compatible legacy DeepSeek IDs, uses environment-based credentials, disables WebSockets/web search, and retains the two native subagent roles. Its catalog was matched to the installed [Codex 0.153.4 schema](https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/protocol/src/openai_models.rs). Existing OpenAI/custom-provider settings still work; without explicit environment settings the worker's legacy default remains Luna.
 
-`deepseek-v4-flash` and `deepseek-v4-pro` are text-only. For image inspection the documented option is `deepseek-v4-flash-vision-exp`, an experimental vision model. Extracting PDF text with Poppler works independently, but PDF charts/screenshots require real vision or a separate OCR stage. A PDF skill alone cannot give a text-only model visual understanding. [DeepSeek image compatibility](https://api-docs.deepseek.com/guides/responses_api/#image-input)
+`deepseek-v4-flash-vision-exp` is selected explicitly at the user's request. DeepSeek documents it as a retired compatibility alias served by the current vision model, `deepseek-flash`; the application does not silently rewrite the requested ID. A tiny authenticated image call using the exact requested alias returned HTTP 200 and correctly read the screenshot heading, with `deepseek-flash` in the response's model field (214 input + 6 output tokens). The authenticated model listing advertised `deepseek-flash` and `deepseek-v4-pro`. These are provider/image-call observations, not native-subagent proof. `deepseek-v4-flash` and `deepseek-v4-pro` remain text-only in our catalog. Extracting PDF text with Poppler works independently, but PDF charts/screenshots require vision or OCR. [DeepSeek vision guide](https://api-docs.deepseek.com/guides/vision/) and [Codex integration](https://api-docs.deepseek.com/quick_start/agent_integrations/codex/)
 
-This is configuration/unit-test support, **not a completed live DeepSeek analysis or native-subagent benchmark**. No model key or Cube service is configured here. Before public use, validate one bounded real job, image/PDF handling, child-agent creation, provider usage and whole-VM termination. No VPN software is required by the application itself; the worker must still reach its chosen provider and Cube endpoint. The previous machine checks had an active tunnel and do not establish VPN-free access.
+The ignored local environment has provider credentials and a healthy Cube development VM; credentials are never part of the image or repository. See [local setup](local-sandbox.md) and [current validation results](../PROGRESS.md) for the distinction between direct image tests, sandbox execution and native-subagent proof. Before public use, validate representative jobs, image/PDF handling, provider usage and whole-VM termination. No VPN software is required by the application itself; the worker must still reach its chosen provider and Cube endpoint. The previous machine checks had an active tunnel and do not establish VPN-free access.
 
 ## Qwen alternative: OpenCode
 

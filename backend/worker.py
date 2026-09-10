@@ -101,6 +101,7 @@ class WorkerConfig:
     cube_api_key: str
     cube_template_id: str
     cube_proxy_node_ip: str | None
+    cube_proxy_port_http: int | None
     codex_model: str
     codex_provider_url: str | None
     codex_api_key_env: str
@@ -120,6 +121,13 @@ class WorkerConfig:
         runtime = Path(_env("ROBOT_SANDBOX_RUNTIME", str(Path(__file__).resolve().parents[1] / "sandbox" / "runtime")))
         wiki = os.environ.get("ROBOT_WIKI_DIR")
         default_wiki = Path(__file__).resolve().parents[1] / "knowledge" / "wiki"
+        proxy_port_text = os.environ.get("CUBE_PROXY_PORT_HTTP")
+        try:
+            proxy_port = int(proxy_port_text) if proxy_port_text else None
+        except ValueError as exc:
+            raise WorkerError("CUBE_PROXY_PORT_HTTP must be an integer") from exc
+        if proxy_port is not None and not 1 <= proxy_port <= 65535:
+            raise WorkerError("CUBE_PROXY_PORT_HTTP must be between 1 and 65535")
         return cls(
             api_url=_env("ROBOT_API_URL", "http://127.0.0.1:8000").rstrip("/"),
             worker_token=_env("ROBOT_WORKER_TOKEN", required=True),
@@ -127,6 +135,7 @@ class WorkerConfig:
             cube_api_key=_env("CUBE_API_KEY", required=True),
             cube_template_id=_env("CUBE_TEMPLATE_ID", required=True),
             cube_proxy_node_ip=os.environ.get("CUBE_PROXY_NODE_IP") or None,
+            cube_proxy_port_http=proxy_port,
             codex_model=_env("ROBOT_CODEX_MODEL", "gpt-5.6-luna"),
             codex_provider_url=os.environ.get("ROBOT_CODEX_PROVIDER_URL") or None,
             codex_api_key_env=key_env,
@@ -232,11 +241,13 @@ class CubeWorker:
         }
         if self.config.cube_proxy_node_ip:
             values["proxy_node_ip"] = self.config.cube_proxy_node_ip
+        if self.config.cube_proxy_port_http is not None:
+            values["proxy_port"] = self.config.cube_proxy_port_http
         return Sandbox, Config(**values)
 
     def _config_object(self, timeout_seconds: int) -> Any:
         """Tests can replace this with a harmless object; production imports Config."""
-        return {
+        values = {
             "api_url": self.config.cube_api_url,
             "api_key": self.config.cube_api_key,
             "template_id": self.config.cube_template_id,
@@ -244,6 +255,9 @@ class CubeWorker:
             "timeout": timeout_seconds,
             "request_timeout": timeout_seconds + 30,
         }
+        if self.config.cube_proxy_port_http is not None:
+            values["proxy_port"] = self.config.cube_proxy_port_http
+        return values
 
     def _sandbox_env(self, timeout_seconds: int) -> dict[str, str]:
         values = {
@@ -256,6 +270,14 @@ class CubeWorker:
         if self.config.codex_provider_url:
             values["CODEX_PROVIDER_URL"] = self.config.codex_provider_url
         return values
+
+    @staticmethod
+    def _ensure_dir(sandbox: Any, path: str) -> None:
+        if sandbox.files.exists(path):
+            if sandbox.files.stat(path).get("type") != "FILE_TYPE_DIRECTORY":
+                raise WorkerError(f"sandbox path exists but is not a directory: {path}")
+            return
+        sandbox.files.make_dir(path)
 
     @staticmethod
     def _write_tree(sandbox: Any, source: Path, destination: str) -> None:
@@ -271,7 +293,7 @@ class CubeWorker:
                 continue
             remote = PurePosixPath(destination, *relative.parts)
             if str(remote.parent) not in made:
-                sandbox.files.make_dir(str(remote.parent)); made.add(str(remote.parent))
+                CubeWorker._ensure_dir(sandbox, str(remote.parent)); made.add(str(remote.parent))
             sandbox.files.write(str(remote), path.read_bytes())
 
     def _checkpoint(self, job_id: str, deadline: float) -> None:
@@ -284,8 +306,8 @@ class CubeWorker:
         files = job.get("files", [])
         if not isinstance(files, list):
             raise WorkerError("job file manifest is invalid")
-        sandbox.files.make_dir("/workspace/inputs")
-        sandbox.files.make_dir("/workspace/.upload")
+        self._ensure_dir(sandbox, "/workspace/inputs")
+        self._ensure_dir(sandbox, "/workspace/.upload")
         with tempfile.TemporaryDirectory(prefix="robot-worker-") as temporary:
           for item in files:
             self._checkpoint(str(job["id"]), deadline)
@@ -302,7 +324,7 @@ class CubeWorker:
             local_path = _input_path(file_id, name)
             item["local_path"] = local_path
             chunks: list[str] = []
-            sandbox.files.make_dir(f"/workspace/.upload/{file_id}")
+            self._ensure_dir(sandbox, f"/workspace/.upload/{file_id}")
             with staged.open("rb") as stream:
                 for index, chunk in enumerate(iter(lambda: stream.read(TRANSFER_CHUNK_BYTES), b"")):
                     self._checkpoint(str(job["id"]), deadline)
@@ -317,7 +339,7 @@ class CubeWorker:
         if not self.config.wiki_dir.is_dir():
             raise WorkerError(f"ROBOT_WIKI_DIR is unavailable: {self.config.wiki_dir}")
         root = self.config.wiki_dir.resolve()
-        sandbox.files.make_dir("/workspace/wiki")
+        self._ensure_dir(sandbox, "/workspace/wiki")
         made = {"/workspace/wiki"}
         for path in sorted(root.rglob("*")):
             self._checkpoint(job_id, deadline)
@@ -328,7 +350,7 @@ class CubeWorker:
             relative = path.resolve().relative_to(root)
             remote = PurePosixPath("/workspace/wiki", *relative.parts)
             if str(remote.parent) not in made:
-                sandbox.files.make_dir(str(remote.parent)); made.add(str(remote.parent))
+                self._ensure_dir(sandbox, str(remote.parent)); made.add(str(remote.parent))
             sandbox.files.write(str(remote), path.read_bytes())
 
     def _event(self, job_id: str, kind: str, message: str, agent: str = "worker") -> None:
@@ -417,7 +439,7 @@ class CubeWorker:
             Sandbox, cube_config = self._cube(timeout_seconds)
             sandbox = Sandbox.create(config=cube_config, env_vars=self._sandbox_env(timeout_seconds), timeout=timeout_seconds)
             self._event(job_id, "progress", "Sandbox created; preparing evidence.")
-            sandbox.files.make_dir("/workspace")
+            self._ensure_dir(sandbox, "/workspace")
             self._write_tree(sandbox, self.config.runtime_dir, "/workspace")
             self._checkpoint(job_id, deadline)
             self._upload_wiki(sandbox, job_id, deadline)

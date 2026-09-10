@@ -223,11 +223,22 @@ def _write_config(model: str) -> None:
     lines = [f"model = {json.dumps(model)}"]
     provider_url = os.environ.get("CODEX_PROVIDER_URL")
     key_env = os.environ.get("CODEX_PROVIDER_ENV_KEY", "OPENAI_API_KEY")
-    if provider_url and model in {"deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4-flash-vision-exp"}:
+    deepseek_modalities = {
+        "deepseek-flash": ["text", "image"],
+        # Retained provider aliases: Flash and Pro are text-only; the retired
+        # experimental vision alias remains image-capable for existing jobs.
+        "deepseek-v4-flash": ["text"],
+        "deepseek-v4-pro": ["text"],
+        "deepseek-v4-flash-vision-exp": ["text", "image"],
+    }
+    if provider_url and model in deepseek_modalities:
         # Official DeepSeek capability metadata, matched to Codex 0.153.4 ModelInfo.
-        # Keep built-in Codex instructions; our bounded job instructions arrive via stdin.
+        # A short required baseline plus bounded job instructions sent via stdin.
         catalog = {"models": [{
             "slug": model, "display_name": model, "description": "DeepSeek Responses API",
+            # Codex 0.153.4 requires this or model_messages.instructions_template
+            # for every catalog model; keep it job-local and provider-neutral.
+            "base_instructions": "You are Codex. Follow the user's task instructions, use available tools when needed, and provide concise, accurate results.",
             "default_reasoning_level": "high",
             "supported_reasoning_levels": [{"effort": value, "description": value} for value in ("low", "high", "max")],
             "shell_type": "shell_command", "visibility": "list", "supported_in_api": True,
@@ -237,8 +248,8 @@ def _write_config(model: str) -> None:
             "truncation_policy": {"mode": "tokens", "limit": 10000},
             "context_window": 1048576, "max_context_window": 1048576,
             "effective_context_window_percent": 95, "experimental_supported_tools": [],
-            "input_modalities": ["text", "image"] if model.endswith("vision-exp") else ["text"],
-            "supports_image_detail_original": model.endswith("vision-exp"),
+            "input_modalities": deepseek_modalities[model],
+            "supports_image_detail_original": "image" in deepseek_modalities[model],
             "default_reasoning_summary": "none", "supports_search_tool": False,
             "use_responses_lite": False, "multi_agent_version": "v2",
         }]}

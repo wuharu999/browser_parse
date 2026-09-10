@@ -1,6 +1,6 @@
 # Project structure
 
-Robot Log Workbench presents one integrated shared analysis UI. Browser preprocessing runs automatically during submission, while FastAPI owns persistent history, uploads, status, hard stops, reports, and versioned human reviews. It reuses open-source archive readers and CubeSandbox. Real model execution requires an external Cube endpoint/template; the local app does not silently execute agents on its host.
+Robot Log Workbench presents one integrated shared analysis UI. Browser preprocessing runs automatically during submission, while FastAPI owns persistent history, uploads, status, hard stops, reports, and versioned human reviews. It reuses open-source archive readers and CubeSandbox. Real model execution requires a Cube endpoint/template; the local development VM provides one without silently executing agents on the host.
 
 ## Source tree
 
@@ -20,10 +20,14 @@ browser_parse/
 ├── THIRD_PARTY_NOTICES.md     # Direct dependency licenses and attribution
 ├── docs/
 │   ├── open-source-options.md # Archive-library decision and format boundaries
-│   └── model-providers.md     # DeepSeek setup, Qwen/OpenCode option and cost assumptions
+│   ├── model-providers.md     # DeepSeek setup, Qwen/OpenCode option and cost assumptions
+│   ├── local-sandbox.md       # Disposable local Cube VM and forwarded networking
+│   └── resource-profiles.md   # Provisional cloud sizing and measurement boundaries
 ├── scripts/
 │   ├── estimate_cost.py       # Dependency-free offline multi-agent cost estimator
-│   └── seed_demo.py           # Idempotent completed synthetic UI examples
+│   ├── seed_demo.py           # Idempotent completed synthetic UI examples
+│   ├── cube_local.sh          # Conservative local VM start/status/ssh/stop
+│   └── benchmark_resources.py # Bounded, credential-free Linux resource sampling
 ├── public/examples/           # Downloadable synthetic log for upload testing
 ├── src/
 │   ├── main.ts                # Integrated submission, history, status, reports and reviews
@@ -43,7 +47,8 @@ browser_parse/
 │   ├── store.py               # SQLite queue, budget reservations, claims and versions
 │   └── worker.py              # Cube-only transfers, concurrency, cancel and timeout
 ├── sandbox/
-│   ├── Dockerfile             # Unverified Cube template candidate; Codex + Poppler
+│   ├── Dockerfile             # Boot-tested reusable Cube image; Codex + Poppler
+│   ├── HostVM.Dockerfile       # Unprivileged Docker wrapper for local QEMU tools
 │   ├── run_codex.py           # In-VM headless runner and bounded public telemetry
 │   └── runtime/
 │       ├── MAIN_PROMPT.md     # Main analysis prompt shared across jobs
@@ -102,4 +107,4 @@ npm test
 npm run build
 ```
 
-During development, open port 5175 and keep the port-8000 API running for Vite's `/api` proxy. For the integrated production-style local path, run `npm run build`, start the API, and open port 8000; FastAPI serves `dist/`. `uv run python scripts/seed_demo.py` adds exactly three completed, synthetic examples without AI calls or queue work and is safe to rerun. Real Cube execution remains blocked until an external template is built, registered, and boot-tested and valid provider credentials are configured. Byte budgets are not exact token counts, and sampled evidence is not a diagnosis.
+During development, open port 5175 and keep the port-8000 API running for Vite's `/api` proxy. For the integrated production-style local path, run `npm run build`, start the API, and open port 8000; FastAPI serves `dist/`. `uv run python scripts/seed_demo.py` adds exactly three completed, synthetic examples without AI calls or queue work and is safe to rerun. See `docs/local-sandbox.md` for the boot-tested development template and `PROGRESS.md` for actual end-to-end validation status. Byte budgets are not exact token counts, and sampled evidence is not a diagnosis.
