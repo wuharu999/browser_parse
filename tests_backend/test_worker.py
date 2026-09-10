@@ -164,6 +164,27 @@ class WorkerTests(unittest.TestCase):
         from backend.worker import _safe_text
         self.assertEqual(_safe_text("# Report\n\n- finding\r\n- next"), "# Report\n\n- finding\n- next")
 
+    def test_safe_final_report_preserves_relative_source_provenance(self) -> None:
+        from backend.worker import _safe_report
+        report = json.dumps({"schemaVersion": "robot-analysis/v1", "source": "archive/folder/log.txt", "findings": ["x" * 8500]})
+        cleaned = _safe_report(report, self.config.codex_api_key and (self.config.codex_api_key,))
+        self.assertEqual(json.loads(cleaned)["source"], "archive/folder/log.txt")
+        self.assertGreater(len(cleaned), 800)
+
+    def test_safe_json_report_redacts_string_values_without_breaking_schema(self) -> None:
+        from backend.worker import _safe_report
+        report = json.dumps({
+            "schemaVersion": "robot-analysis/v1",
+            "source": "archive/folder/log.txt",
+            "evidence": [{"excerpt": "token=abc123 password=letmein; observed timeout"}],
+        })
+        cleaned = _safe_report(report)
+        parsed = json.loads(cleaned)
+        self.assertEqual(parsed["source"], "archive/folder/log.txt")
+        self.assertNotIn("abc123", cleaned)
+        self.assertNotIn("letmein", cleaned)
+        self.assertIn("observed timeout", parsed["evidence"][0]["excerpt"])
+
     def test_wiki_transfer_accepts_bounded_image_larger_than_markdown_index_cap(self) -> None:
         wiki = Path(self.temp.name, "wiki")
         wiki.mkdir()
@@ -182,6 +203,29 @@ class WorkerTests(unittest.TestCase):
         sandbox.files.write("/workspace/activity.jsonl", '{"seq":401,"agent":"log_investigator","message":"Codex activity: turn.started"}\n{"seq":402,"agent":"evidence_reviewer","message":"Codex activity: turn.completed"}\n')
         self.assertEqual(worker._activity(sandbox, "job-activity", seen), 402)
         self.assertEqual([event["agent"] for event in api.events], ["log_investigator", "evidence_reviewer"])
+
+    def test_activity_worker_suppresses_tool_payload_and_redacts_messages(self) -> None:
+        api = Api(None)
+        worker = CubeWorker(self.config, api, Sandbox)
+        sandbox = SandboxInstance()
+        sandbox.files.write("/workspace/activity.jsonl", "\n".join([
+            json.dumps({"seq": 1, "agent": "codex", "kind": "tool", "message": "rm /private/path --token=model-key"}),
+            json.dumps({"seq": 2, "agent": "codex", "kind": "message", "message": "token=model-key; reviewed evidence"}),
+        ]) + "\n")
+        self.assertEqual(worker._activity(sandbox, "job-activity", 0), 2)
+        self.assertEqual(api.events[0]["message"], "Codex tool execution update.")
+        self.assertNotIn("model-key", api.events[1]["message"])
+        self.assertIn("reviewed evidence", api.events[1]["message"])
+
+    def test_activity_worker_keeps_fixed_tool_completion_status(self) -> None:
+        api = Api(None)
+        worker = CubeWorker(self.config, api, Sandbox)
+        sandbox = SandboxInstance()
+        sandbox.files.write("/workspace/activity.jsonl", json.dumps({
+            "seq": 1, "agent": "codex", "kind": "tool", "message": "Codex tool execution completed.",
+        }) + "\n")
+        worker._activity(sandbox, "job-activity", 0)
+        self.assertEqual(api.events[0]["message"], "Codex tool execution completed.")
 
     def test_unconfirmed_cleanup_does_not_terminalize_successful_job(self) -> None:
         api = Api({"id": "job-kill", "files": []})

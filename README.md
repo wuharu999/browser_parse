@@ -1,10 +1,12 @@
 # Robot Log Workbench
 
-A browser tool for preprocessing compressed robot logs, with an optional shared Python analysis queue. Select archives or a folder, click **Preprocess logs**, then **Download analysis brief**. Reading, decompression, parsing, and local context retrieval happen in Web Workers. **Preprocessing needs no Codex, API key, model calls, or LLM tokens.** Only explicitly submitting a shared analysis uploads originals, evidence and attachments to the server.
+A shared robot-incident analysis workbench with automatic in-browser log preprocessing and an optional CubeSandbox model worker. To create an analysis, choose log files or a folder, add any image/PDF attachments, describe the incident, choose the report language, and submit. The browser preprocesses recognizable logs in a Web Worker and then uploads the originals, attachments, and bounded evidence package to the shared backend. **Preprocessing itself needs no Codex, API key, model call, or LLM tokens.**
+
+The integrated EN/中文 interface has a shared history on the left and the selected analysis on the right. Everyone connected to the same backend can see active status and scrollable public session activity, open completed reports, or request the public hard stop. Structured results show the summary, source-grounded evidence chain, uncertainties, and an editable ordered workflow. Human reviews add a name, outcome, note, and edited workflow as a new immutable version; they remain separate from the model report.
 
 The **EN / 中文** interface switch remembers your selection. The analysis output-language selector is separate: it follows the interface until you choose it explicitly.
 
-The default brief is at most **16,000 UTF-8 bytes** of serialized JSON; this is a byte budget, not an exact token count. Keep the larger **Export JSON** package local and use **Read original context** for bounded, on-demand excerpts. The brief is a starting point, not exhaustive evidence or a diagnosis.
+The UI intentionally exposes no preprocessing settings, evidence export, brief download, or local-context controls. Those remain developer APIs: `robot-log-evidence/v2`, `robot-log-brief/v1`, and bounded context replay are used internally and remain covered by tests. The default brief is at most **16,000 UTF-8 bytes** of serialized JSON; this is a byte budget, not an exact token count or an exhaustive diagnosis.
 
 ## Run
 
@@ -12,10 +14,17 @@ Use Node.js 22.12+ in the 22.x line (tested on 22.22.1). The tooling also suppor
 
 ```sh
 npm ci
-npm run dev -- --port 5173 --strictPort
+uv sync
+uv run uvicorn backend.app:app --host 127.0.0.1 --port 8000
 ```
 
-Open http://127.0.0.1:5173. Keep the terminal running. Chrome/Chromium is the tested browser; folder picking requires browser support for `webkitdirectory`, and gzip requires `DecompressionStream`. File selection is available independently of folder selection.
+In a second terminal:
+
+```sh
+npm run dev -- --port 5175 --strictPort
+```
+
+Open http://127.0.0.1:5175 and keep both terminals running; Vite proxies `/api` to port 8000. Alternatively, run `npm run build`, start the same backend command, and open http://127.0.0.1:8000 for the built integrated app. Chrome/Chromium is the tested browser; folder picking requires browser support for `webkitdirectory`, and gzip requires `DecompressionStream`. File selection is available independently of folder selection.
 
 ```sh
 npm test
@@ -57,7 +66,9 @@ The evidence budget reserves 75% for fault candidates, 15% for lifecycle/recover
 - Source IDs include selection order and archive-member ordinal, so duplicate member names remain distinct. Keep the original selection and browser session open. Closing/changing it invalidates access; an exported JSON alone cannot fetch local originals.
 - ZIP accesses the target member; TAR/GZIP must stream through preceding data. A late-line query can be expensive and is cancellable. Early-stop context replay does **not** revalidate the entire archive checksum (`integrity: not-revalidated`). Raw files are never modified.
 
-The UI shows at most 100 reports, candidates, and patterns per section; the export contains the complete bounded package. Exports include original log excerpts and may contain identifying or sensitive information. No automated redaction is promised. Cancelling terminates the worker and discards that run's partial package.
+The UI hides intermediate evidence and exports. The uploaded evidence package includes original log excerpts and may contain identifying or sensitive information; automatic redaction is not a privacy guarantee. Cancelling preparation terminates the browser worker and discards that run's partial package.
+
+Each running job has a scrollable **Session activity & output** view. It displays public agent updates and tool/subagent lifecycle notices, refreshes every three seconds, and preserves your scroll position. The latest 200 persisted events are shown; **Earlier activity** pages backward and **Back to latest** resumes updates. Finished analyses retain the same session view. Hidden reasoning and raw commands/tool output are not published. Native child visibility depends on the events Codex emits; independent child transcripts are not guaranteed.
 
 These bounds constrain retained text/evidence and streamed payloads. Archive-library metadata overhead and browser file-list overhead still depend on the input; the demo is intended for trusted robot log exports, not as a hardened service for arbitrary hostile archives.
 
@@ -71,11 +82,19 @@ npm run build
 uv run uvicorn backend.app:app --host 127.0.0.1 --port 8000
 ```
 
-Open http://127.0.0.1:8000. This serves the built UI and persistent SQLite API together. For frontend development, keep the API running and use `npm run dev -- --port 5173 --strictPort`; Vite proxies `/api`. Preprocess logs first, add an optional scene description and image/PDF attachments, select the report language, then explicitly submit. Image/PDF-only jobs are allowed. The queue works without a model, but such jobs remain queued; no analysis is fabricated.
+Open http://127.0.0.1:8000. This serves the built UI and persistent SQLite API together. For frontend development, keep the API running and use `npm run dev -- --port 5175 --strictPort`; open http://127.0.0.1:5175 and let Vite proxy `/api` to port 8000. The only submission inputs are files or a folder, optional attachments, an incident description, and report language. Image/PDF-only jobs are allowed. The queue works without a model, but real jobs remain queued; no analysis is fabricated.
 
 All visitors see job descriptions, activity summaries, finished reports and immutable review versions. Anyone can request a hard stop. A running job remains **stopping** until the worker confirms sandbox termination or its lease expires; the API cannot itself kill a disconnected remote VM. The worker also configures a maximum 30-minute sandbox lifetime. Reviews require a name, success/failure, an explanation and edited debugging procedure. Claims expire after 30 minutes; saving releases the claim and creates a new version. Names are not verified identities. Version-list and append endpoints provide the extension point for future version management; existing versions are not overwritten.
 
 Data stays in ignored `data/` until the operator removes it. Keep the database and upload folder together in backups. No automatic public URL, TLS, cleanup, user accounts or production abuse protection is configured. This is a local integration demo, **not a hardened internet deployment**. Public reports may contain sensitive excerpts; best-effort credential redaction is not a privacy guarantee. Do not publish confidential logs/wiki content without permission.
+
+For UI walkthroughs without a provider or worker, seed three clearly labeled synthetic completed examples:
+
+```sh
+uv run python scripts/seed_demo.py
+```
+
+This adds the motor timeout/recovery, localization uncertainty, and incomplete-log-coverage examples. It is idempotent, makes no AI/model calls, creates no queued or running work, and preserves existing demo reviews on rerun. The reports and activity state explicitly that they are synthetic.
 
 ### Configure the sandbox worker
 
@@ -112,7 +131,7 @@ Library selection and format boundaries are recorded in [docs/open-source-option
 
 ## Verification (2026-09-09)
 
-Production build and 41 automated tests pass, covering format recognition, archive/source fairness, lifecycle/metadata retention, numeric identity, UTF-8/long-line preservation, reconciled omissions, brief byte budgets, context pagination, duplicate archive paths, corrupt archives, and resource caps.
+Production build and automated tests cover format recognition, archive/source fairness, lifecycle/metadata retention, numeric identity, UTF-8/long-line preservation, reconciled omissions, brief byte budgets, context pagination, duplicate archive paths, corrupt archives, resource caps, structured reports, and idempotent demo seeding.
 
 Browser checks used the local samples without copying raw inputs into the application:
 

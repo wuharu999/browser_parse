@@ -1,4 +1,5 @@
 import os
+import json
 import asyncio
 import tempfile
 import unittest
@@ -41,6 +42,7 @@ class ApiTest(unittest.TestCase):
         response = self.client.put(f"/api/jobs/{jid}/files?name=robot.log", content=b"private log", headers={"Authorization": f"Bearer {token}"})
         self.assertEqual(response.status_code, 201)
         self.assertNotIn("evidence", self.client.get(f"/api/jobs/{jid}").json())
+        self.assertNotIn("files", self.client.get(f"/api/jobs/{jid}").json())
         self.submit(made); running = self.claim_worker(); self.assertEqual(running["id"], jid)
         artifact = running["files"][0]["id"]
         self.assertEqual(self.client.get(f"/api/worker/jobs/{jid}/files/{artifact}", headers=self.worker).content, b"private log")
@@ -124,6 +126,58 @@ class ApiTest(unittest.TestCase):
         self.assertNotIn("abc.def.ghi", event)
         headers = {**self.worker, "Content-Type": "application/json"}
         self.assertEqual(self.client.post(f"/api/worker/jobs/{jid}/finish", headers=headers, content=b'{"status":"completed","report":"done","cost_usd":NaN,"metrics":{}}').status_code, 422)
+
+    def test_active_jobs_are_independent_of_history_page_and_hide_private_fields(self):
+        old = self.submit(self.job("older queued analysis"))
+        recent = self.job("new upload")
+        page = self.client.get("/api/jobs?limit=1").json()["items"]
+        self.assertEqual(page[0]["id"], recent["job"]["id"])
+        active = self.client.get("/api/jobs/active").json()["items"]
+        self.assertEqual({item["id"] for item in active}, {old, recent["job"]["id"]})
+        for item in active:
+            for private in ("evidence", "token_hash", "files", "metrics", "report"):
+                self.assertNotIn(private, item)
+        self.client.post(f"/api/jobs/{old}/cancel")
+        self.assertNotIn(old, {item["id"] for item in self.client.get("/api/jobs/active").json()["items"]})
+
+    def test_session_history_latest_and_earlier_pages_are_bounded_and_ordered(self):
+        jid = self.job()["job"]["id"]
+        store = self.client.app.state.store
+        with store.lock:
+            store._tx()
+            for index in range(405): store._event(jid, "notice", "worker", f"fixture {index}")
+            store.db.commit()
+        latest = self.client.get(f"/api/jobs/{jid}/events?latest=true").json()["events"]
+        self.assertEqual(len(latest), 200)
+        self.assertEqual(latest[-1]["message"], "fixture 404")
+        older = self.client.get(f"/api/jobs/{jid}/events?before={latest[0]['seq']}").json()["events"]
+        self.assertEqual(len(older), 200)
+        self.assertLess(older[-1]["seq"], latest[0]["seq"])
+        self.assertEqual([event["seq"] for event in latest], sorted(event["seq"] for event in latest))
+        for query in ("before=-1", "before=9999999999999999999999", "after=9999999999999999999999"):
+            self.assertEqual(self.client.get(f"/api/jobs/{jid}/events?{query}").status_code, 422)
+
+    def test_public_review_claim_shows_name_not_token_and_expires(self):
+        jid = self.submit(self.job()); self.claim_worker()
+        self.client.post(f"/api/worker/jobs/{jid}/finish", headers=self.worker, json={"status": "completed", "report": "done", "cost_usd": 0, "metrics": {}})
+        token = self.client.post(f"/api/jobs/{jid}/claim", json={"name": "Reviewer A"}).json()["claim_token"]
+        public = self.client.get(f"/api/jobs/{jid}").json()
+        self.assertEqual(set(public["review_claim"]), {"name", "expires_at"})
+        self.assertEqual(public["review_claim"]["name"], "Reviewer A")
+        self.assertNotIn(token, str(public))
+        store = self.client.app.state.store
+        with store.lock:
+            store.db.execute("UPDATE claims SET expires_at='2000-01-01T00:00:00+00:00' WHERE job_id=?", (jid,)); store.db.commit()
+        self.assertIsNone(self.client.get(f"/api/jobs/{jid}").json()["review_claim"])
+
+    def test_structured_report_redaction_preserves_json_and_evidence_source(self):
+        jid = self.submit(self.job()); self.claim_worker()
+        report = {"schemaVersion": "robot-analysis/v1", "summary": "Observed timeout", "evidenceChain": [{"source": "archive/folder/robot.log", "excerpt": "token=synthetic-secret"}], "workflow": ["Inspect E1"]}
+        finished = self.client.post(f"/api/worker/jobs/{jid}/finish", headers=self.worker, json={"status": "completed", "report": json.dumps(report), "cost_usd": 0, "metrics": {}})
+        self.assertEqual(finished.status_code, 200)
+        parsed = json.loads(finished.json()["report"])
+        self.assertEqual(parsed["evidenceChain"][0]["source"], "archive/folder/robot.log")
+        self.assertEqual(parsed["evidenceChain"][0]["excerpt"], "token=[redacted]")
 
     def test_chunked_json_over_limit_is_rejected_before_downstream_parsing(self):
         app = self.client.app

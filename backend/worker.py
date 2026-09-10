@@ -57,8 +57,31 @@ def _safe_text(value: object, secrets: tuple[str, ...] = ()) -> str:
         if secret:
             text = text.replace(secret, "[redacted]")
     text = re.sub(r"(?i)(bearer\s+)[^\s]+", r"\1[redacted]", text)
+    text = re.sub(r"(?i)\b(api[_-]?key|token|secret|password)\s*[:=]\s*[^\s,;\"'{}\[\]]+", r"\1=[redacted]", text)
+    text = re.sub(r"\b(?:sk|pk|rk|AKIA)[-_A-Za-z0-9]{12,}\b", "[redacted]", text)
     # Keep Markdown paragraphs/lists readable; only normalize horizontal space.
     return "\n".join(re.sub(r"[ \t]+", " ", line).strip() for line in text.split("\n")).strip()[:12_000]
+
+
+def _safe_report(value: object, secrets: tuple[str, ...] = ()) -> str:
+    """Redact JSON report string values without changing its syntax or provenance."""
+    if not isinstance(value, str):
+        return _safe_text(value, secrets)
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return _safe_text(value, secrets)
+
+    def clean(item: Any) -> Any:
+        if isinstance(item, str):
+            return _safe_text(item, secrets)
+        if isinstance(item, list):
+            return [clean(part) for part in item]
+        if isinstance(item, dict):
+            return {key: clean(part) for key, part in item.items()}
+        return item
+
+    return json.dumps(clean(parsed), ensure_ascii=False, separators=(",", ":"))[:12_000]
 
 
 def _input_path(file_id: str, name: str) -> str:
@@ -345,7 +368,23 @@ class CubeWorker:
                     continue
                 agent = event.get("agent") if event.get("agent") in {"codex", "log_investigator", "evidence_reviewer"} else "codex"
                 message = event.get("message") if isinstance(event.get("message"), str) else "Codex activity."
-                self._event(job_id, "progress", message[:200], agent)
+                activity_kind = event.get("kind")
+                if activity_kind not in {None, "message", "tool", "subagent", "lifecycle"}:
+                    continue
+                # The UI has one public event category today; preserve a compact
+                # text label so it can render session activity without exposing
+                # runner JSON, commands, or tool output.
+                if activity_kind == "tool":
+                    message = message if message in {
+                        "Codex tool execution started.",
+                        "Codex tool execution completed.",
+                        "Codex tool execution updated.",
+                    } else "Codex tool execution update."
+                elif activity_kind == "subagent":
+                    message = f"Subagent {agent} update."
+                public = _safe_text(message, self._secrets)[:800]
+                if public:
+                    self._event(job_id, "progress", public, agent)
                 newest = max(newest, sequence)
             except (TypeError, ValueError, json.JSONDecodeError):
                 pass
@@ -423,7 +462,7 @@ class CubeWorker:
                 if value is not None:
                     metrics[f"sandbox_{name}"] = value
             status = "completed" if result.get("status") == "completed" else "failed"
-            report = _safe_text(result.get("report") or "Sandbox run produced no final report.", self._secrets)
+            report = _safe_report(result.get("report") or "Sandbox run produced no final report.", self._secrets)
             if not self._kill(sandbox):
                 self._unconfirmed_kill(job_id)
                 return

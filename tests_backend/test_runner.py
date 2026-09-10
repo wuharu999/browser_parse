@@ -27,7 +27,63 @@ class RunnerTests(unittest.TestCase):
             public = target.read_text()
             self.assertNotIn("private", public)
             self.assertIsNone(run_codex._agent_message({"item": {"type": "reasoning", "text": "private thoughts"}}))
-            self.assertEqual(json.loads(public)["message"], "Codex activity: item.completed")
+            self.assertEqual(json.loads(public)["message"], "Codex tool execution completed.")
+
+    def test_activity_includes_only_completed_public_messages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory, "activity.jsonl")
+            run_codex._activity({"type": "item.completed", "item": {"type": "agent_message", "channel": "final", "text": "Reviewed 3 records."}}, target)
+            run_codex._activity({"type": "item.completed", "item": {"type": "reasoning", "text": "hidden chain of thought"}}, target)
+            records = [json.loads(line) for line in target.read_text().splitlines()]
+            self.assertEqual(records[0]["message"], "Reviewed 3 records.")
+            self.assertEqual(len(records), 1)
+
+    def test_activity_redacts_sensitive_values(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"TEST_API_TOKEN": "very-secret-value"}):
+            target = Path(directory, "activity.jsonl")
+            run_codex._activity({"type": "item.completed", "item": {"type": "agent_message", "channel": "commentary", "text": "token=very-secret-value Bearer abc.def.ghi sk-abcdefghijklmnop"}}, target)
+            public = target.read_text()
+            self.assertNotIn("very-secret-value", public)
+            self.assertNotIn("abc.def.ghi", public)
+            self.assertNotIn("sk-abcdefghijklmnop", public)
+
+    def test_activity_ring_is_64kib_and_contains_complete_jsonl_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory, "activity.jsonl")
+            for number in range(200):
+                run_codex._activity({"type": "item.completed", "item": {"type": "agent_message", "channel": "commentary", "text": f"{number}: " + "x" * 790}}, target)
+            raw = target.read_bytes()
+            self.assertLessEqual(len(raw), 64 * 1024)
+            records = [json.loads(line) for line in raw.decode().splitlines()]
+            self.assertGreater(len(records), 1)
+            self.assertEqual(records[-1]["seq"], 200)
+
+    def test_final_report_keeps_long_structured_json_and_source_path(self):
+        report = json.dumps({"schemaVersion": "robot-analysis/v1", "source": "archive/folder/log.txt", "findings": ["x" * 8500]})
+        event = {"type": "item.completed", "item": {"type": "agent_message", "channel": "final", "text": report}}
+        final = run_codex._agent_message(event)
+        self.assertIsNotNone(final)
+        self.assertGreater(len(final or ""), 800)
+        self.assertEqual(json.loads(final or "") ["source"], "archive/folder/log.txt")
+
+    def test_commentary_is_activity_only_and_unknown_channels_are_suppressed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory, "activity.jsonl")
+            commentary = {"type": "item.completed", "item": {"type": "agent_message", "channel": "commentary", "text": "Public progress."}}
+            unknown = {"type": "item.completed", "item": {"type": "agent_message", "channel": "other", "text": "must hide"}}
+            run_codex._activity(commentary, target)
+            run_codex._activity(unknown, target)
+            self.assertIsNone(run_codex._agent_message(commentary))
+            self.assertEqual([json.loads(line)["message"] for line in target.read_text().splitlines()], ["Public progress."])
+
+    def test_installed_codex_json_agent_message_without_channel_is_public(self):
+        # Matches the locally installed Codex SDK's documented JSONL item shape.
+        event = {"type": "item.completed", "item": {"id": "item_0", "type": "agent_message", "text": "Hi!"}}
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory, "activity.jsonl")
+            run_codex._activity(event, target)
+            self.assertEqual(json.loads(target.read_text())["message"], "Hi!")
+        self.assertEqual(run_codex._agent_message(event), "Hi!")
 
     def test_provider_configuration_stays_inside_workspace(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(run_codex, "WORKSPACE", Path(directory)), patch.dict(os.environ, {"CODEX_PROVIDER_URL": "https://provider.invalid/v1", "CODEX_PROVIDER_ENV_KEY": "TEST_MODEL_KEY"}):

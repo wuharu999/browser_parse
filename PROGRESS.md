@@ -1,5 +1,15 @@
 # Analysis service progress
 
+## Simplified frontend and session view — 2026-09-10
+
+- Replaced the separate preprocessing/dashboard controls with one upload-files/folder + incident-description form. Browser preprocessing is automatic and token-free; no intermediate exports/settings are exposed. Existing streaming archive libraries and preprocessing modules remain intact.
+- Added left-hand shared history, all-active job visibility independent of history pagination, EN/中文 UI, structured summary/evidence chain/uncertainties, and editable resolution workflows with named, immutable review versions.
+- Added a scrollable session view for public progress/output and safe tool/subagent status. It polls every three seconds, keeps a reader's scroll position, pages earlier persisted events in batches of 200, and retains session history on completed jobs. Hidden reasoning, commands, and raw tool outputs are excluded. Native child visibility is limited to emitted Codex events; a complete independent transcript for every child is not proven.
+- Runner activity is bounded to 800 characters per message and a 64 KiB complete-record JSONL ring. Final reports use Codex's verified `--output-last-message` file independently, preserving structured output instead of using a truncated activity excerpt. Structured report redaction preserves JSON and source references.
+- Added three clearly marked, completed synthetic examples and an uploadable synthetic log. Seeding is idempotent and never enters the worker queue. The normal local database contains the three examples; no AI was used to produce them.
+- Verification: **43 TypeScript tests + 47 Python tests = 90 passing**, production build and diff checks pass. Browser checks covered compressed-log automatic handoff (`robot-log-evidence/v2` plus original upload), report sections, independent language controls, two-visitor lock conflict, version persistence, claim restoration/release, navigation during claim acquisition, 200-event pagination, scroll preservation and public stop/worker acknowledgement.
+- Browser mutation tests used a separate SQLite/upload directory at `/tmp/robot-ui-redesign.9XevUG`. No paid model, real Cube VM, robot repair, public deployment, or GitHub push is claimed by these tests.
+
 ## Agreed scope
 
 - Local API and worker now; separate server/worker machines later.

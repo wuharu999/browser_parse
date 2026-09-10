@@ -168,14 +168,19 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None) -> 
         items, next_cursor = store.list(limit, parsed)
         return {"items": items, "next_cursor": next_cursor}
 
+    @app.get("/api/jobs/active")
+    async def active_jobs():
+        return {"items": store.active()}
+
     @app.get("/api/jobs/{job_id}")
     async def get_job(job_id: str): return job_or_404(job_id)
 
     @app.get("/api/jobs/{job_id}/events")
-    async def events(job_id: str, after: int = 0):
+    async def events(job_id: str, after: int = 0, latest: bool = False, before: int | None = None):
         job_or_404(job_id)
-        if after < 0: raise HTTPException(422, "after must be non-negative")
-        items, next_after = store.events(job_id, after)
+        if not 0 <= after <= 9223372036854775807: raise HTTPException(422, "after is outside the valid range")
+        if before is not None and not 1 <= before <= 9223372036854775807: raise HTTPException(422, "before is outside the valid range")
+        items, next_after = store.events(job_id, after, latest=latest, before=before)
         return {"events": items, "next": next_after}
 
     @app.get("/api/budget")
@@ -189,7 +194,10 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None) -> 
 
     @app.post("/api/jobs/{job_id}/claim")
     async def claim(job_id: str, body: ReviewClaim):
-        try: return {"claim_token": store.claim_review(job_id, body.name), "ttl_seconds": store.lease_seconds}
+        try:
+            token = store.claim_review(job_id, body.name)
+            owner = store.get(job_id)["review_claim"]
+            return {"claim_token": token, "ttl_seconds": store.lease_seconds, **owner}
         except KeyError: raise HTTPException(404, "job not found")
         except PermissionError as exc: raise HTTPException(409, str(exc))
         except ValueError as exc: raise HTTPException(422, str(exc))

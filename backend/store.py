@@ -39,6 +39,22 @@ def token_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+def clean_report(value: str) -> str:
+    """Redact report values without consuming JSON quotes or source structure."""
+    try:
+        parsed = json.loads(value)
+        if isinstance(parsed, dict) and parsed.get("schemaVersion") == "robot-analysis/v1":
+            def redact(item):
+                if isinstance(item, str): return clean(item, 20000)
+                if isinstance(item, list): return [redact(entry) for entry in item]
+                if isinstance(item, dict): return {key: redact(entry) for key, entry in item.items()}
+                return item
+            return json.dumps(redact(parsed), ensure_ascii=False, separators=(",", ":"))[:20000]
+    except (ValueError, TypeError):
+        pass
+    return clean(value, 20000)
+
+
 class Store:
     # ponytail: a process-wide SQLite lock; move writes behind a DB service only if traffic needs it.
     def __init__(self, db_path: str, upload_dir: str, *, estimate: float = 5, daily_limit: float = 10, max_running: int = 2, max_pending: int = 20, lease_seconds: int = 1800, runtime_seconds: int = 1800):
@@ -116,11 +132,25 @@ class Store:
         for key in ("token_hash", "evidence", "lease_until", "run_deadline", "reservation_day", "finished_day", "upload_reserved"):
             item.pop(key, None)
         item["cancel_requested"] = bool(item["cancel_requested"])
-        item["files"] = self._files(item["id"])
+        claim = self.db.execute("SELECT name,expires_at FROM claims WHERE job_id=? AND expires_at>?", (item["id"], stamp())).fetchone()
+        item["review_claim"] = dict(claim) if claim else None
         return item
+
+    def active(self) -> list[dict]:
+        with self.lock:
+            self._tx(); self._expire_leases(); self.db.commit()
+            rows = self.db.execute("SELECT * FROM jobs WHERE status IN ('draft','queued','running') ORDER BY created_at").fetchall()
+            items = []
+            for row in rows:
+                item = self._public(row) or {}
+                for field in ("report", "metrics", "files"):
+                    item.pop(field, None)
+                items.append(item)
+            return items
 
     def _worker(self, row: sqlite3.Row) -> dict:
         item = self._public(row) or {}
+        item["files"] = self._files(item["id"])
         item["evidence"] = json.loads(row["evidence"]) if row["evidence"] else None
         return item
 
@@ -205,10 +235,12 @@ class Store:
             self.db.commit()
             return {"id": artifact_id, "name": name, "size": size, "sha256": sha256, "created_at": created}
 
-    def events(self, job_id: str, after: int, limit: int = 200) -> tuple[list[dict], int | None]:
+    def events(self, job_id: str, after: int, limit: int = 200, *, latest: bool = False, before: int | None = None) -> tuple[list[dict], int | None]:
         with self.lock:
-            rows = self.db.execute("SELECT seq,created_at,kind,agent,message FROM events WHERE job_id=? AND seq>? ORDER BY seq LIMIT ?", (job_id, after, limit + 1)).fetchall()
-            more, rows = len(rows) > limit, rows[:limit]
+            if latest or before is not None:
+                rows = self.db.execute("SELECT seq,created_at,kind,agent,message FROM events WHERE job_id=? AND seq>? AND seq<? ORDER BY seq DESC LIMIT ?", (job_id, after, before if before is not None else 9223372036854775807, limit)).fetchall()[::-1]
+            else:
+                rows = self.db.execute("SELECT seq,created_at,kind,agent,message FROM events WHERE job_id=? AND seq>? ORDER BY seq LIMIT ?", (job_id, after, limit)).fetchall()
             return [dict(row) for row in rows], rows[-1]["seq"] if rows else None
 
     def budget(self) -> dict:
@@ -272,7 +304,7 @@ class Store:
         if cost is not None and (not math.isfinite(cost) or cost < 0 or cost > 100000): raise ValueError("invalid cost")
         try: metrics_json = json.dumps(metrics or {}, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
         except (TypeError, ValueError) as exc: raise ValueError("metrics must be finite JSON") from exc
-        report = clean(report, 20000)
+        report = clean_report(report)
         if not report: raise ValueError("report is required")
         with self.lock:
             self._tx(); row = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()

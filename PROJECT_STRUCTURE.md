@@ -1,6 +1,6 @@
 # Project structure
 
-Robot Log Workbench has a standalone browser preprocessing path and an optional shared Python analysis queue. It reuses open-source archive readers, FastAPI and CubeSandbox. Real sandbox execution requires an external Cube endpoint/template; the local demo does not silently execute agents on its host.
+Robot Log Workbench presents one integrated shared analysis UI. Browser preprocessing runs automatically during submission, while FastAPI owns persistent history, uploads, status, hard stops, reports, and versioned human reviews. It reuses open-source archive readers and CubeSandbox. Real model execution requires an external Cube endpoint/template; the local app does not silently execute agents on its host.
 
 ## Source tree
 
@@ -22,10 +22,12 @@ browser_parse/
 │   ├── open-source-options.md # Archive-library decision and format boundaries
 │   └── model-providers.md     # DeepSeek setup, Qwen/OpenCode option and cost assumptions
 ├── scripts/
-│   └── estimate_cost.py       # Dependency-free offline multi-agent cost estimator
+│   ├── estimate_cost.py       # Dependency-free offline multi-agent cost estimator
+│   └── seed_demo.py           # Idempotent completed synthetic UI examples
+├── public/examples/           # Downloadable synthetic log for upload testing
 ├── src/
-│   ├── main.ts                # File selection, worker lifecycle, results, downloads
-│   ├── dashboard.ts           # Shared jobs, uploads, activity and review versions
+│   ├── main.ts                # Integrated submission, history, status, reports and reviews
+│   ├── report.ts              # Structured robot-analysis/v1 parser and safe fallback
 │   ├── i18n.ts                # Persistent English/Chinese interface selection
 │   ├── style.css              # Responsive UI styles
 │   ├── preprocess.worker.ts   # Worker message dispatch: preprocess or context
@@ -62,7 +64,7 @@ browser_parse/
 
 `node_modules/`, `dist/`, browser-test artifacts, uploaded logs, and downloaded evidence are not source files and are excluded from Git. Tests construct synthetic fixtures rather than committing private robot logs.
 
-Explicit shared submission follows `dashboard.ts → backend/app.py → store.py` (persistent queue), then `worker.py → Cube job VM → run_codex.py → Codex/native subagents`. Only private worker routes can retrieve originals or finish jobs; public visitors can read shared results, stop jobs, and claim/append human reviews. Local preprocessing remains usable when the API is offline.
+Submission follows `main.ts → preprocess.worker.ts → backend/app.py → store.py` (uploads plus persistent queue), then `worker.py → Cube job VM → run_codex.py → Codex/native subagents`. `main.ts` also renders the shared history and active status; `report.ts` validates structured results before rendering their summary, evidence chain, workflow, and uncertainties. Only private worker routes can retrieve originals or finish jobs. Public visitors can read shared results, request a hard stop, and claim/append human review versions.
 
 ## Processing paths
 
@@ -70,11 +72,12 @@ Explicit shared submission follows `dashboard.ts → backend/app.py → store.py
 Selected local Files
   └─ main.ts → preprocess.worker.ts → sources.ts → lines.ts
        ├─ preprocess.ts + selection.ts → robot-log-evidence/v2
-       │    └─ main.ts → brief.ts → robot-log-brief/v1 (≤16,000 bytes)
-       └─ context.ts → local context page (UI: ≤20 lines / 12,000 bytes)
+       │    ├─ main.ts → backend upload and queue submission
+       │    └─ brief.ts → robot-log-brief/v1 (≤16,000 bytes; developer API)
+       └─ context.ts → bounded replay (developer API: ≤20 lines / 12,000 bytes)
 ```
 
-The browser retains access to the selected originals during the session. A context request reopens the relevant input instead of sending all logs to a model. ZIP reads the target member; TAR/GZIP streams through preceding data. Changing the selection or closing the page invalidates session access. Partial replay does not revalidate whole-archive integrity.
+The simplified UI has no manual preprocessing, export, or context-replay controls. Internally, the browser still retains selected originals while preparing a submission. The tested context API can reopen a relevant input instead of loading all logs at once: ZIP reads the target member, while TAR/GZIP streams through preceding data. Changing the selection or closing the page invalidates that local access. Partial replay does not revalidate whole-archive integrity.
 
 ## Open-source and platform responsibilities
 
@@ -92,9 +95,11 @@ The app is not a fork of an entire log-analysis project. It composes existing li
 
 ```sh
 npm ci
-npm run dev -- --port 5173 --strictPort
+uv sync
+uv run uvicorn backend.app:app --host 127.0.0.1 --port 8000
+npm run dev -- --port 5175 --strictPort
 npm test
 npm run build
 ```
 
-Build output goes to `dist/`. No deployment or log upload happens automatically. Byte budgets are not exact token counts, and sampled evidence is not a diagnosis.
+During development, open port 5175 and keep the port-8000 API running for Vite's `/api` proxy. For the integrated production-style local path, run `npm run build`, start the API, and open port 8000; FastAPI serves `dist/`. `uv run python scripts/seed_demo.py` adds exactly three completed, synthetic examples without AI calls or queue work and is safe to rerun. Real Cube execution remains blocked until an external template is built, registered, and boot-tested and valid provider credentials are configured. Byte budgets are not exact token counts, and sampled evidence is not a diagnosis.
