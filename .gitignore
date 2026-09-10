@@ -1,0 +1,24 @@
+node_modules/
+dist/
+# Local configuration and secrets (never publish credentials).
+.env
+.env.*
+!.env.example
+*.local
+*.tsbuildinfo
+coverage/
+test-results/
+.playwright-mcp/
+robot-log-demo.png
+# User log inputs and generated evidence belong outside the source repository.
+*.log
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.mcap
+*.bag
+*.db3
+robot-log-evidence-*.json
+robot-log-brief-*.json
+robot-log-context-*.json
