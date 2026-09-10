@@ -143,6 +143,30 @@ def _write_config(model: str) -> None:
     lines = [f"model = {json.dumps(model)}"]
     provider_url = os.environ.get("CODEX_PROVIDER_URL")
     key_env = os.environ.get("CODEX_PROVIDER_ENV_KEY", "OPENAI_API_KEY")
+    if provider_url and model in {"deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4-flash-vision-exp"}:
+        # Official DeepSeek capability metadata, matched to Codex 0.153.4 ModelInfo.
+        # Keep built-in Codex instructions; our bounded job instructions arrive via stdin.
+        catalog = {"models": [{
+            "slug": model, "display_name": model, "description": "DeepSeek Responses API",
+            "default_reasoning_level": "high",
+            "supported_reasoning_levels": [{"effort": value, "description": value} for value in ("low", "high", "max")],
+            "shell_type": "shell_command", "visibility": "list", "supported_in_api": True,
+            "priority": 1, "availability_nux": None, "upgrade": None,
+            "support_verbosity": True, "default_verbosity": "low",
+            "apply_patch_tool_type": "freeform", "web_search_tool_type": "text",
+            "truncation_policy": {"mode": "tokens", "limit": 10000},
+            "context_window": 1048576, "max_context_window": 1048576,
+            "effective_context_window_percent": 95, "experimental_supported_tools": [],
+            "input_modalities": ["text", "image"] if model.endswith("vision-exp") else ["text"],
+            "supports_image_detail_original": model.endswith("vision-exp"),
+            "default_reasoning_summary": "none", "supports_search_tool": False,
+            "use_responses_lite": False, "multi_agent_version": "v2",
+        }]}
+        catalog_path = home / "models.json"
+        catalog_path.write_text(json.dumps(catalog))
+        lines += [f"model_catalog_json = {json.dumps(str(catalog_path))}",
+                  'model_reasoning_effort = "high"', 'web_search = "disabled"',
+                  'forced_login_method = "api"']
     if provider_url:
         lines += [
             'model_provider = "sandbox-provider"',
@@ -151,6 +175,8 @@ def _write_config(model: str) -> None:
             f"base_url = {json.dumps(provider_url)}",
             f"env_key = {json.dumps(key_env)}",
             'wire_api = "responses"',
+            "requires_openai_auth = false",
+            "supports_websockets = false",
         ]
     lines += ["[agents]", "enabled = true", "max_concurrent_threads_per_session = 2"]
     (home / "config.toml").write_text("\n".join(lines) + "\n")

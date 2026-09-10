@@ -19,7 +19,10 @@ browser_parse/
 ├── PROGRESS.md                # Implementation, validation and external blockers
 ├── THIRD_PARTY_NOTICES.md     # Direct dependency licenses and attribution
 ├── docs/
-│   └── open-source-options.md # Archive-library decision and format boundaries
+│   ├── open-source-options.md # Archive-library decision and format boundaries
+│   └── model-providers.md     # DeepSeek setup, Qwen/OpenCode option and cost assumptions
+├── scripts/
+│   └── estimate_cost.py       # Dependency-free offline multi-agent cost estimator
 ├── src/
 │   ├── main.ts                # File selection, worker lifecycle, results, downloads
 │   ├── dashboard.ts           # Shared jobs, uploads, activity and review versions

@@ -102,6 +102,12 @@ npm run build
 
 See [PROGRESS.md](PROGRESS.md) for implemented/tested versus externally blocked work.
 
+## DeepSeek / Qwen and estimated cost
+
+`.env.example` now selects DeepSeek through the existing Codex Responses runner. No runtime replacement is required for DeepSeek; Qwen through OpenCode is a documented alternative, not yet wired in. See [provider setup and limitations](docs/model-providers.md).
+
+Run the offline estimator with `uv run python scripts/estimate_cost.py --model deepseek-v4-flash` or `--model qwen3-coder-flash-cn`. It accounts for agents, repeated requests, growing context, cached input, reasoning output and optional sandbox charges. It is a planning estimate, not a measured bill or enforced spend cap.
+
 Library selection and format boundaries are recorded in [docs/open-source-options.md](docs/open-source-options.md). The small custom parser is limited to robot-specific normalization, source provenance, and evidence selection; archive and compression formats use existing implementations.
 
 ## Verification (2026-09-09)

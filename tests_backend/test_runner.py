@@ -38,6 +38,19 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(config["agents"]["max_concurrent_threads_per_session"], 2)
             self.assertEqual(config["model_providers"]["sandbox-provider"]["env_key"], "TEST_MODEL_KEY")
 
+    def test_deepseek_catalog_enables_native_subagents_without_claiming_text_model_vision(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(run_codex, "WORKSPACE", Path(directory)), patch.dict(os.environ, {"CODEX_PROVIDER_URL": "https://api.deepseek.com", "CODEX_PROVIDER_ENV_KEY": "DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY": "test-secret-never-written"}):
+            for model, modalities in (("deepseek-v4-flash", ["text"]), ("deepseek-v4-flash-vision-exp", ["text", "image"])):
+                run_codex._write_config(model)
+                config_path = Path(directory, ".codex/config.toml")
+                config = tomllib.loads(config_path.read_text())
+                catalog = json.loads(Path(config["model_catalog_json"]).read_text())["models"][0]
+                self.assertEqual(catalog["slug"], model)
+                self.assertEqual(catalog["input_modalities"], modalities)
+                self.assertEqual(catalog["multi_agent_version"], "v2")
+                self.assertFalse(config["model_providers"]["sandbox-provider"]["requires_openai_auth"])
+                self.assertNotIn("test-secret-never-written", config_path.read_text())
+
 
 if __name__ == "__main__":
     unittest.main()

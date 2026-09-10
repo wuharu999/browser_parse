@@ -36,6 +36,14 @@ Memory, CPU, writable disk and model pricing will be configurable. Proposed defa
 
 Current telemetry labels parent-Codex RSS explicitly; it does not measure the whole VM or all child processes. Actual aggregate model cost and child usage remain unknown. A strict sub-USD-5 paid pilot needs a provider-enforced spending guard; no paid run is authorized by passing mock tests alone.
 
+## DeepSeek / Qwen follow-up
+
+- Added an offline stdlib cost estimator with dated DeepSeek/Qwen pricing, per-agent/request accounting, cache, context growth, optional infrastructure and a planning buffer. No paid request is made by this tool.
+- DeepSeek officially supports Codex Responses. Added sandbox-local model metadata and example DeepSeek credentials configuration while preserving the existing runtime and native roles. Text-only versus experimental vision modalities are explicit.
+- Qwen through OpenCode is documented as the alternative; it has not been installed or connected to the worker. Do not claim a live provider/subagent proof without credentials and Cube.
+- Current Python suite: 30 passing tests. Frontend unchanged from the 41-test baseline.
+- Retried GitHub after the reported permission update: authenticated owner is `wuharu999`; GET target returned 404 and POST `/user/repos` still returned 403 with required permission `administration=write`. Repository creation and push remain blocked; no credential was saved.
+
 ## Local verification — 2026-09-10
 
 - 41 browser-preprocessing unit tests and production build pass; npm audit reports zero vulnerabilities.
