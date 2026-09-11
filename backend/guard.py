@@ -74,15 +74,20 @@ IMAGE_EXTENSIONS = {
 
 
 def is_non_log_attachment(name: str) -> bool:
-    """Classify whether a file is a non-log attachment requiring host inspection."""
+    """Classify whether a file is a non-log attachment requiring host inspection.
+
+    Ensures document and image formats (PDF, DOCX, PNG, etc.) are always inspected,
+    even if the filename contains '.log.' substrings (e.g. 'incident.log.pdf').
+    Excludes raw archives and telemetry/log files (.log, .stdout, rotated .log.1).
+    """
     lower = name.lower()
-    # Check for log extensions and composite log extensions (e.g. .log.gz)
-    for ext in LOG_EXTENSIONS:
-        if lower.endswith(ext) or f"{ext}." in lower:
-            return False
     # Raw archives are not unpacked on host
     for ext in ARCHIVE_EXTENSIONS:
         if lower.endswith(ext):
+            return False
+    # Known log and machine telemetry extensions (including rotated logs like .log.1)
+    for ext in LOG_EXTENSIONS:
+        if lower.endswith(ext) or re.search(re.escape(ext) + r"\.\d+$", lower):
             return False
     # Check if suffix matches non-log document or image extensions
     for ext in NON_LOG_EXTENSIONS:
@@ -132,8 +137,12 @@ def _extract_image_ocr(path: Path, max_bytes: int) -> str:
 def _extract_pdf_text(path: Path, max_bytes: int) -> str:
     """Safely extract plain text from a PDF file.
 
-    Uses Poppler's pdftotext binary when available (standard Linux open-source tool).
-    Falls back to a pure-Python regex stream scanner for fontless/synthetic test PDFs.
+    Uses Poppler's pdftotext binary when available (standard Linux open-source tool),
+    bounded to the first 10 pages (-f 1 -l 10) to prevent CPU and memory exhaustion
+    on massive documents.
+    Falls back to a pure-Python regex stream scanner for fontless/synthetic test PDFs,
+    with zlib decompression bounded to prevent zip bomb attacks and robust handling
+    of escaped parentheses.
     Ensures corrupted or malformed PDFs never crash the worker and bounds memory consumption.
     """
     if max_bytes <= 0:
@@ -141,7 +150,7 @@ def _extract_pdf_text(path: Path, max_bytes: int) -> str:
     # 1. Try pdftotext CLI (Poppler)
     try:
         res = subprocess.run(
-            ["pdftotext", "-layout", str(path), "-"],
+            ["pdftotext", "-f", "1", "-l", "10", "-layout", str(path), "-"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=5,
@@ -164,19 +173,24 @@ def _extract_pdf_text(path: Path, max_bytes: int) -> str:
         else:
             data = path.read_bytes()
         parts: list[str] = []
-        # Find streams and attempt FlateDecode decompression
+        # Find streams and attempt FlateDecode decompression with zip bomb bounds
         for m in re.finditer(rb"stream[\r\n]+(.*?)[\r\n]+endstream", data, re.DOTALL):
             chunk = m.group(1)
             try:
-                chunk = zlib.decompress(chunk)
+                # Bounded decompression up to 64 KiB to prevent decompression bombs
+                chunk = zlib.decompressobj().decompress(chunk, 64 * 1024)
             except Exception:
                 pass
-            for sm in re.finditer(rb"\(([^)]+)\)", chunk):
-                parts.append(sm.group(1).decode("latin1", errors="replace"))
+            for sm in re.finditer(rb"\(((?:\\.|[^)\\])*)\)", chunk):
+                unescaped = sm.group(1).decode("latin1", errors="replace").replace(r"\(", "(").replace(r"\)", ")")
+                if unescaped.strip():
+                    parts.append(unescaped)
         # Also capture uncompressed string literals outside stream containers
         if not parts:
-            for sm in re.finditer(rb"\(([^)]{4,})\)", data):
-                parts.append(sm.group(1).decode("latin1", errors="replace"))
+            for sm in re.finditer(rb"\(((?:\\.|[^)\\]){4,})\)", data):
+                unescaped = sm.group(1).decode("latin1", errors="replace").replace(r"\(", "(").replace(r"\)", ")")
+                if unescaped.strip():
+                    parts.append(unescaped)
         return " ".join(parts)[:max_bytes]
     except Exception:
         return ""
@@ -227,6 +241,7 @@ def extract_non_log_attachments(
     staged_files: list[tuple[str, Path]],
     max_total_bytes: int = 32 * 1024,
     include_images: bool = False,
+    max_images: int = 5,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Extract text from non-log attachments up to max_total_bytes across attachments (R1.2).
 
@@ -234,6 +249,7 @@ def extract_non_log_attachments(
     prevent token consumption attacks and unbounded host memory usage.
     Budgets header space accurately so attachment content is never truncated out
     by trailing header overhead.
+    Caps image inspection to max_images (default 5) to prevent payload exhaustion.
     """
     text_chunks: list[str] = []
     images: list[dict[str, Any]] = []
@@ -247,9 +263,10 @@ def extract_non_log_attachments(
         # Handle image attachments when vision modality is supported or fallback to OCR
         if is_image_attachment(name):
             if include_images:
-                img_data = _prepare_image(path, name)
-                if img_data:
-                    images.append(img_data)
+                if len(images) < max_images:
+                    img_data = _prepare_image(path, name)
+                    if img_data:
+                        images.append(img_data)
             else:
                 header = f"\n--- [Attachment: {name}] ---\n"
                 header_len = len(header)
