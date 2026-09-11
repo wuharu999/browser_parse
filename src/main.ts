@@ -342,7 +342,11 @@ function sessionPanel(id: string, records: Event[]): HTMLDetailsElement {
   const panel = el('details', 'session-panel'); panel.dataset.job = id; panel.open = sessionViews.get(id)?.open ?? true;
   panel.append(el('summary', '', t('Session activity & output', '会话活动与输出')), el('p', 'session-hint', t('Public progress, tool status and output. Private reasoning and raw command output are not shared.', '公开进展、工具状态及输出；不展示私密推理和原始命令输出。')));
 
-  panel.append(sandboxAbstractionPanel(id, records));
+  // Only show the Sandbox VM abstraction panel while a job is active.
+  // Completed / failed / cancelled history jobs show the transcript directly.
+  const job = findJob(id);
+  const isActive = !job || job.status === 'running' || job.status === 'queued' || job.status === 'draft';
+  if (isActive) panel.append(sandboxAbstractionPanel(id, records));
 
   const transcriptDetails = el('details', 'transcript-collapsible');
   transcriptDetails.open = true;
@@ -510,7 +514,18 @@ async function loadDetail(force = false): Promise<void> {
 }
 function reportSection(number: string, name: string): HTMLElement { const section = el('section', 'report-section'); const heading = el('div', 'report-section-heading'); heading.append(el('span', 'section-number', number), el('h2', '', name)); section.append(heading); return section; }
 function renderResult(): void {
-  const job = selectedJob; if (!job || selected !== job.id) return; content.replaceChildren(); const page = el('article', 'result-page');
+  const job = selectedJob; if (!job || selected !== job.id) return;
+  // Preserve scroll positions before blowing away the DOM.
+  const savedContentScroll = content.scrollTop;
+  const existingTranscript = content.querySelector<HTMLElement>('.session-transcript');
+  if (existingTranscript) {
+    sessionViews.set(job.id, {
+      open: content.querySelector<HTMLDetailsElement>('.session-panel')?.open ?? true,
+      top: existingTranscript.scrollTop,
+      following: existingTranscript.scrollHeight - existingTranscript.scrollTop - existingTranscript.clientHeight < 30,
+    });
+  }
+  content.replaceChildren(); const page = el('article', 'result-page');
   const navigation = el('div', 'report-navigation'); navigation.append(button(t('← Back to upload', '← 返回上传'), 'button secondary back-to-upload', showNew)); page.append(navigation);
   const meta = el('div', 'report-meta'); meta.append(statusBadge(job), el('span', 'muted', date(job.created_at))); page.append(meta, el('h1', '', title(job)), el('p', 'incident-description', job.description.replace(/^\[DEMO\]\s*/, '')));
   if (job.resource_plan) {
@@ -548,6 +563,13 @@ function renderResult(): void {
   page.append(workflow);
   if (selectedVersions.length) { const revisions = el('details', 'revision-history'); revisions.append(el('summary', '', t(`Review history (${selectedVersions.length} versions)`, `审核历史（${selectedVersions.length} 个版本）`))); for (const version of [...selectedVersions].reverse()) { const item = el('div', 'revision'); item.append(el('strong', '', `v${version.id} · ${version.reviewer_name} · ${version.success ? t('Successful', '成功') : t('Unsuccessful', '未成功')}`), el('p', 'muted', date(version.created_at)), el('p', '', version.note), el('p', 'workflow-text', version.procedure)); revisions.append(item); } page.append(revisions); }
   page.append(sessionPanel(job.id, events.get(job.id) ?? selectedEvents), button(t('← Back to upload', '← 返回上传'), 'button secondary back-to-upload', showNew)); content.append(page);
+  // Restore page scroll and inner transcript scroll after DOM rebuild.
+  content.scrollTop = savedContentScroll;
+  const newTranscript = content.querySelector<HTMLElement>('.session-transcript');
+  if (newTranscript) {
+    const state = sessionViews.get(job.id);
+    newTranscript.scrollTop = !state || state.following ? newTranscript.scrollHeight : state.top;
+  }
 }
 function renderEditor(section: HTMLElement, job: Job, draft: Draft): void {
   const form = el('form', 'workflow-editor');
