@@ -1,5 +1,30 @@
 # Analysis service progress
 
+## Pre-execution LLM security guard (prompt injection defense) — 2026-09-11
+
+- Implemented host-side pre-execution security inspection (`backend/guard.py`)
+  integrated into `backend/worker.py` before Cube sandbox provisioning or Codex execution.
+- Evaluates user incident prompts and non-log attachments (PDFs, text/markdown docs,
+  and vision images) against OWASP LLM01:2025 prompt injection and jailbreak patterns.
+- Three-tier enforcement:
+  - `CLEAN`: Proceeds normally to Codex in the isolated Cube VM.
+  - `SUSPICIOUS`: Sanitizes borderline prompts to their objective factual core,
+    preserves both `original_description` and `sanitized_description` in the SQLite store,
+    passes the sanitized prompt to Codex, and logs a public session `warning` event.
+  - `INJECTION`: Immediate hard stop — marks job as `failed` (`Prompt injection detected in inputs`),
+    skips Cube sandbox creation, consumes zero Codex budget, and logs a security warning event.
+- Bounded memory and attachment safety:
+  - Poppler `pdftotext` bounded to first 10 pages (`-f 1 -l 10`) with pure-Python stream decompressor
+    fallback protected by bounded `zlib` decompression (64 KiB) against decompression bombs.
+  - Cumulative text extraction across non-log attachments capped at 32 KiB with exact header budgeting.
+  - Image attachments validated via Pillow (PIL) and capped at 5 images.
+  - LLM HTTP responses stream-read up to 10 MiB with `JSONDecoder().raw_decode` parsing.
+  - Fail-closed error handling: retries once on network/parsing failure, then safely fails the job.
+- Expanded backend test suite from 70 to 104 tests (`tests_backend/test_guard.py`),
+  covering clean inputs, prompt injections, indirect PDF injections, suspicious sanitization,
+  fail-closed retries, zip bomb defense, and classification edge cases.
+- Full verification: 104 backend tests and 48 frontend tests pass 100% green.
+
 ## Public GitHub publication completed — 2026-09-10
 
 - Created public `https://github.com/wuharu999/browser_parse` and pushed `main`.
