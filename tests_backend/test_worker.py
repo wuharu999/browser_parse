@@ -175,7 +175,8 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(env["OPENAI_API_KEY"], "model-key")
         self.assertEqual(api.finished[0]["status"], "completed")
         self.assertIsNone(api.finished[0]["cost_usd"])
-        self.assertEqual(api.finished[0]["metrics"]["cost_source"], "unknown")
+        # No codex_usage in mock result — cost_source falls back to "no_usage"
+        self.assertEqual(api.finished[0]["metrics"]["cost_source"], "no_usage")
 
     def test_run_job_accepts_existing_workspace_and_creates_transfer_directories(self) -> None:
         data = b"synthetic log"

@@ -101,6 +101,65 @@ def _input_path(file_id: str, name: str) -> str:
     return f"inputs/{safe_id}{suffix}"
 
 
+# ---------------------------------------------------------------------------
+# Cost estimation — token-count based, using snapshot pricing (USD / 1M tokens)
+# Rates: https://api-docs.deepseek.com/quick_start/pricing/  (as of 2026-09-11)
+# Output token price covers reasoning tokens (billed identically by DeepSeek).
+# Cache-hit discount: 0.1× input rate.
+# ---------------------------------------------------------------------------
+_DEEPSEEK_RATES: dict[str, tuple[float, float]] = {
+    # model                              in/1M   out/1M  (peak, non-off-peak)
+    "deepseek-v4-flash":              (0.44,  1.32),
+    "deepseek-v4-flash-vision-exp":   (0.44,  1.32),
+    "deepseek-v4-pro":                (1.32,  3.96),
+}
+_CACHE_DISCOUNT = 0.1  # cached input tokens billed at 10% of input rate
+
+# Extensions that require a vision endpoint (image or PDF content)
+_VISION_EXTENSIONS = frozenset({
+    ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tiff", ".tif", ".pdf",
+})
+
+
+def _needs_vision(files: list[dict]) -> bool:
+    """Return True when any uploaded file is an image or PDF that requires vision."""
+    for item in files:
+        name = str(item.get("name", "")).strip().lower()
+        ext = PurePosixPath(name).suffix
+        if ext in _VISION_EXTENSIONS:
+            return True
+    return False
+
+
+def _compute_cost(model: str, usage: dict[str, int]) -> tuple[float, str]:
+    """Estimate cost_usd from SDK-reported token counts.
+
+    Returns (cost_usd, cost_source).  Falls back to (0.0, "no_usage") when
+    usage is empty or the model is not in the pricing table.
+
+    Token key names follow the OpenAI / DeepSeek SDK convention:
+      input_tokens          — prompt tokens (may overlap with cached_tokens)
+      output_tokens         — completion tokens (includes reasoning tokens)
+      input_tokens_details  — dict containing "cached_tokens" sub-key
+    """
+    rates = _DEEPSEEK_RATES.get(model)
+    if not rates or not usage:
+        return 0.0, "no_usage"
+    input_rate, output_rate = rates
+    cache_rate = input_rate * _CACHE_DISCOUNT
+
+    total_in  = int(usage.get("input_tokens",  0))
+    total_out = int(usage.get("output_tokens", 0))
+    details   = usage.get("input_tokens_details") or {}
+    cached    = int(details.get("cached_tokens", 0)) if isinstance(details, dict) else 0
+
+    billable_in = max(0, total_in - cached)
+    cost = (billable_in * input_rate + cached * cache_rate + total_out * output_rate) / 1_000_000
+    return round(cost, 8), "token_based"
+
+
+
+
 @dataclass(frozen=True)
 class WorkerConfig:
     api_url: str
@@ -320,17 +379,23 @@ class CubeWorker:
             values["proxy_port"] = self.config.cube_proxy_port_http
         return values
 
-    def _sandbox_env(self, timeout_seconds: int) -> dict[str, str]:
+    def _sandbox_env(self, timeout_seconds: int, files: list[dict] | None = None) -> dict[str, str]:
+        # Auto-select: if configured model is a vision variant but no file requires
+        # vision, use the plain flash model instead (faster, same pricing tier).
+        model = self.config.codex_model
+        if model == "deepseek-v4-flash-vision-exp" and not _needs_vision(files or []):
+            model = "deepseek-v4-flash"
         values = {
             self.config.codex_api_key_env: self.config.codex_api_key,
             "CODEX_API_KEY": self.config.codex_api_key,
-            "CODEX_MODEL": self.config.codex_model,
+            "CODEX_MODEL": model,
             "CODEX_PROVIDER_ENV_KEY": self.config.codex_api_key_env,
             "ROBOT_RUN_TIMEOUT_SECONDS": str(timeout_seconds),
         }
         if self.config.codex_provider_url:
             values["CODEX_PROVIDER_URL"] = self.config.codex_provider_url
         return values
+
 
     @staticmethod
     def _ensure_dir(sandbox: Any, path: str) -> None:
@@ -574,7 +639,7 @@ class CubeWorker:
             if plan is not None and (profile not in PROFILES or any(plan.get(key) != value for key, value in PROFILES[profile].items())):
                 raise WorkerError("Job resource plan does not match a supported profile")
             Sandbox, cube_config = self._cube(timeout_seconds, profile)
-            sandbox = Sandbox.create(config=cube_config, env_vars=self._sandbox_env(timeout_seconds), timeout=timeout_seconds)
+            sandbox = Sandbox.create(config=cube_config, env_vars=self._sandbox_env(timeout_seconds, job.get("files") or []), timeout=timeout_seconds)
             if profile:
                 info = sandbox.get_info()
                 if any(getattr(info, key, None) != PROFILES[profile][key] for key in ("cpu_milli", "memory_mb")):
@@ -618,7 +683,18 @@ class CubeWorker:
 
             result = self._result(sandbox)
             metrics = dict(result.get("metrics") or {})
-            metrics.update({"runtime_seconds": round(time.monotonic() - started, 3), "cost_source": "unknown"})
+            runtime_s = round(time.monotonic() - started, 3)
+            # Compute token-based cost from SDK usage report in result metrics
+            codex_usage = metrics.get("codex_usage") or {}
+            cost_usd, cost_source = _compute_cost(self.config.codex_model, codex_usage)
+            metrics.update({
+                "runtime_seconds": runtime_s,
+                "cost_source": cost_source,
+                "model": self.config.codex_model,
+                # Preserve raw token counts for display/audit
+                "input_tokens":  codex_usage.get("input_tokens",  0),
+                "output_tokens": codex_usage.get("output_tokens", 0),
+            })
             info = sandbox.get_info()
             for name in ("cpu_milli", "memory_mb", "disk_size_mb"):
                 value = getattr(info, name, None)
@@ -630,7 +706,8 @@ class CubeWorker:
                 self._unconfirmed_kill(job_id)
                 return
             sandbox = None
-            self.api.finish(job_id, status, report, None, metrics)
+            # Pass cost_usd=None when unknown (store falls back to reservation)
+            self.api.finish(job_id, status, report, cost_usd if cost_source == "token_based" else None, metrics)
         except JobCancelled:
             if sandbox is not None and not self._kill(sandbox):
                 self._unconfirmed_kill(job_id)
