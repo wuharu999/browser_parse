@@ -638,7 +638,12 @@ class CubeWorker:
             if sandbox is not None and not self._kill(sandbox):
                 self._unconfirmed_kill(job_id)
                 return
-            self.api.finish(job_id, "failed", _safe_text(f"Worker failed: {exc}", self._secrets), None, {
+            err_text = str(exc)
+            if "deadline_exceeded" in err_text.lower() or "context deadline exceeded" in err_text.lower() or (time.monotonic() - started >= timeout_seconds):
+                msg = f"Sandbox time limit reached ({int(timeout_seconds)}s timeout exceeded)."
+            else:
+                msg = f"Worker failed: {exc}"
+            self.api.finish(job_id, "failed", _safe_text(msg, self._secrets), None, {
                 "runtime_seconds": round(time.monotonic() - started, 3), "cost_source": "unknown",
             })
         finally:
