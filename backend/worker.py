@@ -261,7 +261,12 @@ class CubeWorker:
             secrets_list.append(config.guard_api_key)
         self._secrets = tuple(s for s in secrets_list if s)
         self.guard = guard
-        if self.guard is None and (config.guard_provider_url or config.codex_provider_url):
+        if self.guard is None and (
+            config.guard_provider_url
+            or config.codex_provider_url
+            or config.guard_model
+            or os.environ.get("ROBOT_GUARD_ENABLED", "").lower() in {"1", "true", "yes", "on"}
+        ):
             provider_url = config.guard_provider_url or config.codex_provider_url
             model = config.guard_model or config.codex_model
             api_key = config.guard_api_key or config.codex_api_key
@@ -534,8 +539,8 @@ class CubeWorker:
                     if hasattr(self.api, "sanitize"):
                         try:
                             self.api.sanitize(job_id, original, sanitized)
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            self._event(job_id, "warning", f"Failed to record sanitized prompt in store: {exc}", "guard")
                     self._event(job_id, "warning", "User incident prompt was refined for security.", "guard")
                 # R2.1: CLEAN verdict -> proceed normally into sandbox execution
 

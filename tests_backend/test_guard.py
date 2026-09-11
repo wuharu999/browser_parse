@@ -682,6 +682,139 @@ class SecurityGuardPipelineTests(unittest.TestCase):
             self.assertEqual(worker2.guard.provider_url, "https://guard.custom.test")
             self.assertEqual(worker2.guard.api_key, "guard-custom-key")
 
+    def test_suspicious_verdict_missing_sanitized_description_fails_closed(self) -> None:
+        """Verify that a SUSPICIOUS verdict omitting sanitized_description is treated as malformed, retries, and fails closed."""
+        job = {
+            "id": "job-suspicious-malformed",
+            "description": "Probe prompt.",
+            "language": "en",
+            "files": [],
+        }
+        api = MockWorkerApi(job)
+
+        call_count = 0
+
+        def fake_urlopen(*_args, **_kwargs):
+            nonlocal call_count
+            call_count += 1
+            # Missing sanitized_description on SUSPICIOUS
+            resp = make_chat_completion_response({"verdict": "SUSPICIOUS", "reason": "Borderline prompt detected"})
+            mock_resp = MagicMock()
+            mock_resp.__enter__.return_value.read.return_value = resp
+            return mock_resp
+
+        with patch("backend.guard.urlopen", side_effect=fake_urlopen):
+            worker = CubeWorker(self.config, api, MockSandbox)
+            self.assertTrue(worker.run_once())
+
+        self.assertEqual(call_count, 2)
+        self.assertEqual(len(MockSandbox.created), 0)
+        self.assertEqual(api.finished[0]["status"], "failed")
+        self.assertIn("Security pre-check failed", api.finished[0]["report"])
+
+    def test_conversational_and_markdown_response_parsing(self) -> None:
+        """Verify that LLM responses with conversational text surrounding markdown code blocks are parsed cleanly."""
+        text = "Based on our analysis, here is the result:\n```json\n{\"verdict\": \"CLEAN\", \"reason\": \"Safe inquiry\"}\n```\nThank you."
+        resp = {"choices": [{"message": {"role": "assistant", "content": text}}]}
+        res = _parse_guard_response(resp)
+        self.assertEqual(res.verdict, GuardVerdict.CLEAN)
+        self.assertEqual(res.reason, "Safe inquiry")
+
+    def test_large_document_memory_bounding(self) -> None:
+        """Verify that reading large non-log files does not load the full multi-megabyte file into memory."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            large_file = Path(temp_dir, "large.txt")
+            # Create a 20MB file
+            large_file.write_bytes(b"X" * (20 * 1024 * 1024))
+            extracted, _ = extract_non_log_attachments([("large.txt", large_file)], max_total_bytes=1000)
+            self.assertLessEqual(len(extracted), 1000)
+            self.assertIn("large.txt", extracted)
+
+    def test_large_image_rejected_without_unbounded_read(self) -> None:
+        """Verify that an image exceeding the 4 MiB limit returns None safely."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            huge_img = Path(temp_dir, "huge.png")
+            # Create a 10MB file
+            huge_img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * (10 * 1024 * 1024))
+            from backend.guard import _prepare_image
+            img_data = _prepare_image(huge_img, "huge.png", max_bytes=4 * 1024 * 1024)
+            self.assertIsNone(img_data)
+
+    def test_attachment_header_budgeting_and_small_safety_cap(self) -> None:
+        """Verify that small safety caps properly budget header space without producing orphan cut-off headers."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            doc = Path(temp_dir, "doc.txt")
+            doc.write_text("Secret attack payload")
+            # When cap is smaller than the header length, it must not emit an empty/cut-off header
+            extracted, _ = extract_non_log_attachments([("doc.txt", doc)], max_total_bytes=20)
+            self.assertEqual(extracted, "")
+
+    def test_pdf_indirect_injection_payload_in_llm_request(self) -> None:
+        """Verify that text extracted from a PDF attachment is actually included in the chat completions request payload."""
+        malicious_pdf = make_pdf_bytes("MALICIOUS_PDF_COMMAND_OVERRIDE")
+        job = {
+            "id": "job-pdf-verify",
+            "description": "Legitimate looking query",
+            "language": "en",
+            "files": [{
+                "id": "pdf-1",
+                "name": "data.pdf",
+                "size": len(malicious_pdf),
+                "sha256": hashlib.sha256(malicious_pdf).hexdigest(),
+            }],
+        }
+        api = MockWorkerApi(job, {"pdf-1": malicious_pdf})
+
+        recorded_requests: list[dict] = []
+
+        def fake_urlopen(req, *_args, **_kwargs):
+            body = json.loads(req.data.decode("utf-8"))
+            recorded_requests.append(body)
+            resp = make_chat_completion_response({"verdict": "INJECTION", "reason": "Attack in PDF"})
+            mock_resp = MagicMock()
+            mock_resp.__enter__.return_value.read.return_value = resp
+            return mock_resp
+
+        with patch("backend.guard.urlopen", side_effect=fake_urlopen):
+            worker = CubeWorker(self.config, api, MockSandbox)
+            self.assertTrue(worker.run_once())
+
+        self.assertEqual(len(recorded_requests), 1)
+        user_message = recorded_requests[0]["messages"][1]["content"]
+        self.assertIn("MALICIOUS_PDF_COMMAND_OVERRIDE", user_message)
+
+    def test_supports_vision_edge_cases(self) -> None:
+        """Verify supports_vision safely handles None, empty strings, and non-string inputs."""
+        self.assertFalse(supports_vision(None))
+        self.assertFalse(supports_vision(""))
+        self.assertTrue(supports_vision("gpt-4o-mini"))
+        self.assertTrue(supports_vision("claude-3-5-sonnet-20241022"))
+        self.assertFalse(supports_vision("gpt-5.6-luna"))
+
+    def test_guard_activation_with_guard_model_without_codex_url(self) -> None:
+        """Verify that ROBOT_GUARD_MODEL activates the guard even if ROBOT_CODEX_PROVIDER_URL is None."""
+        env = {
+            "ROBOT_WORKER_TOKEN": "tok",
+            "CUBE_API_URL": "http://cube:3000",
+            "CUBE_API_KEY": "ckey",
+            "CUBE_TEMPLATE_ID": "tmpl",
+            "ROBOT_CODEX_MODEL": "gpt-5.6-luna",
+            "OPENAI_API_KEY": "openai-key",
+            "ROBOT_GUARD_MODEL": "gpt-4o-mini",
+        }
+        with patch.dict("os.environ", env, clear=True):
+            cfg = WorkerConfig.from_env()
+            worker = CubeWorker(cfg, MockWorkerApi(None), MockSandbox)
+            self.assertIsNotNone(worker.guard)
+            self.assertEqual(worker.guard.model, "gpt-4o-mini")
+
+    def test_structured_attachments_classification(self) -> None:
+        """Verify structured config/doc formats (.yaml, .json, .xml) are classified as non-log attachments."""
+        self.assertTrue(is_non_log_attachment("config.yaml"))
+        self.assertTrue(is_non_log_attachment("settings.yml"))
+        self.assertTrue(is_non_log_attachment("data.json"))
+        self.assertTrue(is_non_log_attachment("doc.xml"))
+
 
 if __name__ == "__main__":
     unittest.main()

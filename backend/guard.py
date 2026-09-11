@@ -65,6 +65,7 @@ NON_LOG_EXTENSIONS = {
     ".pdf", ".doc", ".docx", ".odt", ".rtf", ".pages",
     ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tiff", ".tif",
     ".md", ".markdown", ".html", ".htm", ".txt", ".csv", ".tsv",
+    ".yaml", ".yml", ".json", ".xml", ".rst", ".tex", ".ini", ".conf",
 }
 
 IMAGE_EXTENSIONS = {
@@ -96,10 +97,36 @@ def is_image_attachment(name: str) -> bool:
     return any(lower.endswith(ext) for ext in IMAGE_EXTENSIONS)
 
 
-def supports_vision(model_name: str) -> bool:
+def supports_vision(model_name: str | None) -> bool:
     """Heuristic checking if the configured model identifier supports vision modalities."""
+    if not model_name or not isinstance(model_name, str):
+        return False
     lower = model_name.lower()
     return any(term in lower for term in ("vision", "flash", "4o", "gpt-4-turbo", "gemini", "claude"))
+
+
+def _extract_image_ocr(path: Path, max_bytes: int) -> str:
+    """Attempt OCR text extraction from an image using Tesseract CLI if available on the host (R1.2)."""
+    if max_bytes <= 0:
+        return ""
+    try:
+        # Bounded file size check before executing subprocess
+        if path.stat().st_size > 10 * 1024 * 1024:
+            return ""
+        res = subprocess.run(
+            ["tesseract", str(path), "stdout"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+            check=False,
+        )
+        if res.returncode == 0 and res.stdout:
+            text = res.stdout.decode("utf-8", errors="replace").strip()
+            if text:
+                return text[:max_bytes]
+    except Exception:
+        pass
+    return ""
 
 
 def _extract_pdf_text(path: Path, max_bytes: int) -> str:
@@ -107,8 +134,10 @@ def _extract_pdf_text(path: Path, max_bytes: int) -> str:
 
     Uses Poppler's pdftotext binary when available (standard Linux open-source tool).
     Falls back to a pure-Python regex stream scanner for fontless/synthetic test PDFs.
-    Ensures corrupted or malformed PDFs never crash the worker.
+    Ensures corrupted or malformed PDFs never crash the worker and bounds memory consumption.
     """
+    if max_bytes <= 0:
+        return ""
     # 1. Try pdftotext CLI (Poppler)
     try:
         res = subprocess.run(
@@ -128,7 +157,12 @@ def _extract_pdf_text(path: Path, max_bytes: int) -> str:
 
     # 2. Fallback: Parse PDF stream objects and parenthesized strings
     try:
-        data = path.read_bytes()
+        # Cap file reading to 10 MiB to prevent memory exhaustion on huge files
+        if path.stat().st_size > 10 * 1024 * 1024:
+            with path.open("rb") as f:
+                data = f.read(10 * 1024 * 1024)
+        else:
+            data = path.read_bytes()
         parts: list[str] = []
         # Find streams and attempt FlateDecode decompression
         for m in re.finditer(rb"stream[\r\n]+(.*?)[\r\n]+endstream", data, re.DOTALL):
@@ -149,9 +183,16 @@ def _extract_pdf_text(path: Path, max_bytes: int) -> str:
 
 
 def _extract_text_doc(path: Path, max_bytes: int) -> str:
-    """Extract plain text from documents with bounded memory reading and error replacement."""
+    """Extract plain text from documents with bounded memory reading and error replacement.
+
+    Streams only up to max_bytes * 2 from disk to prevent host memory exhaustion (OOM)
+    when users attach multi-gigabyte files.
+    """
+    if max_bytes <= 0:
+        return ""
     try:
-        data = path.read_bytes()[: max_bytes * 2]
+        with path.open("rb") as f:
+            data = f.read(max_bytes * 2)
         return data.decode("utf-8", errors="replace")[:max_bytes]
     except Exception:
         return ""
@@ -161,13 +202,17 @@ def _prepare_image(path: Path, name: str, max_bytes: int = 4 * 1024 * 1024) -> d
     """Validate and encode an image attachment as base64 for vision models.
 
     Uses Pillow (PIL) to verify image integrity before encoding.
+    Enforces the file size limit prior to reading into memory.
     Returns None safely if the image is corrupted or exceeds the size limit.
     """
     try:
+        if path.stat().st_size > max_bytes:
+            return None
         from PIL import Image
         with Image.open(path) as img:
             img.verify()
-        data = path.read_bytes()
+        with path.open("rb") as f:
+            data = f.read(max_bytes + 1)
         if len(data) > max_bytes:
             return None
         ext = Path(name).suffix.lower().lstrip(".")
@@ -187,6 +232,8 @@ def extract_non_log_attachments(
 
     Enforces the cumulative 32 KiB safety boundary across all non-log attachments to
     prevent token consumption attacks and unbounded host memory usage.
+    Budgets header space accurately so attachment content is never truncated out
+    by trailing header overhead.
     """
     text_chunks: list[str] = []
     images: list[dict[str, Any]] = []
@@ -197,30 +244,83 @@ def extract_non_log_attachments(
             continue
         lower = name.lower()
 
-        # Handle image attachments when vision modality is supported
+        # Handle image attachments when vision modality is supported or fallback to OCR
         if is_image_attachment(name):
             if include_images:
                 img_data = _prepare_image(path, name)
                 if img_data:
                     images.append(img_data)
+            else:
+                header = f"\n--- [Attachment: {name}] ---\n"
+                header_len = len(header)
+                if remaining_bytes > header_len:
+                    text_budget = remaining_bytes - header_len
+                    ocr_text = _extract_image_ocr(path, text_budget)
+                    if ocr_text.strip():
+                        content = header + ocr_text[:text_budget]
+                        text_chunks.append(content)
+                        remaining_bytes -= len(content)
             continue
 
         if remaining_bytes <= 0:
             break
 
+        header = f"\n--- [Attachment: {name}] ---\n"
+        header_len = len(header)
+        if remaining_bytes <= header_len:
+            # Cannot fit header and meaningful text content within remaining safety budget
+            break
+
+        text_budget = remaining_bytes - header_len
         # Extract text based on file type
         if lower.endswith(".pdf"):
-            extracted = _extract_pdf_text(path, remaining_bytes)
+            extracted = _extract_pdf_text(path, text_budget)
         else:
-            extracted = _extract_text_doc(path, remaining_bytes)
+            extracted = _extract_text_doc(path, text_budget)
 
         if extracted.strip():
-            header = f"\n--- [Attachment: {name}] ---\n"
-            content = (header + extracted)[:remaining_bytes]
+            content = header + extracted[:text_budget]
             text_chunks.append(content)
             remaining_bytes -= len(content)
 
     return "".join(text_chunks).strip(), images
+
+
+def _extract_json_payload(raw_text: str) -> dict[str, Any]:
+    """Extract a dictionary JSON payload from raw LLM output, handling markdown fences and surrounding text."""
+    raw_text = raw_text.strip()
+    if not raw_text:
+        raise ValueError("LLM response has empty content")
+
+    # 1. Direct JSON parse
+    try:
+        data = json.loads(raw_text)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+
+    # 2. Extract from markdown code fence (```json ... ``` or ``` ... ```)
+    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw_text, re.DOTALL)
+    if fence_match:
+        try:
+            data = json.loads(fence_match.group(1))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+
+    # 3. Extract outermost JSON object {...}
+    brace_match = re.search(r"(\{.*\})", raw_text, re.DOTALL)
+    if brace_match:
+        try:
+            data = json.loads(brace_match.group(1))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+
+    raise ValueError(f"LLM content is not valid JSON: {raw_text[:200]}")
 
 
 def _parse_guard_response(data: dict[str, Any]) -> GuardResult:
@@ -235,20 +335,7 @@ def _parse_guard_response(data: dict[str, Any]) -> GuardResult:
     if not isinstance(content, str) or not content.strip():
         raise ValueError("LLM response has empty content")
 
-    raw_text = content.strip()
-    # Strip markdown code blocks if the LLM formatted response as ```json ... ```
-    if raw_text.startswith("```"):
-        raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
-        raw_text = re.sub(r"\s*```$", "", raw_text)
-        raw_text = raw_text.strip()
-
-    try:
-        parsed = json.loads(raw_text)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"LLM content is not valid JSON: {raw_text[:200]}") from exc
-
-    if not isinstance(parsed, dict):
-        raise ValueError("LLM JSON payload is not an object")
+    parsed = _extract_json_payload(content)
 
     verdict_str = str(parsed.get("verdict", "")).strip().upper()
     if verdict_str not in {v.value for v in GuardVerdict}:
@@ -259,6 +346,10 @@ def _parse_guard_response(data: dict[str, Any]) -> GuardResult:
     sanitized = parsed.get("sanitized_description")
     if sanitized is not None:
         sanitized = str(sanitized).strip()
+
+    # R2.2 & R3: A SUSPICIOUS verdict MUST include a non-empty sanitized_description
+    if verdict == GuardVerdict.SUSPICIOUS and not sanitized:
+        raise ValueError("Guard response with SUSPICIOUS verdict must include non-empty sanitized_description")
 
     return GuardResult(
         verdict=verdict,
@@ -382,6 +473,8 @@ class SecurityGuard:
             raise GuardError("Guard LLM network timeout") from exc
         except json.JSONDecodeError as exc:
             raise GuardError("Guard LLM returned non-JSON response") from exc
+        except (OSError, Exception) as exc:
+            raise GuardError(f"Guard LLM connection error: {exc}") from exc
 
         try:
             return _parse_guard_response(raw_json)
