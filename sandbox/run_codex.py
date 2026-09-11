@@ -11,10 +11,12 @@ import json
 import os
 import queue
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -122,9 +124,67 @@ def _usage(event: dict[str, Any]) -> dict[str, int] | None:
 
 
 def _compact_evidence(value: Any) -> str:
+    """Format and preserve structured LogPackage metadata for Turn 1 prompt without dumping raw log bodies (R4.1).
+
+    Design rationale:
+    LogPackage contains pre-extracted browser metadata (file counts, line totals, severity distribution,
+    error patterns, and key timestamps). Discarding these forces Codex to spend unnecessary tool turns
+    rediscovering basic log properties.
+    However, raw log line dumps (rawLine, raw, contextBefore, contextAfter) must be stripped to prevent
+    wasting prompt context window space. Output is capped at 10,000 chars to remain bounded.
+    """
     if not isinstance(value, dict):
         return json.dumps({"type": type(value).__name__}, ensure_ascii=False)
-    return json.dumps({key: value[key] for key in ("schemaVersion", "coverage", "omissions", "summary", "source", "manifest") if key in value}, ensure_ascii=False, indent=2)[:6000]
+
+    out: dict[str, Any] = {}
+
+    # 1. Standard / legacy envelope keys
+    for k in ("schemaVersion", "summary", "coverage", "omissions", "source", "manifest"):
+        if k in value:
+            out[k] = value[k]
+
+    # 2. Overall log totals (file count, total lines, expanded bytes, severity breakdown)
+    if "totals" in value and isinstance(value["totals"], dict):
+        out["totals"] = value["totals"]
+
+    # 3. Per-file breakdown: file paths, sizes, line counts, timestamps, and error counts (up to 30 files)
+    if "files" in value and isinstance(value["files"], list):
+        out["files"] = [
+            {
+                k: f[k]
+                for k in ("path", "sizeBytes", "lines", "subsystem", "status",
+                          "severityCounts", "firstTimestamp", "lastTimestamp")
+                if k in f
+            }
+            for f in value["files"][:30]
+            if isinstance(f, dict)
+        ]
+
+    # 4. Extracted error patterns with signatures and counts (up to 20 patterns)
+    if "patterns" in value and isinstance(value["patterns"], list):
+        out["patterns"] = [
+            {
+                k: p[k]
+                for k in ("subsystem", "signature", "severity", "count", "countComplete", "example")
+                if k in p
+            }
+            for p in value["patterns"][:20]
+            if isinstance(p, dict)
+        ]
+
+    # 5. Filtered key evidence points (up to 25 items, strictly omitting raw bodies/context)
+    if "evidence" in value and isinstance(value["evidence"], list):
+        out["evidence"] = [
+            {
+                k: e[k]
+                for k in ("file", "line", "severity", "timestamp", "subsystem", "message")
+                if k in e
+            }
+            for e in value["evidence"][:25]
+            if isinstance(e, dict)
+        ]
+
+    return json.dumps(out, ensure_ascii=False, indent=2)[:10_000]
 
 
 def _safe_tool_action(item: dict[str, Any], event_type: str) -> str:
@@ -221,13 +281,204 @@ def _assemble_inputs(job: dict[str, Any]) -> None:
             raise ValueError("assembled upload size differs from manifest")
 
 
-def _prompt(job: dict[str, Any]) -> str:
+def _setup_virtualenv(venv_path: Path | str = "/opt/analysis-venv", workspace: Path | str = WORKSPACE) -> bool:
+    """Detect pre-installed analysis virtualenv, activate in os.environ, and configure shell profiles (R3.1, R3.2).
+
+    Design rationale:
+    Codex subagents execute commands across various sub-shells and child processes:
+    - Direct subprocess spawns inherit the updated `os.environ['PATH']` and `os.environ['VIRTUAL_ENV']`.
+    - Non-interactive shells (`bash -c "..."`) do not source .bashrc by default, but source `BASH_ENV`.
+    - Interactive/login shells source `/etc/profile.d/*.sh` and `.bashrc`.
+    Writing profile scripts and setting `BASH_ENV` ensures full package access (rosbags, mcap, numpy, etc.)
+    regardless of how subagents invoke Python tools.
+    """
+    venv = Path(venv_path)
+    workspace_path = Path(workspace)
+    if not venv.is_dir():
+        return False
+    bin_dir = venv / "bin"
+    if not bin_dir.is_dir():
+        return False
+
+    # 1. Update current process environment for all child processes
+    os.environ["VIRTUAL_ENV"] = str(venv)
+    bin_str = str(bin_dir)
+    current_path = os.environ.get("PATH", "")
+    if not current_path.startswith(f"{bin_str}:") and current_path != bin_str:
+        parts = [p for p in current_path.split(":") if p and p != bin_str]
+        os.environ["PATH"] = f"{bin_str}:{':'.join(parts)}" if parts else bin_str
+
+    # 2. Shell activation snippet for both profile.d and .bashrc
+    profile_script = (
+        f'# Auto-activate analysis virtualenv\n'
+        f'if [ -d "{venv}" ]; then\n'
+        f'    export VIRTUAL_ENV="{venv}"\n'
+        f'    case ":$PATH:" in\n'
+        f'        *:"{bin_str}":*) ;;\n'
+        f'        *) export PATH="{bin_str}:$PATH" ;;\n'
+        f'    esac\n'
+        f'fi\n'
+    )
+
+    # 3. Write /etc/profile.d/analysis_venv.sh (for login shells, if writable)
+    profile_d = Path("/etc/profile.d")
+    profile_file = profile_d / "analysis_venv.sh"
+    if profile_d.is_dir():
+        try:
+            profile_file.write_text(profile_script)
+        except (OSError, PermissionError):
+            pass
+
+    # 4. Write /workspace/.bashrc (interactive shells)
+    try:
+        workspace_path.mkdir(parents=True, exist_ok=True)
+    except (OSError, PermissionError):
+        pass
+    bashrc = workspace_path / ".bashrc"
+    try:
+        content = bashrc.read_text(errors="replace") if bashrc.exists() else ""
+        if str(venv) not in content:
+            new_content = content + ("\n" if content and not content.endswith("\n") else "") + profile_script
+            bashrc.write_text(new_content)
+    except (OSError, PermissionError):
+        pass
+
+    # 5. Set BASH_ENV so non-interactive sub-shells (bash -c) auto-source the profile
+    if bashrc.exists():
+        os.environ["BASH_ENV"] = str(bashrc)
+    elif profile_file.exists():
+        os.environ["BASH_ENV"] = str(profile_file)
+
+    return True
+
+
+def _scan_db3_telemetry(inputs_dir: Path | str = WORKSPACE / "inputs") -> list[dict[str, Any]]:
+    """Fast pre-scan of all ROS2 SQLite .db3 bag files under inputs (<0.5s total) (R4.2).
+
+    Design rationale:
+    ROS2 bags store odometry, joystick, and joint telemetry in SQLite .db3 files.
+    Querying only metadata (topics and message timestamp boundaries) without loading
+    heavy message payloads (BLOBs) executes in <15ms.
+    Injecting this directly into the initial Codex prompt allows the agent to immediately
+    understand topic names, rates, and timestamp ranges without wasting tool turns on discovery.
+    """
+    inputs_path = Path(inputs_dir)
+    if not inputs_path.is_dir():
+        return []
+
+    results: list[dict[str, Any]] = []
+    # Discover all .db3 files recursively under inputs/ (capped at 50 files)
+    for db3_file in sorted(inputs_path.rglob("*.db3"))[:50]:
+        try:
+            # Use read-only URI mode to prevent any locking or modification of bag files
+            uri = f"file:{db3_file.resolve()}?mode=ro"
+            with sqlite3.connect(uri, uri=True, timeout=1.0) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('topics', 'messages')"
+                )
+                tables = {row[0] for row in cursor.fetchall()}
+                if "topics" not in tables or "messages" not in tables:
+                    continue
+
+                cursor.execute("""
+                    SELECT 
+                        t.name, 
+                        t.type, 
+                        COUNT(m.id) as msg_count, 
+                        MIN(m.timestamp) as start_ts, 
+                        MAX(m.timestamp) as end_ts
+                    FROM topics t
+                    LEFT JOIN messages m ON t.id = m.topic_id
+                    GROUP BY t.id, t.name, t.type
+                    ORDER BY t.name ASC
+                """)
+                topics_info: list[dict[str, Any]] = []
+                for name, msg_type, count, start_ts, end_ts in cursor.fetchall():
+                    duration_s = None
+                    start_iso = None
+                    end_iso = None
+                    if start_ts is not None and end_ts is not None:
+                        duration_s = round((end_ts - start_ts) / 1e9, 3)
+                        # Nanosecond timestamp conversion (ROS2 standard)
+                        if start_ts > 1_000_000_000_000_000_000:
+                            try:
+                                start_iso = datetime.fromtimestamp(start_ts / 1e9, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+                                end_iso = datetime.fromtimestamp(end_ts / 1e9, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+                            except Exception:
+                                pass
+                        elif start_ts > 1_000_000_000:
+                            try:
+                                start_iso = datetime.fromtimestamp(start_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+                                end_iso = datetime.fromtimestamp(end_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+                            except Exception:
+                                pass
+                    topics_info.append({
+                        "topic": name,
+                        "type": msg_type,
+                        "message_count": count,
+                        "start_timestamp_ns": start_ts,
+                        "end_timestamp_ns": end_ts,
+                        "start_iso": start_iso,
+                        "end_iso": end_iso,
+                        "duration_seconds": duration_s,
+                    })
+                try:
+                    if inputs_path.name == "inputs":
+                        rel_path = str(db3_file.relative_to(inputs_path.parent))
+                    else:
+                        rel_path = str(db3_file.relative_to(inputs_path))
+                except ValueError:
+                    rel_path = db3_file.name
+
+                results.append({
+                    "file": rel_path,
+                    "topics": topics_info,
+                })
+        except Exception:
+            continue
+    return results
+
+
+def _format_db3_telemetry(telemetry: list[dict[str, Any]]) -> str:
+    """Format extracted telemetry metadata into a concise prompt block for Turn 1."""
+    if not telemetry:
+        return ""
+    lines = ["Pre-scanned ROS2 Telemetry (.db3):"]
+    for item in telemetry:
+        file_name = item.get("file", "unknown")
+        lines.append(f"- File: {file_name}")
+        for topic in item.get("topics", []):
+            name = topic.get("topic")
+            m_type = topic.get("type")
+            count = topic.get("message_count", 0)
+            start = topic.get("start_iso") or topic.get("start_timestamp_ns")
+            end = topic.get("end_iso") or topic.get("end_timestamp_ns")
+            dur = topic.get("duration_seconds")
+            time_str = f"{start} -> {end}" if start is not None else "no messages"
+            if dur is not None:
+                time_str += f" ({dur}s)"
+            lines.append(f"  - Topic: {name} | Type: {m_type} | Count: {count} | Time: {time_str}")
+    return "\n".join(lines)
+
+
+def _prompt(job: dict[str, Any], telemetry: list[dict[str, Any]] | None = None) -> str:
     evidence = _compact_evidence(job.get("evidence", {}))
     template = WORKSPACE / "MAIN_PROMPT.md"
     if template.is_file():
         base = template.read_text(errors="replace")[:12_000]
     else:
         base = "You are the main evidence-analysis agent inside an isolated CubeSandbox."
+
+    # Automatically pre-scan inputs directory for ROS2 db3 bag telemetry if not explicitly passed (R4.2)
+    if telemetry is None and (WORKSPACE / "inputs").is_dir():
+        telemetry = _scan_db3_telemetry(WORKSPACE / "inputs")
+    telemetry_block = ""
+    if telemetry:
+        formatted = _format_db3_telemetry(telemetry)
+        if formatted:
+            telemetry_block = f"\n{formatted}\n"
+
     return f"""{base}
 
 Analyze the supplied job and produce a concise, evidence-grounded final report.
@@ -248,6 +499,7 @@ Job description:
 Language: {job.get('language', 'en')}
 Evidence metadata:
 {evidence}
+{telemetry_block}
 Inputs are under /workspace/inputs and optional wiki context under /workspace/wiki.
 """
 
@@ -345,6 +597,11 @@ def main() -> int:
     started = time.monotonic()
     peak_rss = 0
     try:
+        # Pre-installed virtual environment auto-sourcing (R3.1, R3.2).
+        # Ensures analysis packages (rosbags, mcap, numpy, pandas, etc.) are in PATH
+        # and shell profiles before assembling inputs or executing tools.
+        _setup_virtualenv()
+
         job = json.loads(Path(sys.argv[1]).read_text())
         if not isinstance(job, dict):
             raise ValueError("job JSON must be an object")

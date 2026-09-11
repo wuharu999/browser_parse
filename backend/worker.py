@@ -391,6 +391,12 @@ class CubeWorker:
             "CODEX_MODEL": model,
             "CODEX_PROVIDER_ENV_KEY": self.config.codex_api_key_env,
             "ROBOT_RUN_TIMEOUT_SECONDS": str(timeout_seconds),
+            # Pre-installed virtual environment auto-sourcing (R3.1, R3.2):
+            # Prioritize the analysis virtualenv binary directory so child processes
+            # and subagent tool invocations have immediate access to preinstalled
+            # analysis packages (rosbags, mcap, numpy, pandas, pypdf, h5py, etc.).
+            "VIRTUAL_ENV": "/opt/analysis-venv",
+            "PATH": "/opt/analysis-venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         }
         if self.config.codex_provider_url:
             values["CODEX_PROVIDER_URL"] = self.config.codex_provider_url
