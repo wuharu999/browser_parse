@@ -214,11 +214,16 @@ function sandboxAbstractionPanel(id: string, records: Event[]): HTMLElement {
   container.append(guardBar);
 
   const processGrid = el('div', 'sandbox-process-grid');
-  const agentDefs: Array<{ id: string; name: string; role: string; icon: string }> = [
+  // 3-subagent specialization roster (R2.1, R2.4):
+  // standardAgents defines the orchestrator and all 3 specialized subagents so each
+  // renders a process card, live status badge, and intermediate output drawer in the UI grid.
+  const standardAgents: Array<{ id: string; name: string; role: string; icon: string }> = [
     { id: 'codex', name: 'Codex Orchestrator', role: t('Parent Process', '主分析进程'), icon: '⚡' },
     { id: 'log_investigator', name: 'Log Investigator', role: t('Subagent', '诊断子进程'), icon: '🔍' },
+    { id: 'telemetry_investigator', name: 'Telemetry Investigator', role: t('Subagent', '遥测子进程'), icon: '📊' },
     { id: 'evidence_reviewer', name: 'Evidence Reviewer', role: t('Subagent', '审查子进程'), icon: '📋' },
   ];
+  const agentDefs = [...standardAgents];
 
   for (const rec of records) {
     if (rec.agent && !['worker', 'guard'].includes(rec.agent) && !agentDefs.some(d => d.id === rec.agent)) {

@@ -15,6 +15,7 @@ class RunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.object(run_codex, "WORKSPACE", Path(directory)):
             prompt = run_codex._prompt({"description": "Check motor timeout", "language": "zh", "evidence": {"schemaVersion": "robot-log-evidence/v2", "evidence": [{"raw": "private full log body"}]}})
             self.assertIn("log_investigator", prompt)
+            self.assertIn("telemetry_investigator", prompt)
             self.assertIn("evidence_reviewer", prompt)
             self.assertIn("Language: zh", prompt)
             self.assertNotIn("private full log body", prompt)
@@ -91,8 +92,51 @@ class RunnerTests(unittest.TestCase):
             config = tomllib.loads(Path(directory, ".codex/config.toml").read_text())
             self.assertEqual(os.environ["CODEX_HOME"], str(Path(directory, ".codex")))
             self.assertEqual(config["model"], "test-model")
-            self.assertEqual(config["agents"]["max_concurrent_threads_per_session"], 2)
+            self.assertEqual(config["model_reasoning_effort"], "high")
+            self.assertEqual(config["agents"]["max_concurrent_threads_per_session"], 3)
             self.assertEqual(config["model_providers"]["sandbox-provider"]["env_key"], "TEST_MODEL_KEY")
+
+    def test_safe_agents_includes_telemetry_investigator(self):
+        # R2.3: Safe agent whitelist must include telemetry_investigator for activity streaming and child metrics
+        self.assertIn("telemetry_investigator", run_codex.SAFE_AGENTS)
+        self.assertEqual(run_codex.SAFE_AGENTS, {"codex", "log_investigator", "telemetry_investigator", "evidence_reviewer"})
+
+    def test_reasoning_effort_configuration_and_env_override(self):
+        # R1.1: Default reasoning effort is "high", overridable via ROBOT_CODEX_REASONING_EFFORT
+        with tempfile.TemporaryDirectory() as directory, patch.object(run_codex, "WORKSPACE", Path(directory)):
+            run_codex._write_config("gpt-5.6-luna")
+            config = tomllib.loads(Path(directory, ".codex/config.toml").read_text())
+            self.assertEqual(config["model_reasoning_effort"], "high")
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(run_codex, "WORKSPACE", Path(directory)), patch.dict(os.environ, {"ROBOT_CODEX_REASONING_EFFORT": "low"}):
+            run_codex._write_config("gpt-5.6-luna")
+            config = tomllib.loads(Path(directory, ".codex/config.toml").read_text())
+            self.assertEqual(config["model_reasoning_effort"], "low")
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(run_codex, "WORKSPACE", Path(directory)), patch.dict(os.environ, {"ROBOT_CODEX_REASONING_EFFORT": "invalid_value"}):
+            run_codex._write_config("gpt-5.6-luna")
+            config = tomllib.loads(Path(directory, ".codex/config.toml").read_text())
+            self.assertEqual(config["model_reasoning_effort"], "high")
+
+    def test_subagent_toml_configurations(self):
+        # R1.1, R1.2, R2.1: Verify all 3 subagents exist, use low reasoning effort, and contain inlined diagnostic commands
+        agents_dir = Path(__file__).parents[1] / "sandbox/runtime/.codex/agents"
+        expected_agents = {
+            "log-investigator.toml": "log_investigator",
+            "telemetry-investigator.toml": "telemetry_investigator",
+            "evidence-reviewer.toml": "evidence_reviewer",
+        }
+        for filename, expected_name in expected_agents.items():
+            agent_file = agents_dir / filename
+            self.assertTrue(agent_file.is_file(), f"Missing agent file {filename}")
+            agent_data = tomllib.loads(agent_file.read_text())
+            self.assertEqual(agent_data["name"], expected_name)
+            self.assertEqual(agent_data["model_reasoning_effort"], "low")
+            instructions = agent_data["developer_instructions"]
+            self.assertIn("without reading SKILL.md", instructions)
+            self.assertIn("rg", instructions)
+            self.assertIn("head", instructions)
+            self.assertIn("tail", instructions)
 
     def test_deepseek_catalog_has_current_vision_model_and_accurate_legacy_aliases(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(run_codex, "WORKSPACE", Path(directory)), patch.dict(os.environ, {"CODEX_PROVIDER_URL": "https://api.deepseek.com", "CODEX_PROVIDER_ENV_KEY": "DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY": "test-secret-never-written"}):

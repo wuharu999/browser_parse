@@ -514,7 +514,9 @@ class CubeWorker:
                 sequence = event.get("seq")
                 if not isinstance(sequence, int) or sequence <= seen:
                     continue
-                agent = event.get("agent") if event.get("agent") in {"codex", "log_investigator", "evidence_reviewer"} else "codex"
+                # Safe agent whitelist for activity event streaming (R2.3).
+                # Must match SAFE_AGENTS in sandbox/run_codex.py to prevent downgrading subagent events to orchestrator.
+                agent = event.get("agent") if event.get("agent") in {"codex", "log_investigator", "telemetry_investigator", "evidence_reviewer"} else "codex"
                 message = event.get("message") if isinstance(event.get("message"), str) else "Codex activity."
                 activity_kind = event.get("kind")
                 if activity_kind not in {None, "message", "tool", "subagent", "lifecycle"}:
