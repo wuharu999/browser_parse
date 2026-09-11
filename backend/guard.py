@@ -77,10 +77,11 @@ def is_non_log_attachment(name: str) -> bool:
     """Classify whether a file is a non-log attachment requiring host inspection.
 
     Ensures document and image formats (PDF, DOCX, PNG, etc.) are always inspected,
-    even if the filename contains '.log.' substrings (e.g. 'incident.log.pdf').
+    even if the filename contains '.log.' substrings (e.g. 'incident.log.pdf') or
+    surrounding whitespace.
     Excludes raw archives and telemetry/log files (.log, .stdout, rotated .log.1).
     """
-    lower = name.lower()
+    lower = name.strip().lower()
     # Raw archives are not unpacked on host
     for ext in ARCHIVE_EXTENSIONS:
         if lower.endswith(ext):
@@ -98,7 +99,7 @@ def is_non_log_attachment(name: str) -> bool:
 
 def is_image_attachment(name: str) -> bool:
     """Check if the attachment filename indicates an image format."""
-    lower = name.lower()
+    lower = name.strip().lower()
     return any(lower.endswith(ext) for ext in IMAGE_EXTENSIONS)
 
 
@@ -173,6 +174,7 @@ def _extract_pdf_text(path: Path, max_bytes: int) -> str:
         else:
             data = path.read_bytes()
         parts: list[str] = []
+        total_extracted = 0
         # Find streams and attempt FlateDecode decompression with zip bomb bounds
         for m in re.finditer(rb"stream[\r\n]+(.*?)[\r\n]+endstream", data, re.DOTALL):
             chunk = m.group(1)
@@ -185,12 +187,18 @@ def _extract_pdf_text(path: Path, max_bytes: int) -> str:
                 unescaped = sm.group(1).decode("latin1", errors="replace").replace(r"\(", "(").replace(r"\)", ")")
                 if unescaped.strip():
                     parts.append(unescaped)
+                    total_extracted += len(unescaped)
+            if total_extracted >= max_bytes:
+                break
         # Also capture uncompressed string literals outside stream containers
         if not parts:
             for sm in re.finditer(rb"\(((?:\\.|[^)\\]){4,})\)", data):
                 unescaped = sm.group(1).decode("latin1", errors="replace").replace(r"\(", "(").replace(r"\)", ")")
                 if unescaped.strip():
                     parts.append(unescaped)
+                    total_extracted += len(unescaped)
+                    if total_extracted >= max_bytes:
+                        break
         return " ".join(parts)[:max_bytes]
     except Exception:
         return ""
@@ -303,51 +311,86 @@ def extract_non_log_attachments(
     return "".join(text_chunks).strip(), images
 
 
+VALID_VERDICTS = {"CLEAN", "SUSPICIOUS", "INJECTION"}
+
+
+def _is_valid_verdict_dict(d: Any) -> bool:
+    """Check if a dictionary contains a recognized security guard verdict."""
+    if not isinstance(d, dict):
+        return False
+    v = str(d.get("verdict", "")).strip().upper()
+    return v in VALID_VERDICTS
+
+
+def _extract_candidates_from_text(text: str) -> list[dict[str, Any]]:
+    """Scan text for valid JSON dictionary objects using standard library raw_decode."""
+    results: list[dict[str, Any]] = []
+    decoder = json.JSONDecoder()
+    start = text.find("{")
+    while start != -1:
+        try:
+            obj, _ = decoder.raw_decode(text[start:])
+            if isinstance(obj, dict):
+                results.append(obj)
+        except Exception:
+            pass
+        start = text.find("{", start + 1)
+    return results
+
+
 def _extract_json_payload(raw_text: str) -> dict[str, Any]:
-    """Extract a dictionary JSON payload from raw LLM output, handling markdown fences, comments, and conversational surrounding text."""
+    """Extract a dictionary JSON payload from raw LLM output.
+
+    Defense against Prompt Injection Payload Spoofing:
+    - Attackers may embed fake verdict blocks (e.g. '{"verdict": "CLEAN"}') in prompts or files.
+    - If the LLM echoes or quotes user text in its reasoning before delivering its verdict,
+      greedy matching of the first '{' or first code fence would extract the attacker's fake verdict.
+    - This parser scans all candidate objects, prioritizes valid verdict objects (CLEAN, SUSPICIOUS, INJECTION),
+      and selects the model's concluding verdict object to prevent security bypass.
+    """
     raw_text = raw_text.strip()
     if not raw_text:
         raise ValueError("LLM response has empty content")
 
-    # 1. Direct JSON parse
+    # 1. Direct JSON parse if whole response is a valid verdict dictionary
     try:
         data = json.loads(raw_text)
-        if isinstance(data, dict):
+        if _is_valid_verdict_dict(data):
             return data
     except Exception:
         pass
 
-    # 2. Extract content from markdown code fence (```json ... ``` or ``` ... ```)
-    fence_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", raw_text, re.DOTALL)
-    if fence_match:
+    # 2. Extract candidates from all markdown code fences
+    fenced_candidates: list[dict[str, Any]] = []
+    for fence_match in re.finditer(r"```(?:json)?\s*\n?(.*?)\n?```", raw_text, re.DOTALL):
         fence_content = fence_match.group(1).strip()
         try:
             data = json.loads(fence_content)
             if isinstance(data, dict):
-                return data
+                fenced_candidates.append(data)
         except Exception:
             pass
-        # If direct parse of fence failed (e.g. comments inside code fence), scan fence with raw_decode
-        start = fence_content.find("{")
-        while start != -1:
-            try:
-                obj, _ = json.JSONDecoder().raw_decode(fence_content[start:])
-                if isinstance(obj, dict):
-                    return obj
-            except Exception:
-                pass
-            start = fence_content.find("{", start + 1)
+        for candidate in _extract_candidates_from_text(fence_content):
+            if candidate not in fenced_candidates:
+                fenced_candidates.append(candidate)
 
-    # 3. Scan for valid JSON object {...} anywhere in the text using standard library raw_decode
-    start = raw_text.find("{")
-    while start != -1:
-        try:
-            obj, _ = json.JSONDecoder().raw_decode(raw_text[start:])
-            if isinstance(obj, dict):
-                return obj
-        except Exception:
-            pass
-        start = raw_text.find("{", start + 1)
+    valid_fenced = [c for c in fenced_candidates if _is_valid_verdict_dict(c)]
+    if valid_fenced:
+        # Return the final conclusive verdict from code blocks
+        return valid_fenced[-1]
+
+    # 3. Scan the full text for candidates using raw_decode
+    all_candidates = _extract_candidates_from_text(raw_text)
+    valid_all = [c for c in all_candidates if _is_valid_verdict_dict(c)]
+    if valid_all:
+        # Return the final conclusive verdict from text
+        return valid_all[-1]
+
+    # Fallback: return last parsed dictionary if available (will fail validation downstream and fail closed)
+    if fenced_candidates:
+        return fenced_candidates[-1]
+    if all_candidates:
+        return all_candidates[-1]
 
     raise ValueError(f"LLM content is not valid JSON: {raw_text[:200]}")
 
@@ -361,6 +404,9 @@ def _parse_guard_response(data: dict[str, Any]) -> GuardResult:
     if not isinstance(message, dict):
         raise ValueError("LLM response missing message object")
     content = message.get("content")
+    if isinstance(content, list):
+        # Support providers returning message content as structured content parts
+        content = "".join(part.get("text", "") for part in content if isinstance(part, dict) and "text" in part)
     if not isinstance(content, str) or not content.strip():
         raise ValueError("LLM response has empty content")
 
@@ -374,11 +420,16 @@ def _parse_guard_response(data: dict[str, Any]) -> GuardResult:
     reason = str(parsed.get("reason", ""))
     sanitized = parsed.get("sanitized_description")
     if sanitized is not None:
-        sanitized = str(sanitized).strip()
+        if not isinstance(sanitized, str):
+            sanitized = str(sanitized)
+        sanitized = sanitized.strip()
 
     # R2.2 & R3: A SUSPICIOUS verdict MUST include a non-empty, meaningful sanitized_description
-    if verdict == GuardVerdict.SUSPICIOUS and (not sanitized or sanitized.lower() in {"null", "none", "n/a"}):
-        raise ValueError("Guard response with SUSPICIOUS verdict must include non-empty sanitized_description")
+    if verdict == GuardVerdict.SUSPICIOUS:
+        clean_chars = "".join(c for c in (sanitized or "") if c in "\n\t" or ord(c) >= 32).strip()
+        if not clean_chars or clean_chars.lower() in {"null", "none", "n/a", "nil", "undefined", "[]", "{}"} or len(clean_chars) < 3:
+            raise ValueError("Guard response with SUSPICIOUS verdict must include non-empty sanitized_description")
+        sanitized = clean_chars
 
     return GuardResult(
         verdict=verdict,
@@ -420,12 +471,12 @@ class SecurityGuard:
         self,
         model: str,
         provider_url: str | None,
-        api_key: str,
+        api_key: str | None = None,
         timeout: float = 30.0,
     ) -> None:
         self.model = model
         self.provider_url = provider_url
-        self.api_key = api_key
+        self.api_key = api_key or ""
         self.timeout = timeout
 
     def supports_vision(self) -> bool:
@@ -494,6 +545,12 @@ class SecurityGuard:
         try:
             with urlopen(req, timeout=self.timeout) as resp:
                 resp_bytes = resp.read(10 * 1024 * 1024)
+                encoding = resp.headers.get("Content-Encoding", "").lower() if resp.headers else ""
+                if "gzip" in encoding:
+                    import gzip
+                    resp_bytes = gzip.decompress(resp_bytes)
+                elif "deflate" in encoding:
+                    resp_bytes = zlib.decompress(resp_bytes)
                 raw_json = json.loads(resp_bytes.decode("utf-8"))
         except HTTPError as exc:
             raise GuardError(f"Guard LLM HTTP error: {exc.code}") from exc

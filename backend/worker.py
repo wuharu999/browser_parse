@@ -502,7 +502,7 @@ class CubeWorker:
                     name = str(item.get("name", ""))
                     if is_non_log_attachment(name):
                         file_id = str(item.get("id", ""))
-                        safe_file_id = re.sub(r"[^A-Za-z0-9_-]", "_", file_id)[:80] or f"file_{index}"
+                        safe_file_id = f"{index}_{re.sub(r'[^A-Za-z0-9_-]', '_', file_id)[:60]}"
                         staged = Path(guard_temp, safe_file_id)
                         try:
                             self.api.download_to(job_id, file_id, staged)
@@ -527,13 +527,19 @@ class CubeWorker:
                 except (GuardError, Exception) as exc:
                     # R3: Safe failure handling (fail closed)
                     # If guard LLM call fails after retry, terminate without sandbox provisioning.
-                    self._event(job_id, "warning", f"Security pre-check failed: {exc}", "guard")
+                    try:
+                        self._event(job_id, "warning", f"Security pre-check failed: {exc}", "guard")
+                    except Exception:
+                        pass
                     self.api.finish(job_id, "failed", "Security pre-check failed", 0.0, {"cost_source": "unknown", "security_verdict": "ERROR"})
                     return
 
                 # R2.3: INJECTION verdict -> immediate hard stop, mark failed, zero sandboxes, budget not decremented
                 if result.verdict == GuardVerdict.INJECTION:
-                    self._event(job_id, "warning", "Prompt injection detected in inputs", "guard")
+                    try:
+                        self._event(job_id, "warning", "Prompt injection detected in inputs", "guard")
+                    except Exception:
+                        pass
                     self.api.finish(job_id, "failed", "Prompt injection detected in inputs", 0.0, {"cost_source": "unknown", "security_verdict": "INJECTION"})
                     return
                 # R2.2: SUSPICIOUS verdict -> sanitize prompt, record both in DB, emit warning, dispatch sanitized prompt to Codex
