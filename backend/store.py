@@ -17,7 +17,7 @@ from .resources import allocation, estimate_resources
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 TERMINAL = {"completed", "failed", "cancelled"}
-EVENT_KINDS = {"progress", "notice", "warning", "error", "analysis", "artifact", "system"}
+EVENT_KINDS = {"progress", "notice", "warning", "error", "analysis", "artifact", "system", "heartbeat"}
 
 
 def now() -> datetime:
@@ -246,7 +246,7 @@ class Store:
             self.db.commit()
             return {"id": artifact_id, "name": name, "size": size, "sha256": sha256, "created_at": created}
 
-    def events(self, job_id: str, after: int, limit: int = 200, *, latest: bool = False, before: int | None = None) -> tuple[list[dict], int | None]:
+    def events(self, job_id: str, after: int, limit: int = 500, *, latest: bool = False, before: int | None = None) -> tuple[list[dict], int | None]:
         with self.lock:
             if latest or before is not None:
                 rows = self.db.execute("SELECT seq,created_at,kind,agent,message FROM events WHERE job_id=? AND seq>? AND seq<? ORDER BY seq DESC LIMIT ?", (job_id, after, before if before is not None else 9223372036854775807, limit)).fetchall()[::-1]

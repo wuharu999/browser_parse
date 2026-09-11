@@ -127,10 +127,10 @@ class ApiTest(unittest.TestCase):
         store = self.client.app.state.store
         with store.lock:
             store._tx()
-            for n in range(205): store._event(jid, "notice", "worker", f"event {n}")
+            for n in range(505): store._event(jid, "notice", "worker", f"event {n}")
             store.db.commit()
         events = self.client.get(f"/api/jobs/{jid}/events?after=0").json()
-        self.assertEqual(len(events["events"]), 200)
+        self.assertEqual(len(events["events"]), 500)
         self.assertEqual(self.client.get("/api/jobs?limit=1").json()["items"][0]["id"], jid)
 
     def test_public_worker_text_redacts_common_secrets_and_rejects_nonfinite_cost(self):
@@ -160,13 +160,13 @@ class ApiTest(unittest.TestCase):
         store = self.client.app.state.store
         with store.lock:
             store._tx()
-            for index in range(405): store._event(jid, "notice", "worker", f"fixture {index}")
+            for index in range(1005): store._event(jid, "notice", "worker", f"fixture {index}")
             store.db.commit()
         latest = self.client.get(f"/api/jobs/{jid}/events?latest=true").json()["events"]
-        self.assertEqual(len(latest), 200)
-        self.assertEqual(latest[-1]["message"], "fixture 404")
+        self.assertEqual(len(latest), 500)
+        self.assertEqual(latest[-1]["message"], "fixture 1004")
         older = self.client.get(f"/api/jobs/{jid}/events?before={latest[0]['seq']}").json()["events"]
-        self.assertEqual(len(older), 200)
+        self.assertEqual(len(older), 500)
         self.assertLess(older[-1]["seq"], latest[0]["seq"])
         self.assertEqual([event["seq"] for event in latest], sorted(event["seq"] for event in latest))
         for query in ("before=-1", "before=9999999999999999999999", "after=9999999999999999999999"):

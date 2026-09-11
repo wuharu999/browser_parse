@@ -455,16 +455,23 @@ class CubeWorker:
                 if activity_kind not in {None, "message", "tool", "subagent", "lifecycle"}:
                     continue
                 # The UI has one public event category today; preserve a compact
-                # text label so it can render session activity without exposing
-                # runner JSON, commands, or tool output.
                 if activity_kind == "tool":
-                    message = message if message in {
-                        "Codex tool execution started.",
-                        "Codex tool execution completed.",
-                        "Codex tool execution updated.",
-                    } else "Codex tool execution update."
+                    safe_prefixes = (
+                        "Codex tool execution",
+                        "Inspecting",
+                        "Inspected",
+                        "Checking",
+                        "Checked",
+                        "Analyzing",
+                        "Analyzed",
+                        "Scanning",
+                        "Scanned",
+                    )
+                    if not any(message.startswith(p) for p in safe_prefixes):
+                        message = "Codex tool execution update."
                 elif activity_kind == "subagent":
-                    message = f"Subagent {agent} update."
+                    if not message.startswith("Subagent "):
+                        message = f"Subagent {agent} update."
                 public = _safe_text(message, self._secrets)[:800]
                 if public:
                     self._event(job_id, "progress", public, agent)
@@ -604,7 +611,7 @@ class CubeWorker:
                     self.api.finish(job_id, "cancelled", "Cancelled during sandbox execution.", None, {"runtime_seconds": round(time.monotonic() - started, 3), "cost_source": "unknown"})
                     return
                 seen_activity = self._activity(sandbox, job_id, seen_activity)
-                self._event(job_id, "progress", "Sandbox execution remains active.")
+                self._event(job_id, "heartbeat", "Sandbox execution remains active.")
                 time.sleep(min(15, self.config.poll_seconds))
             command.result()  # only command status is consumed; never publish stdout/stderr
             executor.shutdown(wait=True)

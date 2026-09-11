@@ -4,7 +4,7 @@ import { parseReport } from './report';
 import { availability, type Budget } from './budget';
 import { onUiLanguage, setUiLanguage, t, uiLanguage } from './i18n';
 
-type Job = { id: string; description: string; status: string; created_at: string; cancel_requested: boolean; report?: string; resource_plan?: { profile: string; cpu_milli: number; memory_mb: number; disk_mb: number } | null; review_claim?: { name: string; expires_at: string } | null };
+type Job = { id: string; description: string; status: string; created_at: string; cancel_requested: boolean; report?: string; resource_plan?: { profile: string; cpu_milli: number; memory_mb: number; disk_mb: number } | null; review_claim?: { name: string; expires_at: string } | null; sanitized_description?: string };
 type Version = { id: number; reviewer_name: string; success: boolean; note: string; procedure: string; created_at: string };
 type Event = { seq: number; agent: string; kind: string; message: string; created_at?: string };
 type Draft = { name: string; procedure: string; note: string; verdict: string; token?: string; expires_at?: string };
@@ -34,7 +34,10 @@ let submitMessage = '', controller: AbortController | undefined, selectedJob: Jo
 let selectedEvents: Event[] = [], detailSignature = '', detailSequence = 0, detailNeedsRender = false, refreshing = false;
 const drafts = new Map<string, Draft>(), events = new Map<string, Event[]>();
 const sessionViews = new Map<string, { open: boolean; top: number; following: boolean }>();
+const processDrawers = new Map<string, boolean>();
 const pausedSessions = new Set<string>();
+const isHeartbeat = (event: Event): boolean => event.kind === 'heartbeat' || event.message.includes('Sandbox execution remains active');
+const findJob = (id: string): Job | undefined => (selectedJob?.id === id ? selectedJob : active.find(j => j.id === id) ?? jobs.find(j => j.id === id));
 const app = document.querySelector<HTMLDivElement>('#app')!;
 let history: HTMLElement, content: HTMLElement, activity: HTMLElement, connection: HTMLElement, banner: HTMLElement, activityCount: HTMLElement, usage: HTMLElement;
 
@@ -148,20 +151,246 @@ function renderActivity(): void {
     transcript.scrollTop = !state || state.following ? transcript.scrollHeight : state.top;
   }
 }
+function sandboxAbstractionPanel(id: string, records: Event[]): HTMLElement {
+  const job = findJob(id);
+  const container = el('div', 'sandbox-abstraction');
+
+  const header = el('div', 'sandbox-vm-header');
+  const left = el('div', 'sandbox-vm-title-group');
+  const titleText = el('span', 'sandbox-vm-title', `📦 ${t('Cube Sandbox VM', 'Cube 沙箱环境')}`);
+
+  const isRunning = job ? job.status === 'running' : false;
+  const isCompleted = job ? job.status === 'completed' : false;
+  const isFailed = job ? job.status === 'failed' : false;
+  const isCancelled = job ? job.status === 'cancelled' : false;
+
+  const vmStatusPill = el('span', `sandbox-vm-status ${job?.status ?? 'standby'}`);
+  if (isRunning) {
+    const dot = el('span', 'heartbeat-dot pulse');
+    vmStatusPill.append(dot, document.createTextNode(` ${t('Active', '活跃')}`));
+  } else if (isCompleted) {
+    vmStatusPill.textContent = `✓ ${t('Completed', '已完成')}`;
+  } else if (isFailed) {
+    vmStatusPill.textContent = `✕ ${t('Failed', '失败')}`;
+  } else if (isCancelled) {
+    vmStatusPill.textContent = `⊘ ${t('Cancelled', '已取消')}`;
+  } else {
+    vmStatusPill.textContent = `⋯ ${t('Standby', '待命')}`;
+  }
+  left.append(titleText, vmStatusPill);
+
+  const right = el('div', 'sandbox-vm-meta');
+  if (job?.resource_plan) {
+    const plan = job.resource_plan;
+    right.append(el('span', 'sandbox-res-chip', `${plan.profile.toUpperCase()} · ${plan.cpu_milli}m CPU · ${plan.memory_mb}MB RAM · ${plan.disk_mb}MB Disk`));
+  } else {
+    right.append(el('span', 'sandbox-res-chip', t('Standard VM · 2000m CPU · 4096MB RAM', '标准沙箱 · 2000m CPU · 4096MB RAM')));
+  }
+  header.append(left, right);
+  container.append(header);
+
+  const guardBar = el('div', 'sandbox-guard-bar');
+  const guardEvents = records.filter(e => e.agent === 'guard');
+  const hasInjection = guardEvents.some(e => e.message.toLowerCase().includes('injection'));
+  const hasSanitized = guardEvents.some(e => e.message.toLowerCase().includes('refined') || e.message.toLowerCase().includes('sanitized')) || !!job?.sanitized_description;
+  const guardFailed = guardEvents.some(e => e.message.toLowerCase().includes('failed'));
+
+  if (hasInjection) {
+    guardBar.classList.add('blocked');
+    guardBar.textContent = `🛡️ ${t('Security Guard: Injection detected & blocked', '安全防护：检测到提示词注入并拦截')}`;
+  } else if (hasSanitized) {
+    guardBar.classList.add('sanitized');
+    guardBar.textContent = `🛡️ ${t('Security Guard: Incident prompt sanitized & passed to sandbox', '安全防护：提示词已净化并放行入沙箱')}`;
+  } else if (guardFailed) {
+    guardBar.classList.add('warning');
+    guardBar.textContent = `🛡️ ${t('Security Guard: Pre-check warning', '安全防护：预检警报')}`;
+  } else if (job && !['draft', 'queued'].includes(job.status)) {
+    guardBar.classList.add('passed');
+    guardBar.textContent = `🛡️ ${t('Security Guard: Pre-check passed · prompt & files clean', '安全防护：预检已通过 · 提示词与附件无风险')}`;
+  } else {
+    guardBar.classList.add('standby');
+    guardBar.textContent = `🛡️ ${t('Security Guard: Standby', '安全防护：待命')}`;
+  }
+  container.append(guardBar);
+
+  const processGrid = el('div', 'sandbox-process-grid');
+  const agentDefs: Array<{ id: string; name: string; role: string; icon: string }> = [
+    { id: 'codex', name: 'Codex Orchestrator', role: t('Parent Process', '主分析进程'), icon: '⚡' },
+    { id: 'log_investigator', name: 'Log Investigator', role: t('Subagent', '诊断子进程'), icon: '🔍' },
+    { id: 'evidence_reviewer', name: 'Evidence Reviewer', role: t('Subagent', '审查子进程'), icon: '📋' },
+  ];
+
+  for (const rec of records) {
+    if (rec.agent && !['worker', 'guard'].includes(rec.agent) && !agentDefs.some(d => d.id === rec.agent)) {
+      agentDefs.push({ id: rec.agent, name: rec.agent, role: t('Agent Process', '分析进程'), icon: '⚙️' });
+    }
+  }
+
+  for (const def of agentDefs) {
+    const agentEvents = records.filter(e => e.agent === def.id && !isHeartbeat(e));
+    const card = el('div', `sandbox-process-card ${def.id}`);
+
+    const cardHeader = el('div', 'process-card-header');
+    const headerLeft = el('div', 'process-title-group');
+    headerLeft.append(el('span', 'process-icon', def.icon), el('span', 'process-name', def.name), el('span', 'process-role', def.role));
+
+    let agentStatus = t('Standby', '待命');
+    let agentStatusCls = 'standby';
+    if (isRunning) {
+      if (def.id === 'codex') {
+        agentStatus = t('Active', '执行中');
+        agentStatusCls = 'active';
+      } else if (agentEvents.length > 0) {
+        const last = agentEvents[agentEvents.length - 1];
+        if (last.message.includes('completed') || last.kind === 'artifact') {
+          agentStatus = t('Completed', '已完成');
+          agentStatusCls = 'completed';
+        } else {
+          agentStatus = t('Active', '执行中');
+          agentStatusCls = 'active';
+        }
+      }
+    } else if (isCompleted) {
+      if (agentEvents.length > 0 || def.id === 'codex') {
+        agentStatus = t('Completed', '已完成');
+        agentStatusCls = 'completed';
+      } else {
+        agentStatus = t('Not invoked', '未调用');
+        agentStatusCls = 'idle';
+      }
+    } else if (isFailed || isCancelled) {
+      agentStatus = t('Stopped', '已终止');
+      agentStatusCls = 'stopped';
+    }
+
+    const cardBadge = el('span', `process-badge ${agentStatusCls}`, agentStatus);
+    cardHeader.append(headerLeft, cardBadge);
+    card.append(cardHeader);
+
+    const latestAction = el('div', 'process-latest-action');
+    if (agentEvents.length > 0) {
+      latestAction.textContent = agentEvents[agentEvents.length - 1].message;
+    } else if (isRunning) {
+      latestAction.textContent = def.id === 'codex' ? t('Orchestrating tasks…', '正在调度任务…') : t('Waiting for subagent task dispatch…', '等待子进程任务分派…');
+    } else {
+      latestAction.textContent = t('No activities recorded.', '暂无活动记录。');
+    }
+    card.append(latestAction);
+
+    const drawer = el('details', 'process-output-drawer');
+    const drawerKey = `${id}:${def.id}`;
+    drawer.open = processDrawers.get(drawerKey) ?? false;
+    drawer.addEventListener('toggle', () => {
+      processDrawers.set(drawerKey, drawer.open);
+      const hint = drawer.querySelector('.drawer-toggle-hint');
+      if (hint) hint.textContent = drawer.open ? t('Hide', '收起') : t('View', '展开查看');
+    });
+
+    const summary = el('summary', 'process-drawer-summary');
+    summary.append(
+      el('span', 'drawer-summary-label', `${t('Intermediate outputs', '中间输出与记录')} (${agentEvents.length})`),
+      el('span', 'drawer-toggle-hint', drawer.open ? t('Hide', '收起') : t('View', '展开查看'))
+    );
+
+    const drawerBody = el('div', 'process-drawer-body');
+    if (!agentEvents.length) {
+      drawerBody.append(el('p', 'muted-note', t('No intermediate outputs from this process yet.', '此进程暂未产生中间输出。')));
+    } else {
+      for (const ev of agentEvents) {
+        const item = el('div', 'output-item');
+        const itemMeta = el('div', 'output-meta');
+        itemMeta.append(
+          el('span', `output-kind ${ev.kind}`, ev.kind),
+          el('span', 'output-time', ev.created_at ? date(ev.created_at) : `#${ev.seq}`)
+        );
+        const itemMsg = el('pre', 'output-text', ev.message);
+        item.append(itemMeta, itemMsg);
+        drawerBody.append(item);
+      }
+    }
+    drawer.append(summary, drawerBody);
+    card.append(drawer);
+
+    processGrid.append(card);
+  }
+  container.append(processGrid);
+
+  const heartbeats = records.filter(isHeartbeat);
+  const heartbeatStrip = el('div', 'sandbox-heartbeat-strip');
+  const hbDot = el('span', `heartbeat-dot ${isRunning ? 'pulse' : 'done'}`);
+  const hbText = el('span', 'heartbeat-text');
+  if (isRunning) {
+    const lastHb = heartbeats.length ? heartbeats[heartbeats.length - 1] : undefined;
+    const timeStr = lastHb?.created_at ? date(lastHb.created_at) : t('Active', '活跃');
+    hbText.textContent = `${t('Sandbox VM healthy', '沙箱运行正常')} · ${t('Recorded', '心跳次数')}: ${heartbeats.length} · ${t('Latest heartbeat', '最新心跳')}: ${timeStr}`;
+  } else if (isCompleted) {
+    hbText.textContent = t('✓ Sandbox VM execution finished, environment cleaned up.', '✓ 沙箱虚拟机执行完毕，环境已安全释放。');
+  } else if (isFailed) {
+    hbText.textContent = t('✕ Sandbox VM execution terminated with errors.', '✕ 沙箱虚拟机已终止（异常退出）。');
+  } else if (isCancelled) {
+    hbText.textContent = t('⊘ Sandbox VM cancelled and resources freed.', '⊘ 沙箱虚拟机已取消，资源已释放。');
+  } else {
+    hbText.textContent = t('⋯ Sandbox VM standing by for worker assignment.', '⋯ 沙箱虚拟机待命中，等待分配工作器。');
+  }
+  heartbeatStrip.append(hbDot, hbText);
+  container.append(heartbeatStrip);
+
+  return container;
+}
+
 function sessionPanel(id: string, records: Event[]): HTMLDetailsElement {
   const panel = el('details', 'session-panel'); panel.dataset.job = id; panel.open = sessionViews.get(id)?.open ?? true;
   panel.append(el('summary', '', t('Session activity & output', '会话活动与输出')), el('p', 'session-hint', t('Public progress, tool status and output. Private reasoning and raw command output are not shared.', '公开进展、工具状态及输出；不展示私密推理和原始命令输出。')));
+
+  panel.append(sandboxAbstractionPanel(id, records));
+
+  const transcriptDetails = el('details', 'transcript-collapsible');
+  transcriptDetails.open = true;
+  transcriptDetails.append(el('summary', 'transcript-summary', t('Detailed Activity Log', '详细活动日志')));
+
   const transcript = el('div', 'session-transcript'); transcript.tabIndex = 0; transcript.setAttribute('aria-label', t('Scrollable session activity', '可滚动会话活动'));
   if (!records.length) transcript.append(el('p', 'muted', t('Waiting for worker activity.', '等待工作器活动。')));
+
+  type Grouped = { type: 'event'; event: Event } | { type: 'heartbeat'; count: number; first: Event; last: Event };
+  const grouped: Grouped[] = [];
   for (const event of records) {
-    const line = el('div', 'session-entry');
-    line.append(el('span', 'session-agent', `${event.agent} · ${event.kind}${event.created_at ? ` · ${date(event.created_at)}` : ''}`), el('p', 'session-message', event.message)); transcript.append(line);
+    if (isHeartbeat(event)) {
+      const prev = grouped[grouped.length - 1];
+      if (prev && prev.type === 'heartbeat') {
+        prev.count++;
+        prev.last = event;
+      } else {
+        grouped.push({ type: 'heartbeat', count: 1, first: event, last: event });
+      }
+    } else {
+      grouped.push({ type: 'event', event });
+    }
   }
-  panel.append(transcript, el('p', 'session-hint', pausedSessions.has(id) ? t('Reading earlier activity · live updates paused for this view', '正在查看更早活动 · 此视图已暂停实时更新') : t('Up to 200 recent events · updates every 3 seconds while running', '最多显示 200 条最近活动 · 运行时每 3 秒更新')));
+
+  for (const item of grouped) {
+    if (item.type === 'event') {
+      const line = el('div', 'session-entry');
+      line.append(el('span', 'session-agent', `${item.event.agent} · ${item.event.kind}${item.event.created_at ? ` · ${date(item.event.created_at)}` : ''}`), el('p', 'session-message', item.event.message));
+      transcript.append(line);
+    } else {
+      const line = el('div', 'session-entry heartbeat-entry');
+      if (item.count === 1) {
+        line.append(el('span', 'session-agent', `${item.first.agent} · heartbeat${item.first.created_at ? ` · ${date(item.first.created_at)}` : ''}`), el('p', 'session-message heartbeat-message', item.first.message));
+      } else {
+        line.append(el('span', 'session-agent', `${item.first.agent} · heartbeat · ${item.count} ticks`), el('p', 'session-message heartbeat-message', `● ${t(`Sandbox heartbeat active (${item.count} ticks collapsed)`, `沙箱持续心跳中（已合并 ${item.count} 条心跳）`)}${item.last.created_at ? ` · ${date(item.last.created_at)}` : ''}`));
+      }
+      transcript.append(line);
+    }
+  }
+
+  transcriptDetails.append(transcript, el('p', 'session-hint', pausedSessions.has(id) ? t('Reading earlier activity · live updates paused for this view', '正在查看更早活动 · 此视图已暂停实时更新') : t('Up to 500 recent events · updates every 3 seconds while running', '最多显示 500 条最近活动 · 运行时每 3 秒更新')));
   const controls = el('div', 'session-controls');
-  if (records.length === 200) controls.append(button(t('Earlier activity', '更早活动'), 'button text-button compact', () => { void sessionPage(id, records[0].seq); }));
+  if (records.length === 500) controls.append(button(t('Earlier activity', '更早活动'), 'button text-button compact', () => { void sessionPage(id, records[0].seq); }));
   if (pausedSessions.has(id)) controls.append(button(t('Back to latest', '返回最新'), 'button text-button compact', () => { void sessionPage(id); }));
-  panel.append(controls); return panel;
+  transcriptDetails.append(controls);
+
+  panel.append(transcriptDetails);
+  return panel;
 }
 async function sessionPage(id: string, before?: number): Promise<void> {
   try {
@@ -352,7 +581,7 @@ async function refresh(): Promise<void> {
     const finished = await Promise.all(disappeared.map(job => api<Job>(`/jobs/${job.id}`).catch(() => job)));
     mergeJobs([...page.items, ...activePage.items, ...finished]); if (!historyInitialized) { cursor = page.next_cursor; historyInitialized = true; } active = activePage.items;
     if (!online) notice(''); online = true;
-    await Promise.all(active.map(async job => { if (pausedSessions.has(job.id)) return; const after = events.get(job.id)?.at(-1)?.seq; try { const update = await api<{ events: Event[] }>(`/jobs/${job.id}/events?${after ? `after=${after}` : 'latest=true'}`); events.set(job.id, [...(after ? events.get(job.id) ?? [] : []), ...update.events].slice(-200)); } catch { /* Keep previous activity on transient failures. */ } }));
+    await Promise.all(active.map(async job => { if (pausedSessions.has(job.id)) return; const after = events.get(job.id)?.at(-1)?.seq; try { const update = await api<{ events: Event[] }>(`/jobs/${job.id}/events?${after ? `after=${after}` : 'latest=true'}`); events.set(job.id, [...(after ? events.get(job.id) ?? [] : []), ...update.events].slice(-500)); } catch { /* Keep previous activity on transient failures. */ } }));
     updateConnection(); renderHistory(); renderActivity();
     if (firstLoad && !selected && !busy && !description && !files.length) renderNew();
     if (selected) await loadDetail();

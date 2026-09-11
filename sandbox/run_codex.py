@@ -125,6 +125,40 @@ def _compact_evidence(value: Any) -> str:
     return json.dumps({key: value[key] for key in ("schemaVersion", "coverage", "omissions", "summary", "source", "manifest") if key in value}, ensure_ascii=False, indent=2)[:6000]
 
 
+def _safe_tool_action(item: dict[str, Any], event_type: str) -> str:
+    state = "started" if event_type == "item.started" else "completed" if event_type == "item.completed" else "updated"
+    default_msg = f"Codex tool execution {state}."
+    cmd = item.get("command") or ""
+    fn_name = item.get("name") or ""
+    args = item.get("arguments") or ""
+    if isinstance(args, dict):
+        args = json.dumps(args, ensure_ascii=False)
+    raw_target = f"{cmd} {fn_name} {args}"
+    import re
+    input_match = re.search(r"inputs/([A-Za-z0-9_.-]+)", raw_target)
+    target_file = input_match.group(1) if input_match else None
+    is_evidence = "evidence" in raw_target.lower() or "metadata.yaml" in raw_target.lower()
+    action_label = None
+    if target_file:
+        verb = "Inspecting" if state == "started" else "Inspected" if state == "completed" else "Inspecting"
+        action_label = f"{verb} file: {target_file}"
+    elif is_evidence:
+        verb = "Checking" if state == "started" else "Checked" if state == "completed" else "Checking"
+        sub = "metadata" if "metadata" in raw_target.lower() else "evidence"
+        action_label = f"{verb} {sub}"
+    if not action_label:
+        return default_msg
+    if state == "completed":
+        out = item.get("aggregated_output") or item.get("output") or item.get("result")
+        if isinstance(out, str) and out.strip():
+            clean_out = _public_text(out)
+            if clean_out:
+                first_line = clean_out.splitlines()[0][:120].strip()
+                if first_line and not any(k in first_line.lower() for k in ("traceback", "syntaxerror", "exception:")):
+                    action_label = f"{action_label} · {first_line}"
+    return action_label[:ACTIVITY_MESSAGE_MAX_CHARS]
+
+
 def _activity(event: dict[str, Any], output: Path) -> tuple[str | None, str | None]:
     event_type = event.get("type")
     if not isinstance(event_type, str) or event_type not in {"thread.started", "thread.completed", "turn.started", "turn.completed", "turn.failed", "item.started", "item.completed"}:
@@ -149,9 +183,7 @@ def _activity(event: dict[str, Any], output: Path) -> tuple[str | None, str | No
     if (public := _activity_agent_message(event)) is not None:
         message, activity_kind = public, "message"
     elif item.get("type") in {"command_execution", "function_call", "mcp_tool_call", "tool_call"}:
-        # Tool names, commands, arguments and output can disclose paths or secrets.
-        state = "started" if event_type == "item.started" else "completed" if event_type == "item.completed" else "updated"
-        message, activity_kind = f"Codex tool execution {state}.", "tool"
+        message, activity_kind = _safe_tool_action(item, event_type), "tool"
     elif item.get("type") in {"agent", "subagent", "agent_thread"}:
         state = "started" if event_type in {"thread.started", "item.started"} else "completed" if event_type in {"turn.completed", "item.completed"} else "updated"
         message, activity_kind = f"Subagent {agent} {state}.", "subagent"
