@@ -12,6 +12,7 @@ Security Architecture:
 from __future__ import annotations
 
 import base64
+import gzip
 import json
 import re
 import socket
@@ -547,7 +548,6 @@ class SecurityGuard:
                 resp_bytes = resp.read(10 * 1024 * 1024)
                 encoding = resp.headers.get("Content-Encoding", "").lower() if resp.headers else ""
                 if "gzip" in encoding:
-                    import gzip
                     resp_bytes = gzip.decompress(resp_bytes)
                 elif "deflate" in encoding:
                     resp_bytes = zlib.decompress(resp_bytes)
