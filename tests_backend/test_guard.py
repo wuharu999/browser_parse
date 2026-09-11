@@ -18,6 +18,7 @@ from backend.guard import (
     GuardResult,
     GuardVerdict,
     SecurityGuard,
+    _extract_json_payload,
     _parse_guard_response,
     extract_non_log_attachments,
     is_non_log_attachment,
@@ -814,6 +815,154 @@ class SecurityGuardPipelineTests(unittest.TestCase):
         self.assertTrue(is_non_log_attachment("settings.yml"))
         self.assertTrue(is_non_log_attachment("data.json"))
         self.assertTrue(is_non_log_attachment("doc.xml"))
+
+    def test_non_log_attachment_with_log_substring_in_name(self) -> None:
+        """Verify that files with .log. substrings are correctly classified as non-log attachments if ending in document/image suffixes."""
+        # Non-log document and image formats containing .log. in the name MUST be inspected
+        self.assertTrue(is_non_log_attachment("incident.log.pdf"))
+        self.assertTrue(is_non_log_attachment("security.log.png"))
+        self.assertTrue(is_non_log_attachment("audit.log.docx"))
+        self.assertTrue(is_non_log_attachment("summary.log.txt"))
+        self.assertTrue(is_non_log_attachment("notes.log.md"))
+
+        # Pure log extensions and rotated log numbers MUST NOT be treated as non-log attachments
+        self.assertFalse(is_non_log_attachment("robot.log"))
+        self.assertFalse(is_non_log_attachment("server.log.1"))
+        self.assertFalse(is_non_log_attachment("syslog.log.gz"))
+        self.assertFalse(is_non_log_attachment("app.stdout"))
+        self.assertFalse(is_non_log_attachment("app.err"))
+        self.assertFalse(is_non_log_attachment("data.tar.gz"))
+
+    def test_default_openai_deployment_activates_guard(self) -> None:
+        """Verify that standard production deployments (OpenAI default without ROBOT_GUARD_MODEL) activate the guard."""
+        env = {
+            "ROBOT_WORKER_TOKEN": "tok",
+            "CUBE_API_URL": "http://cube:3000",
+            "CUBE_API_KEY": "ckey",
+            "CUBE_TEMPLATE_ID": "tmpl",
+            "ROBOT_CODEX_MODEL": "gpt-5.6-luna",
+            "OPENAI_API_KEY": "openai-key",
+        }
+        with patch.dict("os.environ", env, clear=True):
+            cfg = WorkerConfig.from_env()
+            self.assertTrue(cfg.guard_enabled)
+            worker = CubeWorker(cfg, MockWorkerApi(None), MockSandbox)
+            # Guard MUST be active and default to codex model
+            self.assertIsNotNone(worker.guard)
+            self.assertEqual(worker.guard.model, "gpt-5.6-luna")
+            self.assertEqual(worker.guard.api_key, "openai-key")
+
+    def test_explicit_robot_guard_disabled_by_env(self) -> None:
+        """Verify that ROBOT_GUARD_ENABLED=0 explicitly disables the guard in production."""
+        env = {
+            "ROBOT_WORKER_TOKEN": "tok",
+            "CUBE_API_URL": "http://cube:3000",
+            "CUBE_API_KEY": "ckey",
+            "CUBE_TEMPLATE_ID": "tmpl",
+            "ROBOT_CODEX_MODEL": "gpt-5.6-luna",
+            "OPENAI_API_KEY": "openai-key",
+            "ROBOT_GUARD_ENABLED": "0",
+        }
+        with patch.dict("os.environ", env, clear=True):
+            cfg = WorkerConfig.from_env()
+            self.assertFalse(cfg.guard_enabled)
+            worker = CubeWorker(cfg, MockWorkerApi(None), MockSandbox)
+            self.assertIsNone(worker.guard)
+
+    def test_json_parsing_with_comments_and_trailing_braces(self) -> None:
+        """Verify raw_decode extracts JSON even when comments appear in code block and trailing notes have braces."""
+        raw_output = """Here is the inspection result:
+```json
+{
+  "verdict": "CLEAN",
+  "reason": "Safe inquiry"
+}
+// check complete
+```
+Notes: Evaluated with context {id: 42}.
+"""
+        res = _extract_json_payload(raw_output)
+        self.assertEqual(res["verdict"], "CLEAN")
+        self.assertEqual(res["reason"], "Safe inquiry")
+
+    def test_suspicious_verdict_with_placeholder_null_string_fails_closed(self) -> None:
+        """Verify that a SUSPICIOUS verdict with placeholder string 'null' or 'None' fails closed after retry."""
+        job = {
+            "id": "job-placeholder-null",
+            "description": "Probe query",
+            "language": "en",
+            "files": [],
+        }
+        api = MockWorkerApi(job)
+
+        call_count = 0
+
+        def fake_urlopen(*_args, **_kwargs):
+            nonlocal call_count
+            call_count += 1
+            resp = make_chat_completion_response({
+                "verdict": "SUSPICIOUS",
+                "reason": "Borderline input",
+                "sanitized_description": "null",
+            })
+            mock_resp = MagicMock()
+            mock_resp.__enter__.return_value.read.return_value = resp
+            return mock_resp
+
+        with patch("backend.guard.urlopen", side_effect=fake_urlopen):
+            worker = CubeWorker(self.config, api, MockSandbox)
+            self.assertTrue(worker.run_once())
+
+        self.assertEqual(call_count, 2)
+        self.assertEqual(len(MockSandbox.created), 0)
+        self.assertEqual(api.finished[0]["status"], "failed")
+        self.assertIn("Security pre-check failed", api.finished[0]["report"])
+
+    def test_pdf_fallback_escaped_parentheses(self) -> None:
+        """Verify fallback PDF stream parser unescapes parentheses inside literal strings."""
+        pdf_bytes = (
+            b"%PDF-1.4\n"
+            b"stream\n"
+            b"(Joint \\(Motor 1\\) reported error \\(E-100\\)) Tj\n"
+            b"endstream\n"
+            b"%%EOF"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pdf_path = Path(temp_dir, "test.pdf")
+            pdf_path.write_bytes(pdf_bytes)
+            # Patch pdftotext to fail to test the fallback parser
+            with patch("subprocess.run", side_effect=FileNotFoundError):
+                from backend.guard import _extract_pdf_text
+                extracted = _extract_pdf_text(pdf_path, 1000)
+                self.assertIn("Joint (Motor 1) reported error (E-100)", extracted)
+
+    def test_pdf_fallback_zip_bomb_bounded(self) -> None:
+        """Verify fallback PDF stream parser bounds zlib decompression to avoid zip bomb exhaustion."""
+        import zlib
+        # Create a compressed stream that expands to 200 KiB of repeating data
+        compressed = zlib.compress(b"(BombPayload) " * 20000)
+        pdf_bytes = b"%PDF-1.4\nstream\n" + compressed + b"\nendstream\n%%EOF"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pdf_path = Path(temp_dir, "bomb.pdf")
+            pdf_path.write_bytes(pdf_bytes)
+            with patch("subprocess.run", side_effect=FileNotFoundError):
+                from backend.guard import _extract_pdf_text
+                extracted = _extract_pdf_text(pdf_path, 1000)
+                self.assertIn("BombPayload", extracted)
+
+    def test_vision_images_capped_at_max_images(self) -> None:
+        """Verify extract_non_log_attachments caps image attachments to max_images."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            images = []
+            for i in range(8):
+                img_path = Path(temp_dir, f"img_{i}.png")
+                img_path.write_bytes(
+                    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0\x00\x00\x03\x01\x01\x00\xc9\xfe\x92\xef\x00\x00\x00\x00IEND\xaeB`\x82"
+                )
+                images.append((f"img_{i}.png", img_path))
+
+            _, extracted_images = extract_non_log_attachments(images, include_images=True, max_images=5)
+            self.assertEqual(len(extracted_images), 5)
 
 
 if __name__ == "__main__":

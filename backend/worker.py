@@ -123,6 +123,7 @@ class WorkerConfig:
     guard_model: str | None = None
     guard_provider_url: str | None = None
     guard_api_key: str | None = None
+    guard_enabled: bool = False
 
     @classmethod
     def from_env(cls) -> "WorkerConfig":
@@ -152,6 +153,8 @@ class WorkerConfig:
         guard_model = os.environ.get("ROBOT_GUARD_MODEL") or None
         guard_provider_url = os.environ.get("ROBOT_GUARD_PROVIDER_URL") or codex_provider_url
         guard_api_key = os.environ.get("ROBOT_GUARD_API_KEY") or os.environ.get("ROBOT_CODEX_API_KEY") or codex_key
+        # R1.3: Enable the guard by default in worker runtime, defaulting to ROBOT_CODEX_* settings
+        guard_enabled = os.environ.get("ROBOT_GUARD_ENABLED", "").lower() not in {"0", "false", "no", "off"}
         return cls(
             api_url=_env("ROBOT_API_URL", "http://127.0.0.1:8000").rstrip("/"),
             worker_token=_env("ROBOT_WORKER_TOKEN", required=True),
@@ -173,6 +176,7 @@ class WorkerConfig:
             guard_model=guard_model,
             guard_provider_url=guard_provider_url,
             guard_api_key=guard_api_key,
+            guard_enabled=guard_enabled,
         )
 
 
@@ -261,8 +265,10 @@ class CubeWorker:
             secrets_list.append(config.guard_api_key)
         self._secrets = tuple(s for s in secrets_list if s)
         self.guard = guard
-        if self.guard is None and (
-            config.guard_provider_url
+        guard_disabled = os.environ.get("ROBOT_GUARD_ENABLED", "").lower() in {"0", "false", "no", "off"}
+        if self.guard is None and not guard_disabled and (
+            config.guard_enabled
+            or config.guard_provider_url
             or config.codex_provider_url
             or config.guard_model
             or os.environ.get("ROBOT_GUARD_ENABLED", "").lower() in {"1", "true", "yes", "on"}
@@ -492,11 +498,12 @@ class CubeWorker:
         if self.guard is not None:
             with tempfile.TemporaryDirectory(prefix="robot-guard-") as guard_temp:
                 non_log_staged: list[tuple[str, Path]] = []
-                for item in job.get("files", []):
+                for index, item in enumerate(job.get("files", [])):
                     name = str(item.get("name", ""))
                     if is_non_log_attachment(name):
                         file_id = str(item.get("id", ""))
-                        staged = Path(guard_temp, file_id)
+                        safe_file_id = re.sub(r"[^A-Za-z0-9_-]", "_", file_id)[:80] or f"file_{index}"
+                        staged = Path(guard_temp, safe_file_id)
                         try:
                             self.api.download_to(job_id, file_id, staged)
                             non_log_staged.append((name, staged))
@@ -513,11 +520,11 @@ class CubeWorker:
 
                 try:
                     result = self.guard.inspect(
-                        description=str(job.get("description", "")),
+                        description=str(job.get("description") or ""),
                         attachments_text=attachments_text,
                         image_attachments=images,
                     )
-                except GuardError as exc:
+                except (GuardError, Exception) as exc:
                     # R3: Safe failure handling (fail closed)
                     # If guard LLM call fails after retry, terminate without sandbox provisioning.
                     self._event(job_id, "warning", f"Security pre-check failed: {exc}", "guard")

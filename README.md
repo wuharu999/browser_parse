@@ -116,6 +116,24 @@ Each job receives its own Cube VM. Native Codex subagents share that VM, with fu
 
 The new [sandbox context skill](sandbox/runtime/.agents/skills/robot-analysis-context/SKILL.md) is copied into `/workspace/.agents/skills/` for **the agents inside each job**, not installed in your personal Codex environment. The main prompt and both roles reference it. Its token-bounded `evidence.py context` helper exposes upload mappings, assigned resources and wiki index status; the skill routes agents to preinstalled tools and applicable original wiki lines. See [wiki review](docs/wiki-review.md) for measured retrieval limits.
 
+### Pre-execution security guard (prompt injection defense)
+
+Before provisioning any CubeSandbox VM or launching Codex, the worker runs an automated host-side security inspection ([`backend/guard.py`](backend/guard.py)) on the user's incident description and all non-log attachments (PDFs, text/markdown documents, configuration files, and images).
+
+- **Three-Tier Classification (OWASP LLM01:2025)**:
+  - **`CLEAN`**: No adversarial manipulation or prompt injection detected. The job proceeds normally into the isolated sandbox with original inputs.
+  - **`SUSPICIOUS`**: The user prompt contains borderline phrasing, ambiguity, or potential prompt-leaking attempts without a confirmed exploit payload. The guard LLM sanitizes the prompt into an objective, factual incident query; the database persists both `original_description` and `sanitized_description`, dispatches the sanitized prompt to Codex, and emits a public `warning` event in the session activity log.
+  - **`INJECTION`**: An active prompt injection, jailbreak, instruction override, or exfiltration attack is detected in either the user description or non-log attachments (e.g. indirect prompt injections in uploaded PDFs). Triggers an **immediate hard stop**: marks the job as `failed` (`Prompt injection detected in inputs`), records a security warning event, terminates before sandbox provisioning, and consumes zero Codex model budget.
+- **Attachment Extraction & Memory Bounding**:
+  - PDFs are text-extracted with Poppler `pdftotext` (bounded to first 10 pages) with a pure-Python regex stream decompressor fallback protected against decompression bombs (`zlib.decompressobj`).
+  - Cumulative text extraction across non-log attachments is strictly capped at **32 KiB** with accurate header length budgeting to prevent prompt bloat and payload masking.
+  - Image attachments are verified with Pillow (PIL) and capped at a maximum of 5 images.
+- **Fail-Closed Resilience**: If the guard LLM call fails due to network timeouts, HTTP errors, or malformed responses, it retries once. If it still fails, it fails closed: the job is marked `failed` with a clear security notice and will never execute uninspected in Codex.
+- **Configuration**:
+  - Enabled by default in worker runtime (`ROBOT_GUARD_ENABLED=1`).
+  - Automatically reuses configured Codex credentials (`ROBOT_CODEX_PROVIDER_URL` and `ROBOT_CODEX_API_KEY`).
+  - Supports optional model/provider overrides via `ROBOT_GUARD_MODEL`, `ROBOT_GUARD_PROVIDER_URL`, and `ROBOT_GUARD_API_KEY`.
+
 Resource sizing is automatic and token-free: small (1 CPU/2 GiB), standard (2 CPU/4 GiB), or large (4 CPU/8 GiB), selected from uploaded sizes, file types and browser expansion hints. Configure matching `CUBE_TEMPLATES_JSON` IDs and the API's resource pool before starting the worker; missing/mismatched templates fail closed. The current local VM supports small/standard only. See [resource profiles](docs/resource-profiles.md) for thresholds, queue reservations, prepared packages and the no-model sandbox verification command.
 
 Reports include **Back to upload** controls that preserve the current draft. The shared daily allowance bar distinguishes accounted estimates, running reservations and remaining allowance; it indicates when new work can queue or when pending slots are full. It is not a provider billing or real-time CPU/RAM usage meter.

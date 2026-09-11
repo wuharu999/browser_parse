@@ -50,7 +50,8 @@ browser_parse/
 │   ├── app.py                 # Public API, bounded uploads, private worker routes
 │   ├── store.py               # SQLite queue, budget reservations, claims and versions
 │   ├── resources.py           # Deterministic upload-driven CPU/RAM/disk profiles
-│   └── worker.py              # Cube-only transfers, concurrency, cancel and timeout
+│   ├── guard.py               # Pre-execution LLM security guard (OWASP injection detection & prompt sanitization)
+│   └── worker.py              # Cube-only transfers, security guard gate, concurrency, cancel and timeout
 ├── sandbox/
 │   ├── Dockerfile             # Boot-tested reusable Cube image; Codex + Poppler
 │   ├── requirements.in / .lock # Hashed Python analysis dependencies, built with uv
@@ -66,7 +67,7 @@ browser_parse/
 ├── knowledge/
 │   ├── README.md              # Wiki location and indexing guidance
 │   └── wiki/                  # Local wiki copy, intentionally Git-ignored
-├── tests_backend/             # API, mocked Cube worker, runner and evidence checks
+├── tests_backend/             # API, security guard pipeline, mocked Cube worker, runner and evidence checks
 └── tests/
     ├── sources.test.ts        # TAR/GZIP/ZIP, safety limits and source identities
     ├── lines.test.ts          # UTF-8, CRLF, oversized and damaged lines
@@ -77,7 +78,7 @@ browser_parse/
 
 `node_modules/`, `dist/`, browser-test artifacts, uploaded logs, and downloaded evidence are not source files and are excluded from Git. Tests construct synthetic fixtures rather than committing private robot logs.
 
-Submission follows `main.ts → preprocess.worker.ts → backend/app.py → store.py` (uploads plus persistent queue), then `worker.py → Cube job VM → run_codex.py → Codex/native subagents`. `main.ts` also renders the shared history and active status; `report.ts` validates structured results before rendering their summary, evidence chain, workflow, and uncertainties. Only private worker routes can retrieve originals or finish jobs. Public visitors can read shared results, request a hard stop, and claim/append human review versions.
+Submission follows `main.ts → preprocess.worker.ts → backend/app.py → store.py` (uploads plus persistent queue), then `worker.py (pre-execution security guard) → Cube job VM → run_codex.py → Codex/native subagents`. `main.ts` also renders the shared history and active status; `report.ts` validates structured results before rendering their summary, evidence chain, workflow, and uncertainties. Only private worker routes can retrieve originals or finish jobs. Public visitors can read shared results, request a hard stop, and claim/append human review versions.
 
 ## Processing paths
 
