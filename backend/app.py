@@ -43,6 +43,11 @@ class WorkerEvent(BaseModel):
     message: str = Field(max_length=2000)
 
 
+class SanitizeJob(BaseModel):
+    original_description: str = Field(max_length=12000)
+    sanitized_description: str = Field(max_length=12000)
+
+
 class Finish(BaseModel):
     status: Literal["completed", "failed", "cancelled"]
     report: str = Field(max_length=20000)
@@ -237,6 +242,13 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None) -> 
     async def worker_event(job_id: str, body: WorkerEvent, authorization: str | None = Header(default=None)):
         worker(authorization)
         try: return store.worker_event(job_id, body.kind, body.agent, body.message)
+        except KeyError: raise HTTPException(404, "job not found")
+        except ValueError as exc: raise HTTPException(422, str(exc))
+
+    @app.post("/api/worker/jobs/{job_id}/sanitize")
+    async def worker_sanitize(job_id: str, body: SanitizeJob, authorization: str | None = Header(default=None)):
+        worker(authorization)
+        try: return store.sanitize(job_id, body.original_description, body.sanitized_description)
         except KeyError: raise HTTPException(404, "job not found")
         except ValueError as exc: raise HTTPException(422, str(exc))
 

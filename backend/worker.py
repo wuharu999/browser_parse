@@ -21,6 +21,13 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from .guard import (
+    GuardError,
+    GuardVerdict,
+    SecurityGuard,
+    extract_non_log_attachments,
+    is_non_log_attachment,
+)
 from .resources import PROFILES
 
 
@@ -113,6 +120,9 @@ class WorkerConfig:
     wiki_dir: Path | None
     parallel: int
     cube_templates: dict[str, str] = field(default_factory=dict)
+    guard_model: str | None = None
+    guard_provider_url: str | None = None
+    guard_api_key: str | None = None
 
     @classmethod
     def from_env(cls) -> "WorkerConfig":
@@ -136,6 +146,12 @@ class WorkerConfig:
             raise WorkerError("CUBE_TEMPLATES_JSON must be a JSON object") from exc
         if not isinstance(templates, dict) or any(key not in PROFILES or not isinstance(value, str) or not value.strip() for key, value in templates.items()):
             raise WorkerError("CUBE_TEMPLATES_JSON must map small/standard/large to template IDs")
+        codex_model = _env("ROBOT_CODEX_MODEL", "gpt-5.6-luna")
+        codex_provider_url = os.environ.get("ROBOT_CODEX_PROVIDER_URL") or None
+        codex_key = os.environ.get("ROBOT_CODEX_API_KEY") or _env(key_env, required=True)
+        guard_model = os.environ.get("ROBOT_GUARD_MODEL") or None
+        guard_provider_url = os.environ.get("ROBOT_GUARD_PROVIDER_URL") or codex_provider_url
+        guard_api_key = os.environ.get("ROBOT_GUARD_API_KEY") or os.environ.get("ROBOT_CODEX_API_KEY") or codex_key
         return cls(
             api_url=_env("ROBOT_API_URL", "http://127.0.0.1:8000").rstrip("/"),
             worker_token=_env("ROBOT_WORKER_TOKEN", required=True),
@@ -144,16 +160,19 @@ class WorkerConfig:
             cube_template_id=_env("CUBE_TEMPLATE_ID", required=True),
             cube_proxy_node_ip=os.environ.get("CUBE_PROXY_NODE_IP") or None,
             cube_proxy_port_http=proxy_port,
-            codex_model=_env("ROBOT_CODEX_MODEL", "gpt-5.6-luna"),
-            codex_provider_url=os.environ.get("ROBOT_CODEX_PROVIDER_URL") or None,
+            codex_model=codex_model,
+            codex_provider_url=codex_provider_url,
             codex_api_key_env=key_env,
-            codex_api_key=_env(key_env, required=True),
+            codex_api_key=codex_key,
             timeout_seconds=timeout,
             poll_seconds=max(0.25, float(_env("ROBOT_POLL_SECONDS", "3"))),
             runtime_dir=runtime,
             wiki_dir=Path(wiki).resolve() if wiki else (default_wiki.resolve() if default_wiki.is_dir() else None),
             parallel=max(1, min(2, int(_env("ROBOT_WORKER_PARALLEL", "2")))),
             cube_templates=templates,
+            guard_model=guard_model,
+            guard_provider_url=guard_provider_url,
+            guard_api_key=guard_api_key,
         )
 
 
@@ -218,6 +237,12 @@ class WorkerApi:
             "kind": kind, "agent": agent, "message": message,
         })
 
+    def sanitize(self, job_id: str, original_description: str, sanitized_description: str) -> dict[str, Any]:
+        return self._request("POST", f"/api/worker/jobs/{job_id}/sanitize", {
+            "original_description": original_description,
+            "sanitized_description": sanitized_description,
+        })
+
     def finish(self, job_id: str, status: str, report: str, cost_usd: float | None, metrics: dict[str, Any]) -> None:
         self._request("POST", f"/api/worker/jobs/{job_id}/finish", {
             "status": status, "report": report, "cost_usd": cost_usd, "metrics": metrics,
@@ -227,11 +252,20 @@ class WorkerApi:
 class CubeWorker:
     """Serial executor.  API queue admission is the global two-job limiter."""
 
-    def __init__(self, config: WorkerConfig, api: WorkerApi | None = None, sandbox_class: Any = None) -> None:
+    def __init__(self, config: WorkerConfig, api: WorkerApi | None = None, sandbox_class: Any = None, guard: Any = None) -> None:
         self.config = config
         self.api = api or WorkerApi(config.api_url, config.worker_token)
         self._sandbox_class = sandbox_class
-        self._secrets = (config.worker_token, config.cube_api_key, config.codex_api_key)
+        secrets_list = [config.worker_token, config.cube_api_key, config.codex_api_key]
+        if config.guard_api_key:
+            secrets_list.append(config.guard_api_key)
+        self._secrets = tuple(s for s in secrets_list if s)
+        self.guard = guard
+        if self.guard is None and (config.guard_provider_url or config.codex_provider_url):
+            provider_url = config.guard_provider_url or config.codex_provider_url
+            model = config.guard_model or config.codex_model
+            api_key = config.guard_api_key or config.codex_api_key
+            self.guard = SecurityGuard(model=model, provider_url=provider_url, api_key=api_key)
 
     def _cube(self, timeout_seconds: int, profile: str | None = None) -> tuple[Any, Any]:
         template = self.config.cube_template_id
@@ -447,6 +481,64 @@ class CubeWorker:
         if job.get("cancel_requested"):
             self.api.finish(job_id, "cancelled", "Cancelled before sandbox execution.", None, {"cost_source": "unknown"})
             return
+
+        # R1: Pre-execution security inspection pipeline
+        # Inspect user prompt and non-log attachments (up to 32 KiB) before creating sandbox or calling Codex.
+        if self.guard is not None:
+            with tempfile.TemporaryDirectory(prefix="robot-guard-") as guard_temp:
+                non_log_staged: list[tuple[str, Path]] = []
+                for item in job.get("files", []):
+                    name = str(item.get("name", ""))
+                    if is_non_log_attachment(name):
+                        file_id = str(item.get("id", ""))
+                        staged = Path(guard_temp, file_id)
+                        try:
+                            self.api.download_to(job_id, file_id, staged)
+                            non_log_staged.append((name, staged))
+                        except Exception:
+                            pass
+
+                supports_vision_fn = getattr(self.guard, "supports_vision", None)
+                include_images = supports_vision_fn() if callable(supports_vision_fn) else False
+                attachments_text, images = extract_non_log_attachments(
+                    non_log_staged,
+                    max_total_bytes=32 * 1024,
+                    include_images=include_images,
+                )
+
+                try:
+                    result = self.guard.inspect(
+                        description=str(job.get("description", "")),
+                        attachments_text=attachments_text,
+                        image_attachments=images,
+                    )
+                except GuardError as exc:
+                    # R3: Safe failure handling (fail closed)
+                    # If guard LLM call fails after retry, terminate without sandbox provisioning.
+                    self._event(job_id, "warning", f"Security pre-check failed: {exc}", "guard")
+                    self.api.finish(job_id, "failed", "Security pre-check failed", 0.0, {"cost_source": "unknown", "security_verdict": "ERROR"})
+                    return
+
+                # R2.3: INJECTION verdict -> immediate hard stop, mark failed, zero sandboxes, budget not decremented
+                if result.verdict == GuardVerdict.INJECTION:
+                    self._event(job_id, "warning", "Prompt injection detected in inputs", "guard")
+                    self.api.finish(job_id, "failed", "Prompt injection detected in inputs", 0.0, {"cost_source": "unknown", "security_verdict": "INJECTION"})
+                    return
+                # R2.2: SUSPICIOUS verdict -> sanitize prompt, record both in DB, emit warning, dispatch sanitized prompt to Codex
+                elif result.verdict == GuardVerdict.SUSPICIOUS:
+                    original = str(job.get("description", ""))
+                    sanitized = result.sanitized_description or "Diagnose reported incident from available logs."
+                    job["original_description"] = original
+                    job["sanitized_description"] = sanitized
+                    job["description"] = sanitized
+                    if hasattr(self.api, "sanitize"):
+                        try:
+                            self.api.sanitize(job_id, original, sanitized)
+                        except Exception:
+                            pass
+                    self._event(job_id, "warning", "User incident prompt was refined for security.", "guard")
+                # R2.1: CLEAN verdict -> proceed normally into sandbox execution
+
         sandbox = None
         executor: ThreadPoolExecutor | None = None
         started = time.monotonic()

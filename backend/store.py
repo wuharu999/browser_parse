@@ -87,6 +87,7 @@ class Store:
           created_at TEXT NOT NULL, updated_at TEXT NOT NULL, submitted_at TEXT,
           cancel_requested INTEGER NOT NULL DEFAULT 0, report TEXT, metrics TEXT,
           cost_usd REAL, reservation REAL NOT NULL DEFAULT 0, reservation_day TEXT, upload_reserved INTEGER NOT NULL DEFAULT 0,
+          original_description TEXT, sanitized_description TEXT,
           lease_until TEXT, run_deadline TEXT, finished_at TEXT, finished_day TEXT
         );
         CREATE TABLE IF NOT EXISTS files (
@@ -113,7 +114,7 @@ class Store:
         """)
         # Keep local development databases usable after additive schema changes.
         columns = {row["name"] for row in self.db.execute("PRAGMA table_info(jobs)")}
-        for name, sql in (("run_deadline", "TEXT"), ("finished_day", "TEXT"), ("upload_reserved", "INTEGER NOT NULL DEFAULT 0"), ("resource_plan", "TEXT")):
+        for name, sql in (("run_deadline", "TEXT"), ("finished_day", "TEXT"), ("upload_reserved", "INTEGER NOT NULL DEFAULT 0"), ("resource_plan", "TEXT"), ("original_description", "TEXT"), ("sanitized_description", "TEXT")):
             if name not in columns:
                 self.db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {sql}")
         self.db.commit()
@@ -320,6 +321,27 @@ class Store:
             event = self._event(job_id, kind, agent or "worker", message)
             self.db.execute("UPDATE jobs SET lease_until=?,updated_at=? WHERE id=?", (stamp(now() + timedelta(seconds=self.lease_seconds)), stamp(), job_id))
             self.db.commit(); return event
+
+    def sanitize(self, job_id: str, original_description: str, sanitized_description: str) -> dict:
+        orig = clean(original_description, 12000)
+        sanitized = clean(sanitized_description, 12000)
+        if not sanitized:
+            raise ValueError("sanitized description is required")
+        with self.lock:
+            self._tx()
+            row = self.db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if not row:
+                self.db.rollback()
+                raise KeyError(job_id)
+            if row["status"] != "running":
+                self.db.rollback()
+                raise ValueError("job is not running")
+            self.db.execute(
+                "UPDATE jobs SET description=?, original_description=?, sanitized_description=?, updated_at=? WHERE id=?",
+                (sanitized, orig, sanitized, stamp(), job_id),
+            )
+            self.db.commit()
+            return self.get(job_id)
 
     def finish(self, job_id: str, status: str, report: str, cost: float | None, metrics: object | None) -> dict:
         if status not in TERMINAL: raise ValueError("invalid terminal status")
