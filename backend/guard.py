@@ -304,7 +304,7 @@ def extract_non_log_attachments(
 
 
 def _extract_json_payload(raw_text: str) -> dict[str, Any]:
-    """Extract a dictionary JSON payload from raw LLM output, handling markdown fences and surrounding text."""
+    """Extract a dictionary JSON payload from raw LLM output, handling markdown fences, comments, and conversational surrounding text."""
     raw_text = raw_text.strip()
     if not raw_text:
         raise ValueError("LLM response has empty content")
@@ -317,25 +317,37 @@ def _extract_json_payload(raw_text: str) -> dict[str, Any]:
     except Exception:
         pass
 
-    # 2. Extract from markdown code fence (```json ... ``` or ``` ... ```)
-    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw_text, re.DOTALL)
+    # 2. Extract content from markdown code fence (```json ... ``` or ``` ... ```)
+    fence_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", raw_text, re.DOTALL)
     if fence_match:
+        fence_content = fence_match.group(1).strip()
         try:
-            data = json.loads(fence_match.group(1))
+            data = json.loads(fence_content)
             if isinstance(data, dict):
                 return data
         except Exception:
             pass
+        # If direct parse of fence failed (e.g. comments inside code fence), scan fence with raw_decode
+        start = fence_content.find("{")
+        while start != -1:
+            try:
+                obj, _ = json.JSONDecoder().raw_decode(fence_content[start:])
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                pass
+            start = fence_content.find("{", start + 1)
 
-    # 3. Extract outermost JSON object {...}
-    brace_match = re.search(r"(\{.*\})", raw_text, re.DOTALL)
-    if brace_match:
+    # 3. Scan for valid JSON object {...} anywhere in the text using standard library raw_decode
+    start = raw_text.find("{")
+    while start != -1:
         try:
-            data = json.loads(brace_match.group(1))
-            if isinstance(data, dict):
-                return data
+            obj, _ = json.JSONDecoder().raw_decode(raw_text[start:])
+            if isinstance(obj, dict):
+                return obj
         except Exception:
             pass
+        start = raw_text.find("{", start + 1)
 
     raise ValueError(f"LLM content is not valid JSON: {raw_text[:200]}")
 
@@ -364,8 +376,8 @@ def _parse_guard_response(data: dict[str, Any]) -> GuardResult:
     if sanitized is not None:
         sanitized = str(sanitized).strip()
 
-    # R2.2 & R3: A SUSPICIOUS verdict MUST include a non-empty sanitized_description
-    if verdict == GuardVerdict.SUSPICIOUS and not sanitized:
+    # R2.2 & R3: A SUSPICIOUS verdict MUST include a non-empty, meaningful sanitized_description
+    if verdict == GuardVerdict.SUSPICIOUS and (not sanitized or sanitized.lower() in {"null", "none", "n/a"}):
         raise ValueError("Guard response with SUSPICIOUS verdict must include non-empty sanitized_description")
 
     return GuardResult(
@@ -471,16 +483,17 @@ class SecurityGuard:
         """Execute one HTTP POST request to the guard LLM provider and parse the verdict."""
         endpoint = self._get_endpoint()
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
+        if self.api_key and str(self.api_key).strip():
+            headers["Authorization"] = f"Bearer {str(self.api_key).strip()}"
         payload = self._build_payload(description, attachments_text, image_attachments)
         data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         req = Request(endpoint, data=data, headers=headers, method="POST")
 
         try:
             with urlopen(req, timeout=self.timeout) as resp:
-                resp_bytes = resp.read()
+                resp_bytes = resp.read(10 * 1024 * 1024)
                 raw_json = json.loads(resp_bytes.decode("utf-8"))
         except HTTPError as exc:
             raise GuardError(f"Guard LLM HTTP error: {exc.code}") from exc
