@@ -96,9 +96,9 @@ function renderBudget(): void {
       queue_full: t('Queue full. Wait for a pending slot before submitting a new analysis.', '队列已满。请等待出现空位后再提交新分析。'),
     };
     usage.append(top, bar, el('p', 'usage-breakdown', t(`Accounted: ${money(budget.spent_usd)} · Running reservations: ${money(budget.active_reservations_usd)} · Remaining: ${money(state.remaining)}`, `已计入：${money(budget.spent_usd)} · 运行预留：${money(budget.active_reservations_usd)} · 剩余：${money(state.remaining)}`)), el('p', 'usage-status', messages[state.state]), el('p', 'usage-note', t(`${state.reservations} job reservations available at ${money(budget.estimated_per_job_usd)} each · ${budget.pending}/${budget.max_pending} pending slots used. Daily reset: ${budget.resets_at.slice(0, 10)} 00:00 (Asia/Shanghai); running reservations carry over. Estimates/reservations, not a verified provider bill.`, `每个任务预留 ${money(budget.estimated_per_job_usd)}，额度可覆盖 ${state.reservations} 个任务 · 待处理名额 ${budget.pending}/${budget.max_pending}。每日重置：${budget.resets_at.slice(0, 10)} 00:00（Asia/Shanghai）；运行中的预留额度跨日保留。这里是估算／预留额度，并非已核实的供应商账单。`)));
-    if (budget.resource_pool && budget.resources_used) {
-      const pool = budget.resource_pool, used = budget.resources_used;
-      usage.append(el('p', 'usage-note', t(`Sandbox capacity reserved: ${used.cpu_milli / 1000}/${pool.cpu_milli / 1000} CPU · ${used.memory_mb / 1024}/${pool.memory_mb / 1024} GiB RAM. Resource reservations, not live utilization.`, `沙箱容量预留：CPU ${used.cpu_milli / 1000}/${pool.cpu_milli / 1000} 核 · 内存 ${used.memory_mb / 1024}/${pool.memory_mb / 1024} GiB。这是容量预留，并非实时利用率。`)));
+    if (budget.resource_envelope) {
+      const limit = budget.resource_envelope;
+      usage.append(el('p', 'usage-note', t(`Maximum per job: ${limit.cpu_milli / 1000} CPU · ${limit.memory_mb / 1024} GiB RAM · ${limit.disk_mb / 1024} GiB monitored disk. Actual worker availability is checked when a worker claims the job.`, `单个任务上限：CPU ${limit.cpu_milli / 1000} 核 · 内存 ${limit.memory_mb / 1024} GiB · 监控磁盘 ${limit.disk_mb / 1024} GiB。实际工作器可用性会在工作器领取任务时确认。`)));
     }
   }
   const start = content.querySelector<HTMLButtonElement>('.start-analysis');
@@ -157,7 +157,7 @@ function sandboxAbstractionPanel(id: string, records: Event[]): HTMLElement {
 
   const header = el('div', 'sandbox-vm-header');
   const left = el('div', 'sandbox-vm-title-group');
-  const titleText = el('span', 'sandbox-vm-title', `📦 ${t('Cube Sandbox VM', 'Cube 沙箱环境')}`);
+  const titleText = el('span', 'sandbox-vm-title', `📦 ${t('Isolated analysis container', '隔离分析容器')}`);
 
   const isRunning = job ? job.status === 'running' : false;
   const isCompleted = job ? job.status === 'completed' : false;
@@ -184,7 +184,7 @@ function sandboxAbstractionPanel(id: string, records: Event[]): HTMLElement {
     const plan = job.resource_plan;
     right.append(el('span', 'sandbox-res-chip', `${plan.profile.toUpperCase()} · ${plan.cpu_milli}m CPU · ${plan.memory_mb}MB RAM · ${plan.disk_mb}MB Disk`));
   } else {
-    right.append(el('span', 'sandbox-res-chip', t('Standard VM · 2000m CPU · 4096MB RAM', '标准沙箱 · 2000m CPU · 4096MB RAM')));
+    right.append(el('span', 'sandbox-res-chip', t('Worker container · limits assigned on claim', '工作器容器 · 领取任务时分配限制')));
   }
   header.append(left, right);
   container.append(header);
@@ -200,7 +200,7 @@ function sandboxAbstractionPanel(id: string, records: Event[]): HTMLElement {
     guardBar.textContent = `🛡️ ${t('Security Guard: Injection detected & blocked', '安全防护：检测到提示词注入并拦截')}`;
   } else if (hasSanitized) {
     guardBar.classList.add('sanitized');
-    guardBar.textContent = `🛡️ ${t('Security Guard: Incident prompt sanitized & passed to sandbox', '安全防护：提示词已净化并放行入沙箱')}`;
+    guardBar.textContent = `🛡️ ${t('Security Guard: Incident prompt sanitized & passed to isolated job', '安全防护：提示词已净化并放行到隔离任务')}`;
   } else if (guardFailed) {
     guardBar.classList.add('warning');
     guardBar.textContent = `🛡️ ${t('Security Guard: Pre-check warning', '安全防护：预检警报')}`;
@@ -327,15 +327,15 @@ function sandboxAbstractionPanel(id: string, records: Event[]): HTMLElement {
   if (isRunning) {
     const lastHb = heartbeats.length ? heartbeats[heartbeats.length - 1] : undefined;
     const timeStr = lastHb?.created_at ? date(lastHb.created_at) : t('Active', '活跃');
-    hbText.textContent = `${t('Sandbox VM healthy', '沙箱运行正常')} · ${t('Recorded', '心跳次数')}: ${heartbeats.length} · ${t('Latest heartbeat', '最新心跳')}: ${timeStr}`;
+    hbText.textContent = `${t('Analysis container healthy', '分析容器运行正常')} · ${t('Recorded', '心跳次数')}: ${heartbeats.length} · ${t('Latest heartbeat', '最新心跳')}: ${timeStr}`;
   } else if (isCompleted) {
-    hbText.textContent = t('✓ Sandbox VM execution finished, environment cleaned up.', '✓ 沙箱虚拟机执行完毕，环境已安全释放。');
+    hbText.textContent = t('✓ Analysis container finished; workspace cleanup requested.', '✓ 分析容器已完成；已请求清理工作区。');
   } else if (isFailed) {
-    hbText.textContent = t('✕ Sandbox VM execution terminated with errors.', '✕ 沙箱虚拟机已终止（异常退出）。');
+    hbText.textContent = t('✕ Analysis container terminated with errors.', '✕ 分析容器已终止（异常退出）。');
   } else if (isCancelled) {
-    hbText.textContent = t('⊘ Sandbox VM cancelled and resources freed.', '⊘ 沙箱虚拟机已取消，资源已释放。');
+    hbText.textContent = t('⊘ Analysis container cancelled and resources released.', '⊘ 分析容器已取消，资源已释放。');
   } else {
-    hbText.textContent = t('⋯ Sandbox VM standing by for worker assignment.', '⋯ 沙箱虚拟机待命中，等待分配工作器。');
+    hbText.textContent = t('⋯ Waiting for a worker to claim this analysis.', '⋯ 等待工作器领取此分析任务。');
   }
   heartbeatStrip.append(hbDot, hbText);
   container.append(heartbeatStrip);
@@ -347,7 +347,7 @@ function sessionPanel(id: string, records: Event[]): HTMLDetailsElement {
   const panel = el('details', 'session-panel'); panel.dataset.job = id; panel.open = sessionViews.get(id)?.open ?? true;
   panel.append(el('summary', '', t('Session activity & output', '会话活动与输出')), el('p', 'session-hint', t('Public progress, tool status and output. Private reasoning and raw command output are not shared.', '公开进展、工具状态及输出；不展示私密推理和原始命令输出。')));
 
-  // Only show the Sandbox VM abstraction panel while a job is active.
+  // Only show the isolated-container progress panel while a job is active.
   // Completed / failed / cancelled history jobs show the transcript directly.
   const job = findJob(id);
   const isActive = !job || job.status === 'running' || job.status === 'queued' || job.status === 'draft';
@@ -386,7 +386,7 @@ function sessionPanel(id: string, records: Event[]): HTMLDetailsElement {
       if (item.count === 1) {
         line.append(el('span', 'session-agent', `${item.first.agent} · heartbeat${item.first.created_at ? ` · ${date(item.first.created_at)}` : ''}`), el('p', 'session-message heartbeat-message', item.first.message));
       } else {
-        line.append(el('span', 'session-agent', `${item.first.agent} · heartbeat · ${item.count} ticks`), el('p', 'session-message heartbeat-message', `● ${t(`Sandbox heartbeat active (${item.count} ticks collapsed)`, `沙箱持续心跳中（已合并 ${item.count} 条心跳）`)}${item.last.created_at ? ` · ${date(item.last.created_at)}` : ''}`));
+        line.append(el('span', 'session-agent', `${item.first.agent} · heartbeat · ${item.count} ticks`), el('p', 'session-message heartbeat-message', `● ${t(`Analysis container heartbeat active (${item.count} ticks collapsed)`, `分析容器持续心跳中（已合并 ${item.count} 条心跳）`)}${item.last.created_at ? ` · ${date(item.last.created_at)}` : ''}`));
       }
       transcript.append(line);
     }
@@ -535,7 +535,7 @@ function renderResult(): void {
   const meta = el('div', 'report-meta'); meta.append(statusBadge(job), el('span', 'muted', date(job.created_at))); page.append(meta, el('h1', '', title(job)), el('p', 'incident-description', job.description.replace(/^\[DEMO\]\s*/, '')));
   if (job.resource_plan) {
     const plan = job.resource_plan;
-    page.append(el('p', 'sandbox-profile', t(`Auto-sized sandbox (${plan.profile}): ${plan.cpu_milli / 1000} CPU · ${plan.memory_mb / 1024} GiB RAM · ${plan.disk_mb / 1024} GiB disk. Estimated from uploads, not guaranteed workload usage.`, `自动选择沙箱（${plan.profile}）：${plan.cpu_milli / 1000} 核 CPU · ${plan.memory_mb / 1024} GiB 内存 · ${plan.disk_mb / 1024} GiB 磁盘。依据上传内容估算，并非实际用量保证。`)));
+    page.append(el('p', 'sandbox-profile', t(`Auto-sized container plan (${plan.profile}): ${plan.cpu_milli / 1000} CPU · ${plan.memory_mb / 1024} GiB RAM · ${plan.disk_mb / 1024} GiB monitored disk. Estimated from uploads, not guaranteed workload usage.`, `自动选择容器计划（${plan.profile}）：CPU ${plan.cpu_milli / 1000} 核 · 内存 ${plan.memory_mb / 1024} GiB · 监控磁盘 ${plan.disk_mb / 1024} GiB。依据上传内容估算，并非实际用量保证。`)));
   }
   if (!terminal(job)) { page.append(el('div', 'waiting-panel', job.status === 'queued' ? t('Your analysis is queued. It starts when a worker and budget are available. You can leave this page and return from history.', '分析已排队。有可用工作器和预算时会开始。你可以离开本页，稍后从历史记录返回。') : t('Analysis is in progress. Everyone can follow the activity above.', '分析正在进行，所有人都可以在上方查看活动。'))); content.append(page); return; }
   const report = parseReport(job.report);

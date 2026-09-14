@@ -1,6 +1,6 @@
 # Project structure
 
-Robot Log Workbench presents one integrated shared analysis UI. Browser preprocessing runs automatically during submission, while FastAPI owns persistent history, uploads, status, hard stops, reports, and versioned human reviews. It reuses open-source archive readers and CubeSandbox. Real model execution requires a Cube endpoint/template; the local development VM provides one without silently executing agents on the host.
+Robot Log Workbench presents one integrated shared analysis UI. Browser preprocessing runs automatically during submission, while FastAPI owns persistent history, uploads, status, hard stops, reports, and versioned human reviews. It reuses open-source archive readers and isolated Docker job containers. Real model execution requires a Docker-capable worker host and its restricted egress proxy; agents never execute directly on the host.
 
 ## Source tree
 
@@ -11,7 +11,7 @@ browser_parse/
 ├── package-lock.json          # Reproducible dependency resolutions
 ├── tsconfig.json              # Strict TypeScript configuration
 ├── vite.config.ts             # Development API proxy
-├── pyproject.toml / uv.lock    # Python API and optional Cube worker dependencies
+├── pyproject.toml / uv.lock    # Python API and Docker worker dependencies
 ├── .env.example               # Model/provider and worker configuration placeholders
 ├── .gitignore                 # Excludes generated output, logs, and credentials
 ├── README.md                  # Setup, supported formats, limits, verification
@@ -19,17 +19,17 @@ browser_parse/
 ├── PROGRESS.md                # Implementation, validation and external blockers
 ├── THIRD_PARTY_NOTICES.md     # Direct dependency licenses and attribution
 ├── docs/
-│   ├── deploy-ecs-worker.md   # Two-machine deployment, services, TLS and operations
+│   ├── deploy-ecs-worker.md   # ECS API service, TLS and two-worker access rules
+│   ├── docker-worker.md       # ECS/API, two Docker workers, TLS and operations
 │   ├── open-source-options.md # Archive-library decision and format boundaries
 │   ├── model-providers.md     # DeepSeek setup, Qwen/OpenCode option and cost assumptions
-│   ├── local-sandbox.md       # Disposable local Cube VM and forwarded networking
 │   ├── wiki-review.md         # Prior pilot limitations and full-index search probes
 │   └── resource-profiles.md   # Automatic sizing, prepared tools and measurement limits
+├── deploy/                    # Host-local Docker network/proxy Compose and Squid ACL
 ├── scripts/
+│   ├── check_sandbox_runtime.py # Credential-free real Docker image/runtime check
 │   ├── estimate_cost.py       # Dependency-free offline multi-agent cost estimator
 │   ├── seed_demo.py           # Idempotent completed synthetic UI examples
-│   ├── cube_local.sh          # Conservative local VM start/status/ssh/stop
-│   ├── check_sandbox_runtime.py # No-model Cube runtime/skill/package check
 │   └── benchmark_resources.py # Bounded, credential-free Linux resource sampling
 ├── public/examples/           # Downloadable synthetic log for upload testing
 ├── src/
@@ -51,13 +51,13 @@ browser_parse/
 │   ├── store.py               # SQLite queue, budget reservations, claims and versions
 │   ├── resources.py           # Deterministic upload-driven CPU/RAM/disk profiles
 │   ├── guard.py               # Pre-execution LLM security guard (OWASP injection detection & prompt sanitization)
-│   └── worker.py              # Cube-only transfers, security guard gate, virtualenv injection, token-based cost, cancel & timeout
+│   ├── docker_runtime.py      # Local Docker isolation, transfer, limits and cleanup
+│   └── worker.py              # Docker dispatch, security guard, cost, cancellation and cleanup
 ├── sandbox/
-│   ├── Dockerfile             # Boot-tested reusable Cube image; Codex + Poppler + Python analysis venv
+│   ├── Dockerfile             # Reusable Docker image; Codex + Poppler + Python analysis venv
 │   ├── requirements.in / .lock # Hashed Python analysis dependencies, built with uv
 │   ├── check_environment.py   # Offline file-format/OCR/import fixtures
-│   ├── HostVM.Dockerfile       # Unprivileged Docker wrapper for local QEMU tools
-│   ├── run_codex.py           # In-VM headless runner, virtualenv auto-sourcing, .db3 pre-scan, and subagent supervisor
+│   ├── run_codex.py           # In-container headless runner, virtualenv auto-sourcing, .db3 pre-scan, and subagent supervisor
 │   └── runtime/
 │       ├── MAIN_PROMPT.md     # Main analysis prompt with 3-subagent delegation guidance
 │       ├── ENVIRONMENT.md     # File-type tools and prebuilt image constraints
@@ -67,7 +67,7 @@ browser_parse/
 ├── knowledge/
 │   ├── README.md              # Wiki location and indexing guidance
 │   └── wiki/                  # Local wiki copy, intentionally Git-ignored
-├── tests_backend/             # API, guard pipeline, mock Cube worker, runner, telemetry scanner and evidence checks
+├── tests_backend/             # API, guard pipeline, mock Docker worker, runner, telemetry scanner and evidence checks
 │   ├── test_runner.py         # Unit tests for runner, concurrency, virtualenv, evidence compaction, and db3 scan
 └── tests/
     ├── sources.test.ts        # TAR/GZIP/ZIP, safety limits and source identities
@@ -79,7 +79,7 @@ browser_parse/
 
 `node_modules/`, `dist/`, browser-test artifacts, uploaded logs, and downloaded evidence are not source files and are excluded from Git. Tests construct synthetic fixtures rather than committing private robot logs.
 
-Submission follows `main.ts → preprocess.worker.ts → backend/app.py → store.py` (uploads plus persistent queue), then `worker.py (pre-execution security guard) → Cube job VM → run_codex.py → Codex/native subagents`. `main.ts` also renders the shared history and active status; `report.ts` validates structured results before rendering their summary, evidence chain, workflow, and uncertainties. Only private worker routes can retrieve originals or finish jobs. Public visitors can read shared results, request a hard stop, and claim/append human review versions.
+Submission follows `main.ts → preprocess.worker.ts → backend/app.py → store.py` (uploads plus persistent queue), then `worker.py (pre-execution security guard) → Docker job container → run_codex.py → Codex/native subagents`. `main.ts` also renders the shared history and active status; `report.ts` validates structured results before rendering their summary, evidence chain, workflow, and uncertainties. Only private worker routes can retrieve originals or finish jobs. Public visitors can read shared results, request a hard stop, and claim/append human review versions.
 
 ## Processing paths
 
@@ -104,7 +104,7 @@ The simplified UI has no manual preprocessing, export, or context-replay control
 | Browser File, Streams, TextDecoder and Worker APIs | Local input, UTF-8 decoding and background execution |
 | TypeScript, Vite and Vitest | Type checking, bundling/development server and tests |
 
-The app is not a fork of an entire log-analysis project. It composes existing libraries with robot-specific preprocessing. The optional worker uses the official `cubesandbox` SDK and native Codex subagents, not an additional agent framework. `fflate` is not installed. MCAP/ROS readers are prepared in the sandbox image, not the browser; browser preprocessing still marks unsupported binary contents as coverage gaps. See [the dependency decision](docs/open-source-options.md) for archive licenses and browser format boundaries.
+The app is not a fork of an entire log-analysis project. It composes existing libraries with robot-specific preprocessing. The worker uses the local Docker CLI and native Codex subagents. Each worker polls ECS independently; no worker-to-worker connectivity is needed. `fflate` is not installed. MCAP/ROS readers are prepared in the sandbox image, not the browser; browser preprocessing still marks unsupported binary contents as coverage gaps. See [the dependency decision](docs/open-source-options.md) for archive licenses and browser format boundaries.
 
 ## Developer commands
 
@@ -117,4 +117,4 @@ npm test
 npm run build
 ```
 
-During development, open port 5175 and keep the port-8000 API running for Vite's `/api` proxy. For the integrated production-style local path, run `npm run build`, start the API, and open port 8000; FastAPI serves `dist/`. `uv run python scripts/seed_demo.py` adds exactly three completed, synthetic examples without AI calls or queue work and is safe to rerun. See `docs/local-sandbox.md` for the boot-tested development template and `PROGRESS.md` for actual end-to-end validation status. Byte budgets are not exact token counts, and sampled evidence is not a diagnosis.
+During development, open port 5175 and keep the port-8000 API running for Vite's `/api` proxy. For the integrated production-style local path, run `npm run build`, start the API, and open port 8000; FastAPI serves `dist/`. `uv run python scripts/seed_demo.py` adds exactly three completed, synthetic examples without AI calls or queue work and is safe to rerun. See `docs/docker-worker.md` for deployment and `PROGRESS.md` for validation status. Byte budgets are not exact token counts, and sampled evidence is not a diagnosis.

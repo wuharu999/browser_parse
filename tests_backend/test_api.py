@@ -17,7 +17,7 @@ class ApiTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
         self.client = TestClient(create_app(db_path=str(root / "jobs.sqlite3"), upload_dir=str(root / "uploads")))
-        self.worker = {"Authorization": "Bearer worker-test-token"}
+        self.worker = {"Authorization": "Bearer worker-test-token", "X-Worker-ID": "worker-a"}
 
     def tearDown(self): self.temp.cleanup()
 
@@ -32,8 +32,11 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         return job["id"]
 
-    def claim_worker(self):
-        response = self.client.post("/api/worker/claim", headers=self.worker)
+    def worker_headers(self, worker_id="worker-a"):
+        return {"Authorization": "Bearer worker-test-token", "X-Worker-ID": worker_id}
+
+    def claim_worker(self, worker_id="worker-a", capacity=None):
+        response = self.client.post("/api/worker/claim", headers=self.worker_headers(worker_id), json={"worker_id": worker_id, "capacity": capacity or {"cpu_milli": 4000, "memory_mb": 8192, "disk_mb": 32768}})
         self.assertEqual(response.status_code, 200)
         return response.json()["job"]
 
@@ -62,8 +65,10 @@ class ApiTest(unittest.TestCase):
 
     def test_budget_is_atomic_and_running_is_limited(self):
         jobs = [self.submit(self.job(f"job {n}")) for n in range(3)]
-        def claim(_): return self.client.post("/api/worker/claim", headers=self.worker).json()["job"]
-        with ThreadPoolExecutor(max_workers=3) as pool: claimed = list(pool.map(claim, jobs))
+        def claim(index):
+            worker_id = f"worker-{index}"
+            return self.client.post("/api/worker/claim", headers=self.worker_headers(worker_id), json={"worker_id": worker_id, "capacity": {"cpu_milli": 4000, "memory_mb": 8192, "disk_mb": 32768}}).json()["job"]
+        with ThreadPoolExecutor(max_workers=3) as pool: claimed = list(pool.map(claim, range(3)))
         running = [j for j in claimed if j]
         self.assertEqual(len(running), 2)
         budget = self.client.get("/api/budget").json()
@@ -98,9 +103,36 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(finish.json()["cost_usd"], 1)
         self.assertEqual(self.client.post(f"/api/worker/jobs/{jid}/finish", headers=self.worker, json={"status": "cancelled", "report": "duplicate", "metrics": {}}).status_code, 409)
 
+    def test_worker_identity_capacity_and_ownership_are_enforced(self):
+        made = self.job(); jid, token = made["job"]["id"], made["upload_token"]
+        self.assertEqual(self.client.put(f"/api/jobs/{jid}/files?name=robot.log", content=b"private", headers={"Authorization": f"Bearer {token}"}).status_code, 201)
+        self.submit(made)
+        malformed = self.client.post("/api/worker/claim", headers=self.worker_headers("worker-a"), json={"worker_id": "worker-a", "capacity": {"cpu_milli": 1, "memory_mb": 1, "disk_mb": 0}})
+        self.assertEqual(malformed.status_code, 422)
+        mismatch = self.client.post("/api/worker/claim", headers=self.worker_headers("worker-a"), json={"worker_id": "worker-b", "capacity": {"cpu_milli": 4000, "memory_mb": 8192, "disk_mb": 32768}})
+        self.assertEqual(mismatch.status_code, 422)
+        claimed = self.claim_worker("worker-a")
+        artifact = claimed["files"][0]["id"]
+        other = self.worker_headers("worker-b")
+        self.assertEqual(self.client.get(f"/api/worker/jobs/{jid}", headers=other).status_code, 403)
+        self.assertEqual(self.client.get(f"/api/worker/jobs/{jid}/files/{artifact}", headers=other).status_code, 403)
+        self.assertEqual(self.client.post(f"/api/worker/jobs/{jid}/events", headers=other, json={"kind": "notice", "message": "not mine"}).status_code, 403)
+        self.assertEqual(self.client.post(f"/api/worker/jobs/{jid}/sanitize", headers=other, json={"original_description": "original", "sanitized_description": "sanitized"}).status_code, 403)
+        self.assertEqual(self.client.post(f"/api/worker/jobs/{jid}/finish", headers=other, json={"status": "completed", "report": "not mine", "metrics": {}}).status_code, 403)
+
+    def test_expired_lease_cannot_be_renewed_by_an_event(self):
+        jid = self.submit(self.job())
+        self.claim_worker("worker-a")
+        store = self.client.app.state.store
+        with store.lock:
+            store.db.execute("UPDATE jobs SET lease_until=? WHERE id=?", ("2000-01-01T00:00:00+00:00", jid)); store.db.commit()
+        event = self.client.post(f"/api/worker/jobs/{jid}/events", headers=self.worker, json={"kind": "heartbeat", "message": "too late"})
+        self.assertEqual(event.status_code, 422)
+        self.assertEqual(self.client.get(f"/api/jobs/{jid}").json()["status"], "failed")
+
     def test_cancel_keeps_admission_reservation_and_expiry_charges_it(self):
         first, second, third = self.submit(self.job("one")), self.submit(self.job("two")), self.submit(self.job("three"))
-        a, b = self.claim_worker(), self.claim_worker()
+        a, b = self.claim_worker("worker-a"), self.claim_worker("worker-b")
         self.assertEqual(len({a["id"], b["id"]}), 2)
         stopping = a["id"]
         self.assertEqual(self.client.post(f"/api/jobs/{stopping}/cancel").status_code, 200)

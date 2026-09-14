@@ -74,7 +74,7 @@ class DemoSeedTests(unittest.TestCase):
         reopened = Store(str(self.db), str(self.uploads))
         real = reopened.get(job["id"])
         self.assertEqual(real["status"], "queued")
-        claimed, _ = reopened.worker_claim()
+        claimed, _ = reopened.worker_claim("demo-test-worker", {"cpu_milli": 4000, "memory_mb": 8192, "disk_mb": 32768})
         self.assertEqual(claimed["id"], job["id"])
         self.assertNotIn(claimed["id"], {demo["id"] for demo in DEMOS})
         reopened.db.close()

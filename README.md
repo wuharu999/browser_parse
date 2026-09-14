@@ -1,11 +1,10 @@
 # Robot Log Workbench
 
-**Deploy on two machines:** [ECS web/API server + sandbox worker setup](docs/deploy-ecs-worker.md)
-includes HTTPS, configuration, systemd services, template creation, private wiki
-transfer, resource limits, acceptance tests and backups. This is an operator
-runbook; an ECS/cloud deployment has not yet been verified.
+**Deploy on two worker machines:** [Docker worker runbook](docs/docker-worker.md)
+covers ECS connectivity, TLS, two independent hosts, restricted egress, limits,
+systemd and cleanup. It is an operator runbook; no cloud deployment is claimed.
 
-A shared robot-incident analysis workbench with automatic in-browser log preprocessing and an optional CubeSandbox model worker. To create an analysis, choose log files or a folder, add any image/PDF attachments, describe the incident, choose the report language, and submit. The browser preprocesses recognizable logs in a Web Worker and then uploads the originals, attachments, and bounded evidence package to the shared backend. **Preprocessing itself needs no Codex, API key, model call, or LLM tokens.**
+A shared robot-incident analysis workbench with automatic in-browser log preprocessing and an optional isolated Docker model worker. To create an analysis, choose log files or a folder, add any image/PDF attachments, describe the incident, choose the report language, and submit. The browser preprocesses recognizable logs in a Web Worker and then uploads the originals, attachments, and bounded evidence package to the shared backend. **Preprocessing itself needs no Codex, API key, model call, or LLM tokens.**
 
 The integrated EN/中文 interface has a shared history on the left and the selected analysis on the right. Everyone connected to the same backend can see active status and scrollable public session activity, open completed reports, or request the public hard stop. Structured results show the summary, source-grounded evidence chain, uncertainties, and an editable ordered workflow. Human reviews add a name, outcome, note, and edited workflow as a new immutable version; they remain separate from the model report.
 
@@ -89,7 +88,7 @@ uv run uvicorn backend.app:app --host 127.0.0.1 --port 8000
 
 Open http://127.0.0.1:8000. This serves the built UI and persistent SQLite API together. For frontend development, keep the API running and use `npm run dev -- --port 5175 --strictPort`; open http://127.0.0.1:5175 and let Vite proxy `/api` to port 8000. The only submission inputs are files or a folder, optional attachments, an incident description, and report language. Image/PDF-only jobs are allowed. The queue works without a model, but real jobs remain queued; no analysis is fabricated.
 
-All visitors see job descriptions, activity summaries, finished reports and immutable review versions. Anyone can request a hard stop. A running job remains **stopping** until the worker confirms sandbox termination or its lease expires; the API cannot itself kill a disconnected remote VM. The worker also configures a maximum 30-minute sandbox lifetime. Reviews require a name, success/failure, an explanation and edited debugging procedure. Claims expire after 30 minutes; saving releases the claim and creates a new version. Names are not verified identities. Version-list and append endpoints provide the extension point for future version management; existing versions are not overwritten.
+All visitors see job descriptions, activity summaries, finished reports and immutable review versions. Anyone can request a hard stop. A running job remains **stopping** until the worker confirms sandbox termination or its lease expires; the API cannot itself kill a disconnected remote container. The worker also configures a maximum 30-minute sandbox lifetime. Reviews require a name, success/failure, an explanation and edited debugging procedure. Claims expire after 30 minutes; saving releases the claim and creates a new version. Names are not verified identities. Version-list and append endpoints provide the extension point for future version management; existing versions are not overwritten.
 
 Data stays in ignored `data/` until the operator removes it. Keep the database and upload folder together in backups. No automatic public URL, TLS, cleanup, user accounts or production abuse protection is configured. This is a local integration demo, **not a hardened internet deployment**. Public reports may contain sensitive excerpts; best-effort credential redaction is not a privacy guarantee. Do not publish confidential logs/wiki content without permission.
 
@@ -101,24 +100,24 @@ uv run python scripts/seed_demo.py
 
 This adds the motor timeout/recovery, localization uncertainty, and incomplete-log-coverage examples. It is idempotent, makes no AI/model calls, creates no queued or running work, and preserves existing demo reviews on rerun. The reports and activity state explicitly that they are synthetic.
 
-### Configure the sandbox worker
+### Configure the Docker workers
 
-Copy `.env.example` to an ignored `.env`, replace the worker secret, and supply your Cube API URL/key/template and model key. Restart the API using `uv run --env-file .env uvicorn backend.app:app --host 127.0.0.1 --port 8000`, then in another terminal:
+Follow [Docker worker deployment](docs/docker-worker.md) on each machine. Both workers poll ECS at `http://47.239.12.206:8000`; they need no direct connection to each other. Each has a local Docker engine, an internal job network and a provider-only egress proxy. Give each a distinct `ROBOT_WORKER_ID`, configure its capacity, image ID/digest, shared worker token and model credential. Roll out the updated ECS API before starting these workers.
 
 ```sh
-uv sync --extra worker
+uv sync --frozen
 uv run --env-file .env python -m backend.worker
 ```
 
-`sandbox/Dockerfile` builds the reusable Cube analysis image, with pinned Codex, Python, Poppler and ripgrep. It has been built, registered and boot-tested in a local CubeSandbox v0.7.0 development VM; file transfer and tool execution passed and the smoke sandbox was destroyed. See [local sandbox management](docs/local-sandbox.md), [resource profiles](docs/resource-profiles.md) and [latest validation](PROGRESS.md). Cube services run inside a disposable OpenCloudOS VM, without reformatting or installing privileged Cube services on the Ubuntu host. Missing Cube configuration fails closed: Codex is never launched unrestricted on the host.
+`sandbox/Dockerfile` builds the analysis image with Codex, Python, OCR, Poppler and the analysis libraries installed in advance. Each job runs as a non-root user in its own container and named workspace volume. Native Codex subagents share that container. CPU, memory and PIDs are constrained; disk usage is monitored and jobs are stopped on overflow, without claiming a hard disk quota. No KVM or Cube service is required, and missing Docker isolation settings fail closed.
 
-Each job receives its own Cube VM. Native Codex subagents share that VM, with full permissions inside it, not separate VMs per child. The main prompt and two bounded roles live in `sandbox/runtime/`; raw logs and wiki pages are data, not instructions. The worker streams and hashes original uploads and supplies bounded local evidence tools instead of putting whole archives/wiki into the prompt. The complete local wiki is in ignored `knowledge/wiki/`: 564 Markdown pages were indexed, including pages absent from its navigation index. Raw evidence and page context remain retrievable by source/line. Activity exposes coarse lifecycle events, not private reasoning or raw shell output.
+The worker streams and hashes uploads before transferring them into the container. Optional private wiki files come from ignored `knowledge/wiki/`; activity exposes coarse progress, not private reasoning or raw shell output. Containers and their workspaces are removed on completion, cancellation or timeout. Startup cleanup is restricted to resources belonging to that worker ID. See [resource profiles](docs/resource-profiles.md) for sizing and the credential-free image check.
 
-The new [sandbox context skill](sandbox/runtime/.agents/skills/robot-analysis-context/SKILL.md) is copied into `/workspace/.agents/skills/` for **the agents inside each job**, not installed in your personal Codex environment. The main prompt and both roles reference it. Its token-bounded `evidence.py context` helper exposes upload mappings, assigned resources and wiki index status; the skill routes agents to preinstalled tools and applicable original wiki lines. See [wiki review](docs/wiki-review.md) for measured retrieval limits.
+The new [sandbox context skill](sandbox/runtime/.agents/skills/robot-analysis-context/SKILL.md) is copied into `/workspace/.agents/skills/` for **the agents inside each job**, not installed in your personal Codex environment. The main prompt and subagent roles reference it. Its token-bounded `evidence.py context` helper exposes upload mappings, assigned resources and wiki index status; the skill routes agents to preinstalled tools and applicable original wiki lines. See [wiki review](docs/wiki-review.md) for measured retrieval limits.
 
 ### Pre-execution security guard (prompt injection defense)
 
-Before provisioning any CubeSandbox VM or launching Codex, the worker runs an automated host-side security inspection ([`backend/guard.py`](backend/guard.py)) on the user's incident description and all non-log attachments (PDFs, text/markdown documents, configuration files, and images).
+Before provisioning any Docker job container or launching Codex, the worker runs an automated host-side security inspection ([`backend/guard.py`](backend/guard.py)) on the user's incident description and all non-log attachments (PDFs, text/markdown documents, configuration files, and images).
 
 - **Three-Tier Classification (OWASP LLM01:2025)**:
   - **`CLEAN`**: No adversarial manipulation or prompt injection detected. The job proceeds normally into the isolated sandbox with original inputs.
@@ -150,10 +149,10 @@ To prevent exploratory tool stalls, redundant skill reads, and multi-minute reas
 - **Frontend Process Grid Integration**:
   - `src/main.ts` renders a live 4-card process grid (`Codex Orchestrator`, `Log Investigator`, `Telemetry Investigator`, and `Evidence Reviewer`) with live status badges and expandable intermediate output inspection drawers.
   - Page and transcript scroll positions are automatically preserved across 3-second live poll intervals (`renderResult`).
-  - The Cube VM abstraction card is cleanly scoped to active analyses (running/queued/draft) and hidden on completed history views.
+  - The Docker container card is cleanly scoped to active analyses (running/queued/draft) and hidden on completed history views.
 - **Sandbox Python Virtualenv Auto-Sourcing**:
-  - `backend/worker.py::_sandbox_env()` prioritizes `/opt/analysis-venv/bin` in `PATH` and exports `VIRTUAL_ENV=/opt/analysis-venv`.
-  - `sandbox/run_codex.py::_setup_virtualenv()` automatically detects and activates pre-installed virtualenvs at startup, updating `os.environ`, `sys.path`, and writing activation hooks to `/etc/profile.d/analysis_venv.sh` and `/workspace/.bashrc` with `BASH_ENV` configured. Subshells and Codex tool executions run with full package access (`rosbags`, `mcap`, `numpy`, `pandas`, `pypdf`, `h5py`).
+  - `backend/worker.py::_container_env()` prioritizes `/opt/analysis-venv/bin` in `PATH` and exports `VIRTUAL_ENV=/opt/analysis-venv`.
+  - `sandbox/run_codex.py::_setup_virtualenv()` automatically detects and activates pre-installed virtualenvs at startup, updating `os.environ`, `sys.path`, and writing the workspace activation hook `/workspace/.bashrc` with `BASH_ENV` configured; the read-only root prevents system profile changes. Subshells and Codex tool executions run with full package access (`rosbags`, `mcap`, `numpy`, `pandas`, `pypdf`, `h5py`).
 - **Preprocessing Pipeline Bridge**:
   - `sandbox/run_codex.py::_compact_evidence()` preserves structured browser `LogPackage` metadata (`totals`, up to 30 files, up to 20 patterns, and up to 25 evidence entries) while stripping raw line payloads, providing file sizes, line counts, timestamps, and error patterns immediately on Turn 1.
   - Fast (<0.5s) read-only SQLite `.db3` topic and timestamp scanner (`_scan_db3_telemetry`) extracts topic names, message counts, and nanosecond timestamp bounds, formatting them directly into the Turn 1 prompt.
@@ -161,16 +160,16 @@ To prevent exploratory tool stalls, redundant skill reads, and multi-minute reas
   - Token counts (`input_tokens`, `output_tokens`, `cached_tokens`) reported by the SDK are settled using snapshot rates (`deepseek-v4-flash`: $0.44/1M in, $1.32/1M out, 10% cache rate).
   - Automatically selects `deepseek-v4-flash` for non-vision jobs, routing around multimodal overhead when no images or PDFs are present.
 
-Resource sizing is automatic and token-free: small (1 CPU/2 GiB), standard (2 CPU/4 GiB), or large (4 CPU/8 GiB), selected from uploaded sizes, file types and browser expansion hints. Configure matching `CUBE_TEMPLATES_JSON` IDs and the API's resource pool before starting the worker; missing/mismatched templates fail closed. The current local VM supports small/standard only. See [resource profiles](docs/resource-profiles.md) for thresholds, queue reservations, prepared packages and the no-model sandbox verification command.
+Resource sizing is automatic and token-free: small (1 CPU/2 GiB), standard (2 CPU/4 GiB), or large (4 CPU/8 GiB), selected from uploaded sizes, file types and browser expansion hints. ECS grants at most one job to each worker ID and two globally. Each worker advertises available local capacity, so a queued job must fit the machine claiming it. A busy or undersized machine does not prevent another capable machine from claiming work. See [resource profiles](docs/resource-profiles.md).
 
 Reports include **Back to upload** controls that preserve the current draft. The shared daily allowance bar distinguishes accounted estimates, running reservations and remaining allowance; it indicates when new work can queue or when pending slots are full. It is not a provider billing or real-time CPU/RAM usage meter.
 
 The model key enters the sandbox and is accessible to a full-permission agent. Use a dedicated, restricted-budget provider key and limit sandbox network access externally. Provider replacement uses `ROBOT_CODEX_PROVIDER_URL`, `ROBOT_CODEX_API_KEY_ENV` and `ROBOT_CODEX_MODEL`; the endpoint must be compatible with Codex's Responses protocol. Arbitrary providers are not automatically supported.
 
-Defaults admit at most two concurrent jobs, with 20 pending/uploading jobs and a USD 5 reservation per job against a **USD 10 Asia/Shanghai-day admission cap**. Active reservations count across midnight. Unknown actual cost is conservatively settled at the reservation. This is **not verified billing or a hard USD 10 final-charge ceiling**: in-flight jobs finish and can exceed estimates. The requested DeepSeek vision alias completed a 93-second synthetic log/image pilot with two native subagents; the aggregate provider bill remains unknown. The local pilot uses one worker and an 1800-second (30-minute) timeout. CPU/RAM/disk allocation is selected in the Cube template; tiny-case observations and provisional cloud sizing are separated in [resource profiles](docs/resource-profiles.md).
+Defaults admit at most two concurrent jobs, with 20 pending/uploading jobs and a USD 5 reservation per job against a **USD 10 Asia/Shanghai-day admission cap**. Active reservations count across midnight. Unknown actual cost is conservatively settled at the reservation. This is **not verified billing or a hard USD 10 final-charge ceiling**: in-flight jobs finish and can exceed estimates. Worker loss or lease expiry fails a job without automatically repeating model calls. Each machine independently manages its Docker resources; there is no shared worker filesystem or peer network.
 
 ```sh
-PYTHONPATH=. pytest tests_backend -v
+uv run python -m unittest discover -s tests_backend -v
 npm test
 npm run build
 ```
@@ -210,3 +209,6 @@ Browser checks used the local samples without copying raw inputs into the applic
 | August ROS2 bag TAR.GZ, previous baseline | Five SQLite recordings explicitly skipped; trailing gzip garbage surfaced as an archive error. |
 
 The v2 browser check downloaded/parsed both exports, retrieved a 20-line context page and previously unselected extraction metadata, and checked no horizontal page overflow at 390 pixels. Observed preprocessing requests were only local application assets; no log/model upload request occurred. Four-archive v2 runs took roughly 3.6–4.7 seconds on this machine, not a cross-machine performance guarantee. The extra readable lines/configuration and wider context intentionally make the local full package larger than v1; only the compact brief is intended as the small initial handoff.
+
+For the initial deployment with one separate worker machine, follow
+[the one-worker setup guide](docs/worker-one-machine.md).

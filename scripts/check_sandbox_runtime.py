@@ -1,62 +1,150 @@
-"""Boot a configured profile and verify runtime assets without a model/API job.
+"""Validate a restricted Docker analysis runtime without model or API credentials.
 
-Run from the repo: uv run --env-file .env python scripts/check_sandbox_runtime.py small
-The disposable VM receives synthetic input and no model credentials. It is
-destroyed on completion or failure. This is not a workload performance benchmark.
+Run after Docker infrastructure has created the internal job network and proxy:
+```
+ROBOT_DOCKER_IMAGE=sha256:... \
+ROBOT_EGRESS_PROXY_URL=http://robot-egress-proxy:3128 \
+python scripts/check_sandbox_runtime.py standard
+```
+The check creates one synthetic job volume/container and removes both on exit.
+It does not contact the API, a model provider, or any external service.
 """
 from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
+import os
+import shutil
 import sys
+import tempfile
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from backend.docker_runtime import DockerRuntime
 from backend.resources import PROFILES
-from backend.worker import CubeWorker, WorkerConfig
+
+
+ROOT = Path(__file__).resolve().parents[1]
+CHECK_PROGRAM = """\
+import json
+import os
+import subprocess
+from pathlib import Path
+
+for name in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY", "ROBOT_WORKER_TOKEN", "CODEX_API_KEY"):
+    assert not os.environ.get(name), f"unexpected credential: {name}"
+
+for name in ("robot-analysis-context", "robot-evidence", "pdf-evidence"):
+    assert Path("/workspace/.agents/skills", name, "SKILL.md").is_file(), name
+
+subprocess.run(["python3", "/workspace/evidence.py", "index"], check=True, capture_output=True)
+context = json.loads(subprocess.check_output(["python3", "/workspace/evidence.py", "context"]))
+assert context["wiki_indexed_pages"] == 1
+assert context["job_id"] == "offline-runtime-check"
+
+limits = {}
+for name in ("memory.max", "memory.swap.max", "pids.max", "cpu.max"):
+    path = Path("/sys/fs/cgroup", name)
+    limits[name] = path.read_text().strip() if path.is_file() else None
+
+environment = json.loads(Path("/opt/sandbox/environment.json").read_text())
+Path("/workspace/result.json").write_text(
+    json.dumps({"context": context, "environment": environment, "cgroup": limits})
+)
+"""
+
+
+def _stage_runtime(destination: Path, job: dict[str, object]) -> None:
+    runtime = ROOT / "sandbox" / "runtime"
+    if not runtime.is_dir():
+        raise RuntimeError(f"runtime directory is unavailable: {runtime}")
+    shutil.copytree(
+        runtime,
+        destination,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        dirs_exist_ok=True,
+    )
+    wiki = destination / "wiki"
+    wiki.mkdir(parents=True, exist_ok=True)
+    (wiki / "fixture.md").write_text("# Synthetic test\nMotor diagnostic context only.\n")
+    (destination / "job.json").write_text(json.dumps(job, separators=(",", ":")))
+    (destination / "runtime_check.py").write_text(CHECK_PROGRAM)
+
+
+def _inspect_limits(runtime: DockerRuntime, container: str, plan: dict[str, int]) -> None:
+    result = runtime._run(["inspect", container])
+    details = json.loads(result.stdout)[0]
+    host = details["HostConfig"]
+    expected_memory = plan["memory_mb"] * 1024 * 1024
+    expected_cpu = plan["cpu_milli"] * 1_000_000
+    if host.get("Memory") != expected_memory or host.get("MemorySwap") != expected_memory:
+        raise RuntimeError("Docker memory/swap limit differs from the requested profile")
+    if host.get("NanoCpus") != expected_cpu:
+        raise RuntimeError("Docker CPU limit differs from the requested profile")
+    if host.get("PidsLimit") != runtime.pids_limit:
+        raise RuntimeError("Docker pids limit differs from the configured limit")
+    if not host.get("ReadonlyRootfs") or host.get("NetworkMode") != runtime.network:
+        raise RuntimeError("Docker root filesystem or job network restriction is missing")
+    if "ALL" not in (host.get("CapDrop") or []) or "no-new-privileges" not in (host.get("SecurityOpt") or []):
+        raise RuntimeError("Docker capability or no-new-privileges restriction is missing")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("profile", choices=PROFILES)
+    parser.add_argument("--image", default=os.environ.get("ROBOT_DOCKER_IMAGE"))
+    parser.add_argument("--network", default=os.environ.get("ROBOT_DOCKER_NETWORK", "robot-analysis-jobs"))
+    parser.add_argument("--proxy-url", default=os.environ.get("ROBOT_EGRESS_PROXY_URL"))
+    parser.add_argument("--worker-id", default="runtime-check")
+    parser.add_argument("--docker-data-dir", type=Path, default=Path(os.environ.get("ROBOT_DOCKER_DATA_DIR", "/var/lib/docker")))
+    parser.add_argument("--disk-reserve-mb", type=int, default=int(os.environ.get("ROBOT_HOST_DISK_RESERVE_MB", "8192")))
+    parser.add_argument("--pids-limit", type=int, default=int(os.environ.get("ROBOT_JOB_PIDS_LIMIT", "512")))
     args = parser.parse_args()
-    worker = CubeWorker(WorkerConfig.from_env())
-    Sandbox, config = worker._cube(180, args.profile)
-    sandbox = Sandbox.create(config=config, timeout=180)
+    if not args.image:
+        raise SystemExit("missing --image or ROBOT_DOCKER_IMAGE")
+    if not args.proxy_url:
+        raise SystemExit("missing --proxy-url or ROBOT_EGRESS_PROXY_URL")
+
+    plan = {"profile": args.profile, **PROFILES[args.profile]}
+    runtime = DockerRuntime(
+        image=args.image,
+        network=args.network,
+        proxy_url=args.proxy_url,
+        worker_id=args.worker_id,
+        data_dir=args.docker_data_dir,
+        disk_reserve_mb=args.disk_reserve_mb,
+        pids_limit=args.pids_limit,
+    )
+    runtime.preflight()
+    job = runtime.create("offline-runtime-check", plan, {})
+    removed = False
     try:
-        info = sandbox.get_info()
-        expected = PROFILES[args.profile]
-        for key in ("cpu_milli", "memory_mb"):
-            if getattr(info, key) != expected[key]:
-                raise RuntimeError(f"Template {key} differs from the reserved profile")
-        worker._ensure_dir(sandbox, "/workspace")
-        worker._write_tree(sandbox, worker.config.runtime_dir, "/workspace")
-        worker._ensure_dir(sandbox, "/workspace/wiki")
-        sandbox.files.write("/workspace/wiki/fixture.md", "# Synthetic test\nMotor diagnostic context only.\n")
-        job = {"id": "offline-runtime-check", "description": "Synthetic context check; no model run.",
-               "language": "en", "files": [], "resource_plan": {"profile": args.profile, **expected}}
-        sandbox.files.write("/workspace/job.json", json.dumps(job))
-        command = """python3 - <<'PY'
-import json, os, subprocess
-from pathlib import Path
-for name in ('DEEPSEEK_API_KEY', 'OPENAI_API_KEY', 'ROBOT_WORKER_TOKEN'):
-    assert not os.environ.get(name), 'Unexpected credential in offline check'
-for name in ('robot-analysis-context', 'robot-evidence', 'pdf-evidence'):
-    assert Path('/workspace/.agents/skills', name, 'SKILL.md').is_file(), name
-subprocess.run(['python3', '/workspace/evidence.py', 'index'], check=True, capture_output=True)
-context = json.loads(subprocess.check_output(['python3', '/workspace/evidence.py', 'context']))
-assert context['wiki_indexed_pages'] == 1
-assert context['job_id'] == 'offline-runtime-check'
-environment = json.loads(subprocess.check_output(['python3', '/opt/sandbox/check_environment.py']))
-print(json.dumps({'context': context, 'environment': environment}))
-subprocess.run(['df', '-m', '/workspace'], check=True)
-PY"""
-        result = sandbox.commands.run(command, cwd="/workspace", timeout=90)
-        if result.exit_code:
-            raise RuntimeError(f"Sandbox check failed ({result.exit_code}): {result.stderr[:1000]}")
-        print(result.stdout)
+        with tempfile.TemporaryDirectory(prefix="robot-runtime-check-") as temporary:
+            _stage_runtime(Path(temporary), {
+                "id": "offline-runtime-check",
+                "description": "Synthetic context check; no model run.",
+                "language": "en",
+                "files": [],
+                "resource_plan": plan,
+            })
+            runtime.copy_in(job, Path(temporary))
+        runtime.start(job)
+        _inspect_limits(runtime, job.container, plan)
+        runtime._run(
+            ["exec", job.container, "python3", "-I", "/workspace/runtime_check.py"],
+            timeout=120,
+        )
+        report = runtime.copy_out_text(job, "/workspace/result.json", 64 * 1024)
+        if report is None:
+            raise RuntimeError("Docker runtime check did not produce a readable result")
+        print(json.dumps(json.loads(report), ensure_ascii=False))
+        removed = runtime.remove(job)
+        if not removed:
+            raise RuntimeError("Docker runtime check cleanup was not confirmed")
     finally:
-        sandbox.kill()
+        if not removed and not runtime.remove(job):
+            raise RuntimeError("Docker runtime check cleanup was not confirmed")
 
 
 if __name__ == "__main__":

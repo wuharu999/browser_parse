@@ -26,7 +26,8 @@ from backend.guard import (
     supports_vision,
 )
 from backend.store import Store
-from backend.worker import CubeWorker, WorkerConfig
+from backend.docker_runtime import DockerJob
+from backend.worker import DockerWorker, WorkerConfig
 
 
 class MockFiles:
@@ -70,7 +71,7 @@ class MockCommands:
         }))
 
 
-class MockSandboxInstance:
+class FakeDockerJob:
     def __init__(self) -> None:
         self.files = MockFiles()
         self.commands = MockCommands(self.files)
@@ -87,15 +88,38 @@ class MockSandboxInstance:
         return type("Info", (), {"cpu_milli": 1000, "memory_mb": 2048, "disk_size_mb": 8192})()
 
 
-class MockSandbox:
-    created: list[tuple[MockSandboxInstance, object, dict[str, str]]] = []
+class CompletedProcess:
+    returncode = 0
+    def poll(self): return 0
 
-    @classmethod
-    def create(cls, *, config: object, env_vars: dict[str, str], timeout: int) -> MockSandboxInstance:
-        instance = MockSandboxInstance()
-        instance.timeout = timeout
-        cls.created.append((instance, config, env_vars))
-        return instance
+
+class FakeDockerRuntime:
+    created: list[FakeDockerJob] = []
+    def available_capacity(self, maxima, memory_reserve_mb=1024): return maxima
+    def preflight(self): pass
+    def cleanup_orphans(self): pass
+    def create(self, _job_id, _plan, env):
+        instance = FakeDockerJob(); self.created.append(instance); self.env = env
+        return DockerJob("fake", "fake-volume")
+    def copy_in(self, _job, source):
+        instance = self.created[-1]
+        for path in source.rglob("*"):
+            if path.is_file(): instance.files.write("/workspace/" + path.relative_to(source).as_posix(), path.read_bytes())
+    def start(self, _job): pass
+    def exec_runner(self, _job):
+        instance = self.created[-1]
+        instance.commands.run("python3 /opt/sandbox/run_codex.py /workspace/job.json")
+        return CompletedProcess()
+    def copy_out_text(self, _job, path, maximum=256 * 1024):
+        value = self.created[-1].files.read(path)
+        return value.decode() if isinstance(value, bytes) else value
+    def disk_healthy(self, _job, _limit): return True
+    def workspace_bytes(self, _job): return 34
+    def remove(self, _job): return True
+
+
+def docker_worker(config, api):
+    return DockerWorker(config, api, FakeDockerRuntime())
 
 
 class MockWorkerApi:
@@ -106,7 +130,7 @@ class MockWorkerApi:
         self.events: list[dict] = []
         self.sanitizations: list[dict] = []
 
-    def claim(self) -> dict | None:
+    def claim(self, _capacity=None) -> dict | None:
         return self.job
 
     def download_to(self, _job_id: str, artifact_id: str, destination: Path) -> tuple[int, str]:
@@ -176,7 +200,7 @@ def make_pdf_bytes(text: str) -> bytes:
 
 class SecurityGuardPipelineTests(unittest.TestCase):
     def setUp(self) -> None:
-        MockSandbox.created.clear()
+        FakeDockerRuntime.created.clear()
         self.temp = tempfile.TemporaryDirectory()
         runtime = Path(self.temp.name, "runtime")
         runtime.mkdir()
@@ -184,11 +208,11 @@ class SecurityGuardPipelineTests(unittest.TestCase):
         self.config = WorkerConfig(
             api_url="http://127.0.0.1:8000",
             worker_token="worker-token",
-            cube_api_url="http://cube:3000",
-            cube_api_key="cube-key",
-            cube_template_id="template",
-            cube_proxy_node_ip=None,
-            cube_proxy_port_http=None,
+            worker_id="guard-test-worker",
+            docker_image="sha256:" + "a" * 64,
+            docker_network="robot-test",
+            egress_proxy_url="http://proxy.test:8080",
+            docker_data_dir=runtime,
             codex_model="gpt-5.6-luna",
             codex_provider_url="https://api.guard.test",
             codex_api_key_env="OPENAI_API_KEY",
@@ -197,7 +221,7 @@ class SecurityGuardPipelineTests(unittest.TestCase):
             poll_seconds=0.01,
             runtime_dir=runtime,
             wiki_dir=None,
-            parallel=2,
+            cpu_milli=4000, memory_mb=8192, disk_mb=24576, disk_reserve_mb=1024,
             guard_model="guard-test-model",
             guard_provider_url="https://api.guard.test",
             guard_api_key="guard-secret",
@@ -227,12 +251,12 @@ class SecurityGuardPipelineTests(unittest.TestCase):
         clean_resp = make_chat_completion_response({"verdict": "CLEAN", "reason": "Factual incident report."})
         with patch("backend.guard.urlopen") as mock_url:
             mock_url.return_value.__enter__.return_value.read.return_value = clean_resp
-            worker = CubeWorker(self.config, api, MockSandbox)
+            worker = DockerWorker(self.config, api, FakeDockerRuntime())
             self.assertTrue(worker.run_once())
 
         # Verify sandbox was created and Codex executed
-        self.assertEqual(len(MockSandbox.created), 1)
-        instance = MockSandbox.created[0][0]
+        self.assertEqual(len(FakeDockerRuntime.created), 1)
+        instance = FakeDockerRuntime.created[0]
         self.assertEqual(instance.commands.runs, ["python3 /opt/sandbox/run_codex.py /workspace/job.json"])
         self.assertEqual(api.finished[0]["status"], "completed")
 
@@ -251,11 +275,11 @@ class SecurityGuardPipelineTests(unittest.TestCase):
         })
         with patch("backend.guard.urlopen") as mock_url:
             mock_url.return_value.__enter__.return_value.read.return_value = injection_resp
-            worker = CubeWorker(self.config, api, MockSandbox)
+            worker = DockerWorker(self.config, api, FakeDockerRuntime())
             self.assertTrue(worker.run_once())
 
         # Verify zero sandboxes were provisioned
-        self.assertEqual(len(MockSandbox.created), 0)
+        self.assertEqual(len(FakeDockerRuntime.created), 0)
         # Verify job marked failed with explicit prompt injection reason
         self.assertEqual(api.finished[0]["status"], "failed")
         self.assertIn("Prompt injection detected in inputs", api.finished[0]["report"])
@@ -288,11 +312,11 @@ class SecurityGuardPipelineTests(unittest.TestCase):
         })
         with patch("backend.guard.urlopen") as mock_url:
             mock_url.return_value.__enter__.return_value.read.return_value = injection_resp
-            worker = CubeWorker(self.config, api, MockSandbox)
+            worker = DockerWorker(self.config, api, FakeDockerRuntime())
             self.assertTrue(worker.run_once())
 
         # Zero sandboxes created
-        self.assertEqual(len(MockSandbox.created), 0)
+        self.assertEqual(len(FakeDockerRuntime.created), 0)
         self.assertEqual(api.finished[0]["status"], "failed")
         self.assertIn("Prompt injection detected in inputs", api.finished[0]["report"])
         self.assertEqual(api.finished[0]["cost_usd"], 0.0)
@@ -316,7 +340,7 @@ class SecurityGuardPipelineTests(unittest.TestCase):
         })
         with patch("backend.guard.urlopen") as mock_url:
             mock_url.return_value.__enter__.return_value.read.return_value = suspicious_resp
-            worker = CubeWorker(self.config, api, MockSandbox)
+            worker = DockerWorker(self.config, api, FakeDockerRuntime())
             self.assertTrue(worker.run_once())
 
         # Verify database record of original and sanitized descriptions via API
@@ -329,8 +353,8 @@ class SecurityGuardPipelineTests(unittest.TestCase):
         self.assertTrue(any("refined for security" in e["message"] for e in warning_events))
 
         # Verify sandbox was created and job.json contains sanitized prompt
-        self.assertEqual(len(MockSandbox.created), 1)
-        instance = MockSandbox.created[0][0]
+        self.assertEqual(len(FakeDockerRuntime.created), 1)
+        instance = FakeDockerRuntime.created[0]
         runner_job = json.loads(instance.files.values["/workspace/job.json"])
         self.assertEqual(runner_job["description"], sanitized_prompt)
         self.assertEqual(runner_job["original_description"], original_prompt)
@@ -354,13 +378,13 @@ class SecurityGuardPipelineTests(unittest.TestCase):
             raise URLError("Connection timed out")
 
         with patch("backend.guard.urlopen", side_effect=fake_urlopen):
-            worker = CubeWorker(self.config, api, MockSandbox)
+            worker = DockerWorker(self.config, api, FakeDockerRuntime())
             self.assertTrue(worker.run_once())
 
         # Verify it retried exactly once (2 calls total)
         self.assertEqual(call_count, 2)
         # Verify zero sandboxes created
-        self.assertEqual(len(MockSandbox.created), 0)
+        self.assertEqual(len(FakeDockerRuntime.created), 0)
         # Verify fail-closed job failure
         self.assertEqual(api.finished[0]["status"], "failed")
         self.assertIn("Security pre-check failed", api.finished[0]["report"])
@@ -383,11 +407,11 @@ class SecurityGuardPipelineTests(unittest.TestCase):
             raise HTTPError("http://guard", 500, "Internal Server Error", {}, BytesIO(b""))
 
         with patch("backend.guard.urlopen", side_effect=fake_urlopen):
-            worker = CubeWorker(self.config, api, MockSandbox)
+            worker = DockerWorker(self.config, api, FakeDockerRuntime())
             self.assertTrue(worker.run_once())
 
         self.assertEqual(call_count, 2)
-        self.assertEqual(len(MockSandbox.created), 0)
+        self.assertEqual(len(FakeDockerRuntime.created), 0)
         self.assertEqual(api.finished[0]["status"], "failed")
         self.assertIn("Security pre-check failed", api.finished[0]["report"])
 
@@ -412,11 +436,11 @@ class SecurityGuardPipelineTests(unittest.TestCase):
             return mock_resp
 
         with patch("backend.guard.urlopen", side_effect=fake_urlopen):
-            worker = CubeWorker(self.config, api, MockSandbox)
+            worker = DockerWorker(self.config, api, FakeDockerRuntime())
             self.assertTrue(worker.run_once())
 
         self.assertEqual(call_count, 2)
-        self.assertEqual(len(MockSandbox.created), 0)
+        self.assertEqual(len(FakeDockerRuntime.created), 0)
         self.assertEqual(api.finished[0]["status"], "failed")
         self.assertIn("Security pre-check failed", api.finished[0]["report"])
 
@@ -442,12 +466,12 @@ class SecurityGuardPipelineTests(unittest.TestCase):
             return mock_resp
 
         with patch("backend.guard.urlopen", side_effect=fake_urlopen):
-            worker = CubeWorker(self.config, api, MockSandbox)
+            worker = DockerWorker(self.config, api, FakeDockerRuntime())
             self.assertTrue(worker.run_once())
 
         # Verify retry succeeded and sandbox executed
         self.assertEqual(call_count, 2)
-        self.assertEqual(len(MockSandbox.created), 1)
+        self.assertEqual(len(FakeDockerRuntime.created), 1)
         self.assertEqual(api.finished[0]["status"], "completed")
 
     def test_corrupted_non_log_attachment_handled_safely(self) -> None:
@@ -477,11 +501,11 @@ class SecurityGuardPipelineTests(unittest.TestCase):
         clean_resp = make_chat_completion_response({"verdict": "CLEAN"})
         with patch("backend.guard.urlopen") as mock_url:
             mock_url.return_value.__enter__.return_value.read.return_value = clean_resp
-            worker = CubeWorker(self.config, api, MockSandbox)
+            worker = DockerWorker(self.config, api, FakeDockerRuntime())
             # Must not crash!
             self.assertTrue(worker.run_once())
 
-        self.assertEqual(len(MockSandbox.created), 1)
+        self.assertEqual(len(FakeDockerRuntime.created), 1)
         self.assertEqual(api.finished[0]["status"], "completed")
 
     def test_safety_cap_32kib_across_non_log_attachments(self) -> None:
@@ -552,11 +576,11 @@ class SecurityGuardPipelineTests(unittest.TestCase):
             # Create job
             job, _ = store.create("Original suspicious prompt", "en", None)
             store.submit(job["id"])
-            claimed, _ = store.worker_claim()
+            claimed, _ = store.worker_claim("guard-test-worker", {"cpu_milli": 4000, "memory_mb": 8192, "disk_mb": 32768})
             self.assertIsNotNone(claimed)
 
             # Sanitize job
-            updated = store.sanitize(job["id"], "Original suspicious prompt", "Sanitized prompt")
+            updated = store.sanitize(job["id"], "guard-test-worker", "Original suspicious prompt", "Sanitized prompt")
             self.assertEqual(updated["original_description"], "Original suspicious prompt")
             self.assertEqual(updated["sanitized_description"], "Sanitized prompt")
             self.assertEqual(updated["description"], "Sanitized prompt")
@@ -586,7 +610,8 @@ class SecurityGuardPipelineTests(unittest.TestCase):
                 client.post(f"/api/jobs/{job_id}/submit", headers={"Authorization": f"Bearer {sub_token}"})
 
                 # 2. Claim job as worker
-                claim_res = client.post("/api/worker/claim", headers={"Authorization": "Bearer secret-worker-tok"})
+                worker_headers = {"Authorization": "Bearer secret-worker-tok", "X-Worker-ID": "guard-test-worker"}
+                claim_res = client.post("/api/worker/claim", headers=worker_headers, json={"worker_id": "guard-test-worker", "capacity": {"cpu_milli": 4000, "memory_mb": 8192, "disk_mb": 32768}})
                 self.assertEqual(claim_res.status_code, 200)
 
                 # 3. Sanitize without token -> 401/403
@@ -599,7 +624,7 @@ class SecurityGuardPipelineTests(unittest.TestCase):
                 # 4. Sanitize with worker token -> 200
                 san_res = client.post(
                     f"/api/worker/jobs/{job_id}/sanitize",
-                    headers={"Authorization": "Bearer secret-worker-tok"},
+                    headers=worker_headers,
                     json={
                         "original_description": "Probe prompt",
                         "sanitized_description": "Sanitized query",
@@ -646,23 +671,21 @@ class SecurityGuardPipelineTests(unittest.TestCase):
     def test_worker_config_guard_defaults_and_env_precedence(self) -> None:
         env = {
             "ROBOT_WORKER_TOKEN": "tok",
-            "CUBE_API_URL": "http://cube:3000",
-            "CUBE_API_KEY": "ckey",
-            "CUBE_TEMPLATE_ID": "tmpl",
             "ROBOT_CODEX_MODEL": "codex-main",
             "ROBOT_CODEX_PROVIDER_URL": "https://codex.provider.test",
             "ROBOT_CODEX_API_KEY": "codex-secret",
             "OPENAI_API_KEY": "openai-key",
         }
+        env.update({"ROBOT_WORKER_ID": "guard-env", "ROBOT_DOCKER_IMAGE": "sha256:" + "a" * 64, "ROBOT_DOCKER_NETWORK": "guard-test", "ROBOT_EGRESS_PROXY_URL": "http://proxy.test:8080"})
         with patch.dict("os.environ", env, clear=True):
             cfg = WorkerConfig.from_env()
             # Falls back to codex settings
-            self.assertEqual(cfg.guard_model, None)  # None in config, resolved in CubeWorker
+            self.assertEqual(cfg.guard_model, None)  # Resolved from Codex settings by DockerWorker.
             self.assertEqual(cfg.guard_provider_url, "https://codex.provider.test")
             self.assertEqual(cfg.guard_api_key, "codex-secret")
 
-            # In CubeWorker, guard is created with fallback model
-            worker = CubeWorker(cfg, MockWorkerApi(None), MockSandbox)
+            # DockerWorker creates the guard with the Codex fallback model.
+            worker = docker_worker(cfg, MockWorkerApi(None))
             self.assertIsNotNone(worker.guard)
             self.assertEqual(worker.guard.model, "codex-main")
             self.assertEqual(worker.guard.provider_url, "https://codex.provider.test")
@@ -672,13 +695,14 @@ class SecurityGuardPipelineTests(unittest.TestCase):
         env["ROBOT_GUARD_MODEL"] = "guard-custom"
         env["ROBOT_GUARD_PROVIDER_URL"] = "https://guard.custom.test"
         env["ROBOT_GUARD_API_KEY"] = "guard-custom-key"
+        env.update({"ROBOT_WORKER_ID": "guard-env", "ROBOT_DOCKER_IMAGE": "sha256:" + "a" * 64, "ROBOT_DOCKER_NETWORK": "guard-test", "ROBOT_EGRESS_PROXY_URL": "http://proxy.test:8080"})
         with patch.dict("os.environ", env, clear=True):
             cfg2 = WorkerConfig.from_env()
             self.assertEqual(cfg2.guard_model, "guard-custom")
             self.assertEqual(cfg2.guard_provider_url, "https://guard.custom.test")
             self.assertEqual(cfg2.guard_api_key, "guard-custom-key")
 
-            worker2 = CubeWorker(cfg2, MockWorkerApi(None), MockSandbox)
+            worker2 = docker_worker(cfg2, MockWorkerApi(None))
             self.assertIsNotNone(worker2.guard)
             self.assertEqual(worker2.guard.model, "guard-custom")
             self.assertEqual(worker2.guard.provider_url, "https://guard.custom.test")
@@ -706,11 +730,11 @@ class SecurityGuardPipelineTests(unittest.TestCase):
             return mock_resp
 
         with patch("backend.guard.urlopen", side_effect=fake_urlopen):
-            worker = CubeWorker(self.config, api, MockSandbox)
+            worker = docker_worker(self.config, api)
             self.assertTrue(worker.run_once())
 
         self.assertEqual(call_count, 2)
-        self.assertEqual(len(MockSandbox.created), 0)
+        self.assertEqual(len(FakeDockerRuntime.created), 0)
         self.assertEqual(api.finished[0]["status"], "failed")
         self.assertIn("Security pre-check failed", api.finished[0]["report"])
 
@@ -778,7 +802,7 @@ class SecurityGuardPipelineTests(unittest.TestCase):
             return mock_resp
 
         with patch("backend.guard.urlopen", side_effect=fake_urlopen):
-            worker = CubeWorker(self.config, api, MockSandbox)
+            worker = docker_worker(self.config, api)
             self.assertTrue(worker.run_once())
 
         self.assertEqual(len(recorded_requests), 1)
@@ -797,16 +821,14 @@ class SecurityGuardPipelineTests(unittest.TestCase):
         """Verify that ROBOT_GUARD_MODEL activates the guard even if ROBOT_CODEX_PROVIDER_URL is None."""
         env = {
             "ROBOT_WORKER_TOKEN": "tok",
-            "CUBE_API_URL": "http://cube:3000",
-            "CUBE_API_KEY": "ckey",
-            "CUBE_TEMPLATE_ID": "tmpl",
             "ROBOT_CODEX_MODEL": "gpt-5.6-luna",
             "OPENAI_API_KEY": "openai-key",
             "ROBOT_GUARD_MODEL": "gpt-4o-mini",
         }
+        env.update({"ROBOT_WORKER_ID": "guard-env", "ROBOT_DOCKER_IMAGE": "sha256:" + "a" * 64, "ROBOT_DOCKER_NETWORK": "guard-test", "ROBOT_EGRESS_PROXY_URL": "http://proxy.test:8080"})
         with patch.dict("os.environ", env, clear=True):
             cfg = WorkerConfig.from_env()
-            worker = CubeWorker(cfg, MockWorkerApi(None), MockSandbox)
+            worker = docker_worker(cfg, MockWorkerApi(None))
             self.assertIsNotNone(worker.guard)
             self.assertEqual(worker.guard.model, "gpt-4o-mini")
 
@@ -838,16 +860,14 @@ class SecurityGuardPipelineTests(unittest.TestCase):
         """Verify that standard production deployments (OpenAI default without ROBOT_GUARD_MODEL) activate the guard."""
         env = {
             "ROBOT_WORKER_TOKEN": "tok",
-            "CUBE_API_URL": "http://cube:3000",
-            "CUBE_API_KEY": "ckey",
-            "CUBE_TEMPLATE_ID": "tmpl",
             "ROBOT_CODEX_MODEL": "gpt-5.6-luna",
             "OPENAI_API_KEY": "openai-key",
         }
+        env.update({"ROBOT_WORKER_ID": "guard-env", "ROBOT_DOCKER_IMAGE": "sha256:" + "a" * 64, "ROBOT_DOCKER_NETWORK": "guard-test", "ROBOT_EGRESS_PROXY_URL": "http://proxy.test:8080"})
         with patch.dict("os.environ", env, clear=True):
             cfg = WorkerConfig.from_env()
             self.assertTrue(cfg.guard_enabled)
-            worker = CubeWorker(cfg, MockWorkerApi(None), MockSandbox)
+            worker = docker_worker(cfg, MockWorkerApi(None))
             # Guard MUST be active and default to codex model
             self.assertIsNotNone(worker.guard)
             self.assertEqual(worker.guard.model, "gpt-5.6-luna")
@@ -857,17 +877,15 @@ class SecurityGuardPipelineTests(unittest.TestCase):
         """Verify that ROBOT_GUARD_ENABLED=0 explicitly disables the guard in production."""
         env = {
             "ROBOT_WORKER_TOKEN": "tok",
-            "CUBE_API_URL": "http://cube:3000",
-            "CUBE_API_KEY": "ckey",
-            "CUBE_TEMPLATE_ID": "tmpl",
             "ROBOT_CODEX_MODEL": "gpt-5.6-luna",
             "OPENAI_API_KEY": "openai-key",
             "ROBOT_GUARD_ENABLED": "0",
         }
+        env.update({"ROBOT_WORKER_ID": "guard-env", "ROBOT_DOCKER_IMAGE": "sha256:" + "a" * 64, "ROBOT_DOCKER_NETWORK": "guard-test", "ROBOT_EGRESS_PROXY_URL": "http://proxy.test:8080"})
         with patch.dict("os.environ", env, clear=True):
             cfg = WorkerConfig.from_env()
             self.assertFalse(cfg.guard_enabled)
-            worker = CubeWorker(cfg, MockWorkerApi(None), MockSandbox)
+            worker = docker_worker(cfg, MockWorkerApi(None))
             self.assertIsNone(worker.guard)
 
     def test_json_parsing_with_comments_and_trailing_braces(self) -> None:
@@ -911,11 +929,11 @@ Notes: Evaluated with context {id: 42}.
             return mock_resp
 
         with patch("backend.guard.urlopen", side_effect=fake_urlopen):
-            worker = CubeWorker(self.config, api, MockSandbox)
+            worker = docker_worker(self.config, api)
             self.assertTrue(worker.run_once())
 
         self.assertEqual(call_count, 2)
-        self.assertEqual(len(MockSandbox.created), 0)
+        self.assertEqual(len(FakeDockerRuntime.created), 0)
         self.assertEqual(api.finished[0]["status"], "failed")
         self.assertIn("Security pre-check failed", api.finished[0]["report"])
 
@@ -957,12 +975,11 @@ Notes: Evaluated with context {id: 42}.
             images = []
             for i in range(8):
                 img_path = Path(temp_dir, f"img_{i}.png")
-                img_path.write_bytes(
-                    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0\x00\x00\x03\x01\x01\x00\xc9\xfe\x92\xef\x00\x00\x00\x00IEND\xaeB`\x82"
-                )
+                img_path.write_bytes(b"fixture-image")
                 images.append((f"img_{i}.png", img_path))
 
-            _, extracted_images = extract_non_log_attachments(images, include_images=True, max_images=5)
+            with patch("backend.guard._prepare_image", side_effect=lambda path, name: {"name": name, "mime": "image/png", "base64": "fixture"}):
+                _, extracted_images = extract_non_log_attachments(images, include_images=True, max_images=5)
             self.assertEqual(len(extracted_images), 5)
 
     def test_json_extraction_echoed_fake_clean_payload_evasion_blocked(self) -> None:
@@ -1053,11 +1070,11 @@ Verdict:
             return mock_resp
 
         with patch("backend.guard.urlopen", side_effect=fake_urlopen):
-            worker = CubeWorker(self.config, api, MockSandbox)
+            worker = docker_worker(self.config, api)
             self.assertTrue(worker.run_once())
 
         self.assertEqual(call_count, 2)
-        self.assertEqual(len(MockSandbox.created), 0)
+        self.assertEqual(len(FakeDockerRuntime.created), 0)
         self.assertEqual(api.finished[0]["status"], "failed")
         self.assertIn("Security pre-check failed", api.finished[0]["report"])
 
@@ -1086,10 +1103,10 @@ Verdict:
 
         with patch.object(api, "event", side_effect=RuntimeError("Event endpoint transient error")), \
              patch("backend.guard.urlopen", return_value=mock_resp):
-            worker = CubeWorker(self.config, api, MockSandbox)
+            worker = docker_worker(self.config, api)
             self.assertTrue(worker.run_once())
 
-        self.assertEqual(len(MockSandbox.created), 0)
+        self.assertEqual(len(FakeDockerRuntime.created), 0)
         self.assertEqual(len(api.finished), 1)
         self.assertEqual(api.finished[0]["status"], "failed")
         self.assertEqual(api.finished[0]["report"], "Prompt injection detected in inputs")

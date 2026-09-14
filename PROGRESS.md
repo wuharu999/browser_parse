@@ -1,5 +1,17 @@
 # Analysis service progress
 
+## Docker worker migration — 2026-09-14
+
+- Replaced the Cube SDK/configuration and KVM image base with a local Docker runtime. The two worker machines poll ECS independently; there is no peer networking or shared worker storage.
+- ECS claims are atomic, capacity-aware, bound to a worker ID, and limited to one active job per ID/two globally. Shared-token IDs provide trusted attribution, not separate security principals. Expired leases cannot be renewed by late worker calls; failed work is not automatically retried.
+- Each job uses UID 10001, a read-only root, its own named workspace, default seccomp, no capabilities, no-new-privileges, CPU/memory/PID limits and zero swap. Disk is monitored with a stop threshold, not a hard quota. Unconfirmed cleanup stops the worker and retains its lease; restart cleans only resources labelled for that worker ID.
+- Local verification: 123 backend tests and 48 frontend tests passed; frontend build and Compose validation passed. Replaced Cube-specific fixture tests with Docker behavior tests; the guard image-cap test now mocks image preparation to test the cap independently of optional host Pillow.
+- Built `robot-log-analysis:docker` locally. Its credential-free runtime check passed library/format/OCR fixtures and wiki indexing; real standard-profile cgroups reported 2 CPU, 4 GiB memory, zero swap and 512 PIDs.
+- Synthetic live HTTP tests with two worker identities and real Docker containers passed completion, concurrent claims, one-slot enforcement, cancellation, timeout, disk overflow and container/volume cleanup. This is a single-host simulation of two independent workers, not physical two-machine deployment or paid model inference.
+- Real adapter tests verified workspace/file ownership, bounded output reads rejecting symlinks/FIFOs/oversized results, and idempotent cleanup.
+- Proxy boot was verified as nonroot with dropped capabilities. Allowed provider CONNECT and certificate-verified TLS succeeded (keyless provider response 401); private/metadata/ECS/other-host/subdomain/wrong-port/plain-HTTP and direct-egress tests were denied. The local VPN intercepts DNS with synthetic 198.18 addresses; positive provider testing used a temporary public-DNS mapping, without weakening private-address ACLs.
+- ECS deployment was requested for an initial single remote worker, but root SSH on port 22 closed before authentication. The public API still serves the previous version. The one-worker guide specifies `JOB_MAX_RUNNING=1`; deploy the API before starting that worker. Existing `.env`, private data and ignored old development-VM files were preserved. Earlier entries below describe historical Cube validation.
+
 ## Codex runtime optimization, specialized subagents & preprocessing bridge — 2026-09-14
 
 - Implemented tiered reasoning architecture:

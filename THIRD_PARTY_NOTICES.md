@@ -12,9 +12,9 @@ Robot Log Workbench uses the following direct open-source dependencies. Exact in
 | `fastapi` | Python HTTP API | MIT | [FastAPI](https://github.com/fastapi/fastapi) |
 | `uvicorn` | ASGI server | BSD-3-Clause | [Uvicorn](https://github.com/encode/uvicorn) |
 | `httpx` | API test transport | BSD-3-Clause | [HTTPX](https://github.com/encode/httpx) |
-| `cubesandbox` (optional) | Sandbox SDK | Apache-2.0 | [CubeSandbox](https://github.com/TencentCloud/CubeSandbox) |
+| `Squid` | Restricted outbound HTTPS proxy | GPL-2.0-or-later | [Squid](https://www.squid-cache.org/) |
 
-The candidate sandbox image also installs OpenAI Codex CLI (Apache-2.0), Node.js (MIT and bundled component notices), Python (PSF license), and Poppler utilities (GPL-family component licenses). Preserve image/package license notices and check redistribution obligations before distributing a built template. The supplied wiki and user uploads are private data, not licensed project dependencies, and are excluded from Git.
+The analysis container image also installs OpenAI Codex CLI (Apache-2.0), Node.js (MIT and bundled component notices), Python (PSF license), and Poppler utilities (GPL-family component licenses). Preserve image/package license notices when distributing an image. The supplied wiki and user uploads are private data, not licensed project dependencies, and are excluded from Git.
 
 The prepared image additionally uses uv, Tesseract and English/Chinese language
 data, jq, SQLite, compression utilities, and the Python packages listed in

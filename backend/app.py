@@ -13,7 +13,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt
 
 from .store import Store
 
@@ -53,6 +53,17 @@ class Finish(BaseModel):
     report: str = Field(max_length=20000)
     cost_usd: float | None = Field(default=None, ge=0, le=100000)
     metrics: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkerCapacity(BaseModel):
+    cpu_milli: StrictInt = Field(gt=0)
+    memory_mb: StrictInt = Field(gt=0)
+    disk_mb: StrictInt = Field(gt=0)
+
+
+class WorkerClaim(BaseModel):
+    worker_id: str = Field(min_length=1, max_length=80)
+    capacity: WorkerCapacity
 
 
 def bearer(value: str | None) -> str:
@@ -101,7 +112,7 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None) -> 
         return await call_next(request)
 
     if configured_origins:
-        app.add_middleware(CORSMiddleware, allow_origins=sorted(configured_origins), allow_methods=["GET", "POST", "PUT", "DELETE"], allow_headers=["Authorization", "Content-Type"])
+        app.add_middleware(CORSMiddleware, allow_origins=sorted(configured_origins), allow_methods=["GET", "POST", "PUT", "DELETE"], allow_headers=["Authorization", "Content-Type", "X-Worker-ID"])
 
     def job_or_404(job_id: str) -> dict:
         item = store.get(job_id)
@@ -118,6 +129,20 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None) -> 
         wanted = os.getenv("ROBOT_WORKER_TOKEN")
         if not wanted: raise HTTPException(503, "worker API is disabled until ROBOT_WORKER_TOKEN is configured")
         if not secrets.compare_digest(bearer(authorization), wanted): raise HTTPException(403, "worker token invalid")
+
+    def worker_identity(authorization: str | None, worker_id: str | None) -> str:
+        worker(authorization)
+        try:
+            return store._worker_identity(worker_id or "")
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))
+
+    def owned_worker_identity(job_id: str, authorization: str | None, worker_id: str | None) -> str:
+        identity = worker_identity(authorization, worker_id)
+        owned = store.worker_owns(job_id, identity)
+        if owned is None: raise HTTPException(404, "job not found")
+        if not owned: raise HTTPException(403, "worker does not own job")
+        return identity
 
     @app.post("/api/jobs", status_code=201)
     async def create_job(body: CreateJob):
@@ -223,39 +248,41 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None) -> 
         return Response(status_code=204)
 
     @app.post("/api/worker/claim")
-    async def worker_claim(authorization: str | None = Header(default=None)):
-        worker(authorization); job, budget_state = store.worker_claim(); return {"job": job, "budget": budget_state}
+    async def worker_claim(body: WorkerClaim, authorization: str | None = Header(default=None), x_worker_id: str | None = Header(default=None)):
+        identity = worker_identity(authorization, x_worker_id)
+        if body.worker_id != identity: raise HTTPException(422, "worker_id must match X-Worker-ID")
+        try:
+            job, budget_state = store.worker_claim(identity, body.capacity.model_dump())
+        except ValueError as exc: raise HTTPException(422, str(exc))
+        return {"job": job, "budget": budget_state}
 
     @app.get("/api/worker/jobs/{job_id}")
-    async def worker_get(job_id: str, authorization: str | None = Header(default=None)):
-        worker(authorization); item = store.worker_job(job_id)
+    async def worker_get(job_id: str, authorization: str | None = Header(default=None), x_worker_id: str | None = Header(default=None)):
+        item = store.worker_job(job_id, owned_worker_identity(job_id, authorization, x_worker_id))
         if not item: raise HTTPException(404, "job not found")
         return item
 
     @app.get("/api/worker/jobs/{job_id}/files/{artifact_id}")
-    async def worker_file(job_id: str, artifact_id: str, authorization: str | None = Header(default=None)):
-        worker(authorization); item = store.worker_file(job_id, artifact_id)
+    async def worker_file(job_id: str, artifact_id: str, authorization: str | None = Header(default=None), x_worker_id: str | None = Header(default=None)):
+        item = store.worker_file(job_id, artifact_id, owned_worker_identity(job_id, authorization, x_worker_id))
         if not item: raise HTTPException(404, "file not available")
         path, name = item; return FileResponse(path, filename=name, media_type="application/octet-stream")
 
     @app.post("/api/worker/jobs/{job_id}/events", status_code=201)
-    async def worker_event(job_id: str, body: WorkerEvent, authorization: str | None = Header(default=None)):
-        worker(authorization)
-        try: return store.worker_event(job_id, body.kind, body.agent, body.message)
+    async def worker_event(job_id: str, body: WorkerEvent, authorization: str | None = Header(default=None), x_worker_id: str | None = Header(default=None)):
+        try: return store.worker_event(job_id, owned_worker_identity(job_id, authorization, x_worker_id), body.kind, body.agent, body.message)
         except KeyError: raise HTTPException(404, "job not found")
         except ValueError as exc: raise HTTPException(422, str(exc))
 
     @app.post("/api/worker/jobs/{job_id}/sanitize")
-    async def worker_sanitize(job_id: str, body: SanitizeJob, authorization: str | None = Header(default=None)):
-        worker(authorization)
-        try: return store.sanitize(job_id, body.original_description, body.sanitized_description)
+    async def worker_sanitize(job_id: str, body: SanitizeJob, authorization: str | None = Header(default=None), x_worker_id: str | None = Header(default=None)):
+        try: return store.sanitize(job_id, owned_worker_identity(job_id, authorization, x_worker_id), body.original_description, body.sanitized_description)
         except KeyError: raise HTTPException(404, "job not found")
         except ValueError as exc: raise HTTPException(422, str(exc))
 
     @app.post("/api/worker/jobs/{job_id}/finish")
-    async def worker_finish(job_id: str, body: Finish, authorization: str | None = Header(default=None)):
-        worker(authorization)
-        try: return store.finish(job_id, body.status, body.report, body.cost_usd, body.metrics)
+    async def worker_finish(job_id: str, body: Finish, authorization: str | None = Header(default=None), x_worker_id: str | None = Header(default=None)):
+        try: return store.finish(job_id, owned_worker_identity(job_id, authorization, x_worker_id), body.status, body.report, body.cost_usd, body.metrics)
         except KeyError: raise HTTPException(404, "job not found")
         except ValueError as exc: raise HTTPException(409, str(exc))
 

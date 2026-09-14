@@ -12,12 +12,14 @@ import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from .resources import allocation, estimate_resources
+from .resources import estimate_resources
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 TERMINAL = {"completed", "failed", "cancelled"}
 EVENT_KINDS = {"progress", "notice", "warning", "error", "analysis", "artifact", "system", "heartbeat"}
+WORKER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}\Z")
+RESOURCE_KEYS = ("cpu_milli", "memory_mb", "disk_mb")
 
 
 def now() -> datetime:
@@ -71,7 +73,10 @@ class Store:
         self.lease_seconds, self.runtime_seconds = lease_seconds, runtime_seconds
         if pool_cpu_milli < 1000 or pool_memory_mb < 2048 or pool_disk_mb < 8192:
             raise ValueError("resource pool must fit at least one small sandbox")
-        self.resource_pool = {"cpu_milli": pool_cpu_milli, "memory_mb": pool_memory_mb, "disk_mb": pool_disk_mb}
+        # This bounds an individual submitted job.  It is deliberately not an
+        # aggregate host pool: workers advertise their own Docker capacity when
+        # claiming, so two separate hosts can each run a large job.
+        self.resource_envelope = {"cpu_milli": pool_cpu_milli, "memory_mb": pool_memory_mb, "disk_mb": pool_disk_mb}
         self.lock = threading.RLock()
         self.db = sqlite3.connect(self.path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
@@ -114,10 +119,40 @@ class Store:
         """)
         # Keep local development databases usable after additive schema changes.
         columns = {row["name"] for row in self.db.execute("PRAGMA table_info(jobs)")}
-        for name, sql in (("run_deadline", "TEXT"), ("finished_day", "TEXT"), ("upload_reserved", "INTEGER NOT NULL DEFAULT 0"), ("resource_plan", "TEXT"), ("original_description", "TEXT"), ("sanitized_description", "TEXT")):
+        for name, sql in (("run_deadline", "TEXT"), ("finished_day", "TEXT"), ("upload_reserved", "INTEGER NOT NULL DEFAULT 0"), ("resource_plan", "TEXT"), ("original_description", "TEXT"), ("sanitized_description", "TEXT"), ("worker_id", "TEXT")):
             if name not in columns:
                 self.db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {sql}")
         self.db.commit()
+
+    @staticmethod
+    def _worker_identity(worker_id: str) -> str:
+        if not isinstance(worker_id, str) or not WORKER_ID.fullmatch(worker_id):
+            raise ValueError("worker_id must be 1-80 letters, digits, dots, underscores, or hyphens")
+        return worker_id
+
+    @staticmethod
+    def _capacity(capacity: dict) -> dict[str, int]:
+        if not isinstance(capacity, dict) or set(capacity) != set(RESOURCE_KEYS):
+            raise ValueError("worker capacity must contain cpu_milli, memory_mb, and disk_mb")
+        if any(not isinstance(capacity[key], int) or isinstance(capacity[key], bool) or capacity[key] <= 0 for key in RESOURCE_KEYS):
+            raise ValueError("worker capacity values must be positive integers")
+        return {key: capacity[key] for key in RESOURCE_KEYS}
+
+    @staticmethod
+    def _fits(plan: dict, capacity: dict) -> bool:
+        return all(plan.get(key, 0) <= capacity[key] for key in RESOURCE_KEYS)
+
+    def _owned_running(self, job_id: str, worker_id: str) -> sqlite3.Row | None:
+        return self.db.execute("SELECT * FROM jobs WHERE id=? AND status='running' AND worker_id=?", (job_id, worker_id)).fetchone()
+
+    def _owned_job(self, job_id: str, worker_id: str) -> sqlite3.Row | None:
+        return self.db.execute("SELECT * FROM jobs WHERE id=? AND worker_id=?", (job_id, worker_id)).fetchone()
+
+    def worker_owns(self, job_id: str, worker_id: str) -> bool | None:
+        worker_id = self._worker_identity(worker_id)
+        with self.lock:
+            row = self.db.execute("SELECT worker_id FROM jobs WHERE id=?", (job_id,)).fetchone()
+            return None if row is None else hmac.compare_digest(row["worker_id"] or "", worker_id)
 
     def _tx(self):
         self.db.execute("BEGIN IMMEDIATE")
@@ -134,7 +169,7 @@ class Store:
         if not row:
             return None
         item = dict(row)
-        for key in ("token_hash", "evidence", "lease_until", "run_deadline", "reservation_day", "finished_day", "upload_reserved"):
+        for key in ("token_hash", "evidence", "lease_until", "run_deadline", "reservation_day", "finished_day", "upload_reserved", "worker_id"):
             item.pop(key, None)
         item["cancel_requested"] = bool(item["cancel_requested"])
         item["resource_plan"] = json.loads(item["resource_plan"]) if item.get("resource_plan") else None
@@ -208,8 +243,8 @@ class Store:
             if row["status"] != "draft": self.db.rollback(); raise ValueError("only draft jobs can be submitted")
             if row["upload_reserved"]: self.db.rollback(); raise ValueError("wait for active uploads before submitting")
             plan = estimate_resources(self._files(job_id), json.loads(row["evidence"]) if row["evidence"] else None)
-            if any(plan[key] > total for key, total in self.resource_pool.items()):
-                self.db.rollback(); raise ValueError(f"upload needs the {plan['profile']} sandbox, larger than this worker resource pool; use a larger worker or a smaller evidence set")
+            if any(plan[key] > total for key, total in self.resource_envelope.items()):
+                self.db.rollback(); raise ValueError(f"upload needs the {plan['profile']} container, larger than the per-job resource envelope; use a larger worker or a smaller evidence set")
             when = now().isoformat(timespec="microseconds")
             self.db.execute("UPDATE jobs SET status='queued',submitted_at=?,updated_at=?,resource_plan=? WHERE id=?", (when, when, json.dumps(plan), job_id))
             self._event(job_id, "system", "api", f"Assigned {plan['profile']} sandbox: {plan['cpu_milli'] // 1000} CPU, {plan['memory_mb']} MiB RAM, {plan['disk_mb']} MiB writable disk (estimate).")
@@ -264,12 +299,7 @@ class Store:
             running = self.db.execute("SELECT count(*) n FROM jobs WHERE status='running'", ()).fetchone()["n"]
             pending = self.db.execute("SELECT count(*) n FROM jobs WHERE status IN ('draft','queued')").fetchone()["n"]
             queued = self.db.execute("SELECT count(*) n FROM jobs WHERE status='queued'").fetchone()["n"]
-            allocations = [allocation(json.loads(row["resource_plan"]) if row["resource_plan"] else None) for row in self.db.execute("SELECT resource_plan FROM jobs WHERE status='running'")]
-            used = {key: sum(item[key] for item in allocations) for key in self.resource_pool}
-            next_row = self.db.execute("SELECT resource_plan FROM jobs WHERE status='queued' AND cancel_requested=0 ORDER BY submitted_at,rowid LIMIT 1").fetchone()
-            next_plan = json.loads(next_row["resource_plan"]) if next_row and next_row["resource_plan"] else None
-            resource_wait = bool(next_row) and any(used[key] + allocation(next_plan)[key] > total for key, total in self.resource_pool.items())
-        return {"day": day, "timezone": "Asia/Shanghai", "resets_at": resets_at, "daily_limit_usd": self.daily_limit, "estimated_per_job_usd": self.estimate, "spent_usd": spent, "active_reservations_usd": reserved, "admission_used_usd": spent + reserved, "max_running": self.max_running, "running": running, "max_pending": self.max_pending, "pending": pending, "queued": queued, "resource_pool": self.resource_pool, "resources_used": used, "resource_wait": resource_wait, "note": "Admission control, not a hard billing ceiling; actual worker cost may overrun its estimate."}
+        return {"day": day, "timezone": "Asia/Shanghai", "resets_at": resets_at, "daily_limit_usd": self.daily_limit, "estimated_per_job_usd": self.estimate, "spent_usd": spent, "active_reservations_usd": reserved, "admission_used_usd": spent + reserved, "max_running": self.max_running, "running": running, "max_pending": self.max_pending, "pending": pending, "queued": queued, "resource_envelope": self.resource_envelope, "resource_wait": False, "note": "Admission control, not a hard billing ceiling; each worker's advertised Docker capacity decides whether it can claim a queued job."}
 
     def _expire_leases(self) -> None:
         expired = self.db.execute("SELECT id,reservation FROM jobs WHERE status='running' AND (lease_until<? OR run_deadline<?)", (stamp(), stamp())).fetchall()
@@ -278,63 +308,74 @@ class Store:
             self.db.execute("UPDATE jobs SET status='failed',cancel_requested=1,report=?,cost_usd=?,finished_at=?,finished_day=?,updated_at=?,reservation=0 WHERE id=?", ("Worker lease or maximum runtime expired. The job was not retried automatically.", row["reservation"], finished, datetime.now(SHANGHAI).date().isoformat(), finished, row["id"]))
             self._event(row["id"], "system", "api", "Worker lease or maximum runtime expired; job marked failed without retry.")
 
-    def worker_claim(self) -> tuple[dict | None, dict]:
+    def worker_claim(self, worker_id: str, capacity: dict) -> tuple[dict | None, dict]:
+        worker_id, capacity = self._worker_identity(worker_id), self._capacity(capacity)
         with self.lock:
             self._tx(); self._expire_leases()
             budget = self.budget()
             if budget["running"] >= self.max_running or budget["admission_used_usd"] + self.estimate > self.daily_limit:
                 self.db.commit(); return None, budget
-            row = self.db.execute("SELECT * FROM jobs WHERE status='queued' AND cancel_requested=0 ORDER BY submitted_at,rowid LIMIT 1").fetchone()
+            if self.db.execute("SELECT 1 FROM jobs WHERE status='running' AND worker_id=?", (worker_id,)).fetchone():
+                self.db.commit(); return None, budget
+            row = None
+            for candidate in self.db.execute("SELECT * FROM jobs WHERE status='queued' AND cancel_requested=0 ORDER BY submitted_at,rowid"):
+                plan = json.loads(candidate["resource_plan"]) if candidate["resource_plan"] else estimate_resources(self._files(candidate["id"]), json.loads(candidate["evidence"]) if candidate["evidence"] else None)
+                if self._fits(plan, capacity):
+                    row = candidate
+                    break
             if not row: self.db.commit(); return None, budget
             plan = json.loads(row["resource_plan"]) if row["resource_plan"] else estimate_resources(self._files(row["id"]), json.loads(row["evidence"]) if row["evidence"] else None)
-            if any(budget["resources_used"][key] + plan[key] > total for key, total in self.resource_pool.items()):
-                self.db.commit(); return None, budget
             until = stamp(now() + timedelta(seconds=self.lease_seconds)); current = stamp(); day = datetime.now(SHANGHAI).date().isoformat()
             deadline = stamp(now() + timedelta(seconds=self.runtime_seconds))
-            self.db.execute("UPDATE jobs SET status='running',reservation=?,reservation_day=?,lease_until=?,run_deadline=?,updated_at=?,resource_plan=? WHERE id=?", (self.estimate, day, until, deadline, current, json.dumps(plan), row["id"]))
-            self._event(row["id"], "system", "api", "Worker lease granted.")
+            self.db.execute("UPDATE jobs SET status='running',reservation=?,reservation_day=?,lease_until=?,run_deadline=?,updated_at=?,resource_plan=?,worker_id=? WHERE id=?", (self.estimate, day, until, deadline, current, json.dumps(plan), worker_id, row["id"]))
+            self._event(row["id"], "system", "api", f"Worker lease granted to {worker_id}.")
             updated = self.db.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()
             self.db.commit()
             return self._worker(updated), self.budget()
 
-    def worker_job(self, job_id: str) -> dict | None:
+    def worker_job(self, job_id: str, worker_id: str) -> dict | None:
+        worker_id = self._worker_identity(worker_id)
         with self.lock:
             self._tx(); self._expire_leases(); self.db.commit()
-            row = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            row = self._owned_running(job_id, worker_id)
             return self._worker(row) if row else None
 
-    def worker_file(self, job_id: str, artifact_id: str) -> tuple[Path, str] | None:
+    def worker_file(self, job_id: str, artifact_id: str, worker_id: str) -> tuple[Path, str] | None:
+        worker_id = self._worker_identity(worker_id)
         with self.lock:
-            row = self.db.execute("SELECT f.name,f.stored_name FROM files f JOIN jobs j ON j.id=f.job_id WHERE f.job_id=? AND f.id=? AND j.status='running'", (job_id, artifact_id)).fetchone()
+            self._tx(); self._expire_leases(); self.db.commit()
+            row = self.db.execute("SELECT f.name,f.stored_name FROM files f JOIN jobs j ON j.id=f.job_id WHERE f.job_id=? AND f.id=? AND j.status='running' AND j.worker_id=?", (job_id, artifact_id, worker_id)).fetchone()
             if not row: return None
             path = self.upload_dir / row["stored_name"]
             return (path, row["name"]) if path.is_file() else None
 
-    def worker_event(self, job_id: str, kind: str, agent: str, message: str) -> dict:
+    def worker_event(self, job_id: str, worker_id: str, kind: str, agent: str, message: str) -> dict:
+        worker_id = self._worker_identity(worker_id)
         if kind not in EVENT_KINDS - {"system"}: raise ValueError("event kind is not allowed")
         if not clean(message, 2000): raise ValueError("message is required")
         with self.lock:
-            self._tx()
-            row = self.db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+            self._tx(); self._expire_leases()
+            row = self._owned_job(job_id, worker_id)
             if not row: self.db.rollback(); raise KeyError(job_id)
-            if row["status"] != "running": self.db.rollback(); raise ValueError("job is not running")
+            if row["status"] != "running": self.db.commit(); raise ValueError("job is not running")
             event = self._event(job_id, kind, agent or "worker", message)
             self.db.execute("UPDATE jobs SET lease_until=?,updated_at=? WHERE id=?", (stamp(now() + timedelta(seconds=self.lease_seconds)), stamp(), job_id))
             self.db.commit(); return event
 
-    def sanitize(self, job_id: str, original_description: str, sanitized_description: str) -> dict:
+    def sanitize(self, job_id: str, worker_id: str, original_description: str, sanitized_description: str) -> dict:
+        worker_id = self._worker_identity(worker_id)
         orig = clean(original_description, 12000)
         sanitized = clean(sanitized_description, 12000)
         if not sanitized:
             raise ValueError("sanitized description is required")
         with self.lock:
-            self._tx()
-            row = self.db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+            self._tx(); self._expire_leases()
+            row = self._owned_job(job_id, worker_id)
             if not row:
                 self.db.rollback()
                 raise KeyError(job_id)
             if row["status"] != "running":
-                self.db.rollback()
+                self.db.commit()
                 raise ValueError("job is not running")
             self.db.execute(
                 "UPDATE jobs SET description=?, original_description=?, sanitized_description=?, updated_at=? WHERE id=?",
@@ -343,7 +384,8 @@ class Store:
             self.db.commit()
             return self.get(job_id)
 
-    def finish(self, job_id: str, status: str, report: str, cost: float | None, metrics: object | None) -> dict:
+    def finish(self, job_id: str, worker_id: str, status: str, report: str, cost: float | None, metrics: object | None) -> dict:
+        worker_id = self._worker_identity(worker_id)
         if status not in TERMINAL: raise ValueError("invalid terminal status")
         if cost is not None and (not math.isfinite(cost) or cost < 0 or cost > 100000): raise ValueError("invalid cost")
         try: metrics_json = json.dumps(metrics or {}, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
@@ -351,9 +393,9 @@ class Store:
         report = clean_report(report)
         if not report: raise ValueError("report is required")
         with self.lock:
-            self._tx(); row = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            self._tx(); self._expire_leases(); row = self._owned_job(job_id, worker_id)
             if not row: self.db.rollback(); raise KeyError(job_id)
-            if row["status"] != "running": self.db.rollback(); raise ValueError("job is not running")
+            if row["status"] != "running": self.db.commit(); raise ValueError("job is not running")
             if row["cancel_requested"]: status = "cancelled"
             charged = row["reservation"] if cost is None else cost
             finished = stamp(); self.db.execute("UPDATE jobs SET status=?,report=?,metrics=?,cost_usd=?,reservation=0,lease_until=NULL,run_deadline=NULL,finished_at=?,finished_day=?,updated_at=? WHERE id=?", (status, report, metrics_json, charged, finished, datetime.now(SHANGHAI).date().isoformat(), finished, job_id))

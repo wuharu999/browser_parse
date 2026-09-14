@@ -13,17 +13,17 @@ ROBOT_CODEX_API_KEY_ENV=DEEPSEEK_API_KEY
 DEEPSEEK_API_KEY=replace-locally-never-commit
 ```
 
-Keep the Cube settings from `.env.example`. Run the API and worker with `uv run --env-file .env ...` as described in the README. No host Codex fallback was added. The wrapper writes a job-local catalog for the current `deepseek-flash` and compatible legacy DeepSeek IDs, uses environment-based credentials, disables WebSockets/web search, and retains the two native subagent roles. Its catalog was matched to the installed [Codex 0.153.4 schema](https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/protocol/src/openai_models.rs). Existing OpenAI/custom-provider settings still work; without explicit environment settings the worker's legacy default remains Luna.
+Keep provider settings in each worker's protected environment file. The Docker worker injects them only into its one job container and never falls back to host Codex execution. The wrapper writes a job-local catalog for the current `deepseek-flash` and compatible legacy DeepSeek IDs, uses environment-based credentials, disables WebSockets/web search, and retains the two native subagent roles. Its catalog was matched to the installed [Codex 0.153.4 schema](https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/protocol/src/openai_models.rs). Existing OpenAI/custom-provider settings still work; without explicit environment settings the worker's legacy default remains Luna.
 
 `deepseek-v4-flash-vision-exp` is selected explicitly at the user's request. DeepSeek documents it as a retired compatibility alias served by the current vision model, `deepseek-flash`; the application does not silently rewrite the requested ID. A tiny authenticated image call using the exact requested alias returned HTTP 200 and correctly read the screenshot heading, with `deepseek-flash` in the response's model field (214 input + 6 output tokens). The authenticated model listing advertised `deepseek-flash` and `deepseek-v4-pro`. These are provider/image-call observations, not native-subagent proof. `deepseek-v4-flash` and `deepseek-v4-pro` remain text-only in our catalog. Extracting PDF text with Poppler works independently, but PDF charts/screenshots require vision or OCR. [DeepSeek vision guide](https://api-docs.deepseek.com/guides/vision/) and [Codex integration](https://api-docs.deepseek.com/quick_start/agent_integrations/codex/)
 
-The ignored local environment has provider credentials and a healthy Cube development VM; credentials are never part of the image or repository. See [local setup](local-sandbox.md) and [current validation results](../PROGRESS.md) for the distinction between direct image tests, sandbox execution and native-subagent proof. Before public use, validate representative jobs, image/PDF handling, provider usage and whole-VM termination. No VPN software is required by the application itself; the worker must still reach its chosen provider and Cube endpoint. The previous machine checks had an active tunnel and do not establish VPN-free access.
+Credentials are never part of the image or repository. See [the Docker worker runbook](docker-worker.md) and [current validation results](../PROGRESS.md) for the distinction between direct image tests, container execution and native-subagent proof. Before public use, validate representative jobs, image/PDF handling, provider usage and whole-container termination. A job can reach only the exact provider allowlist configured in Squid; update it when the configured provider changes.
 
 ## Qwen alternative: OpenCode
 
 Alibaba's documented OpenAI-compatible interface uses Chat Completions. Do not point the current Codex Responses runner at a Chat Completions URL and call it compatible. OpenCode supports configurable providers and native subagents, so it is the next integration candidate if Qwen is selected. Its shared `.agents/skills/` discovery can reuse our evidence/PDF skills. Use stable `/docs/`, not the separate `/v2/docs/` configuration schema. [Alibaba text generation](https://www.alibabacloud.com/help/en/model-studio/text-generation), [OpenCode providers](https://opencode.ai/docs/providers/), [agents](https://opencode.ai/docs/agents/), [skills](https://opencode.ai/docs/skills/)
 
-An illustrative **in-sandbox** OpenCode configuration for Beijing PAYG API access is:
+An illustrative **in-job-container** OpenCode configuration for Beijing PAYG API access is:
 
 ```json
 {
@@ -45,7 +45,7 @@ An illustrative **in-sandbox** OpenCode configuration for Beijing PAYG API acces
 
 Use the endpoint matching the key's region; do not mix international keys with Beijing URLs. Production robot-log processing should use pay-as-you-go API credentials, not assume a personal coding subscription permits a multiuser backend. Configuration above is a documented starting point, **not installed or wired into this worker**.
 
-OpenCode's headless command is `opencode run --format json --dir /workspace --model alibaba-qwen/qwen3-coder-flash`. A future adapter should preserve `job.json`, `activity.jsonl`, `result.json`, sandbox isolation, cancellation and the public review API. Change only the in-VM command/config/event parser; keep the public UI and Python queue. Do not start a shared privileged OpenCode server for all users. [OpenCode CLI](https://opencode.ai/docs/cli/)
+OpenCode's headless command is `opencode run --format json --dir /workspace --model alibaba-qwen/qwen3-coder-flash`. A future adapter should preserve `job.json`, `activity.jsonl`, `result.json`, container isolation, cancellation and the public review API. Change only the job-container command/config/event parser; keep the public UI and Python queue. Do not start a shared privileged OpenCode server for all users. [OpenCode CLI](https://opencode.ai/docs/cli/)
 
 ## Offline cost estimator
 

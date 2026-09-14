@@ -32,3 +32,6 @@ knowledge/wiki/
 *.sqlite3-shm
 *.sqlite3-wal
 sandbox/.runtime/
+
+# Local deployment bundles and checksums.
+releases/

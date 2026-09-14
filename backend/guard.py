@@ -2,7 +2,7 @@
 
 Security Architecture:
 - R1: Inspects user incident descriptions and non-log attachments (PDFs, text docs,
-      and vision images if model supports vision) before Cube sandbox provisioning.
+      and vision images if model supports vision) before job container provisioning.
 - R2: Implements a 3-tier verdict model (CLEAN, SUSPICIOUS, INJECTION) based on
       OWASP Top 10 for LLM Applications (LLM01:2025 Prompt Injection).
 - R3: Implements safe fail-closed error handling with 1 retry upon network or
@@ -47,7 +47,7 @@ class GuardResult:
     sanitized_description: str | None = None
 
 
-# Known log and machine telemetry extensions that are processed inside the Cube sandbox,
+# Known log and machine telemetry extensions that are processed inside the job container,
 # rather than as user-authored document attachments on the host.
 LOG_EXTENSIONS = {
     ".log", ".journal", ".dmesg", ".trace", ".out", ".err",

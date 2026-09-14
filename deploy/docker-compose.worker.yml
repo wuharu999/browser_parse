@@ -1,0 +1,39 @@
+services:
+  egress-proxy:
+    # Canonical-maintained Squid, pinned to the amd64 digest for tag 6.6-24.04_beta.
+    image: ubuntu/squid@sha256:8fafd41d6ddceb295d26eea9938321d825ac5351c7e46cf6a8aa5d093b8ed1ce
+    container_name: robot-egress-proxy
+    restart: unless-stopped
+    user: "13:13"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    pids_limit: 128
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "3"
+    tmpfs:
+      - /run:rw,noexec,nosuid,size=16m,uid=13,gid=13
+      - /var/spool/squid:rw,noexec,nosuid,size=256m,uid=13,gid=13
+    volumes:
+      - ./squid.conf:/etc/squid/squid.conf:ro
+    networks:
+      jobs:
+        aliases: [robot-egress-proxy]
+      egress: {}
+
+networks:
+  # No external route. gateway_mode=isolated closes the bridge-gateway host path;
+  # IPv6 is disabled rather than providing a second route.
+  jobs:
+    name: robot-analysis-jobs
+    internal: true
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+  egress:
+    name: robot-analysis-egress

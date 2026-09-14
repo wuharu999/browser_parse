@@ -2,7 +2,7 @@
 """Bounded local resource sampler for a sandbox-run analysis process tree.
 
 It never starts workloads or calls an API. Invoke it alongside an explicitly
-started local/Cube-connected workload with a PID visible to this Linux host.
+started local/container workload with a PID visible to this Linux host.
 """
 from __future__ import annotations
 

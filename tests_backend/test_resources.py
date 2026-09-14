@@ -3,7 +3,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from backend.resources import GIB, MIB, PROFILES, estimate_resources
+from backend.resources import GIB, MIB, estimate_resources
 from backend.store import Store
 
 
@@ -43,43 +43,45 @@ class ResourceQueueTests(unittest.TestCase):
         self.store.add_file(job["id"], name, "fixture", size, "0" * 64, size)
         return self.store.submit(job["id"])
 
-    def test_large_runs_alone_and_cancellation_keeps_resource_reservation(self):
-        large = self.job(size=600 * MIB); small = self.job()
-        running, _ = self.store.worker_claim()
-        self.assertEqual(running["id"], large["id"])
-        self.assertIsNone(self.store.worker_claim()[0])
-        self.assertEqual(self.store.budget()["resources_used"], PROFILES["large"])
-        self.assertTrue(self.store.budget()["resource_wait"])
-        self.store.cancel(large["id"])
-        self.assertIsNone(self.store.worker_claim()[0])
-        self.store.finish(large["id"], "cancelled", "test stopped", 0, {})
-        self.assertEqual(self.store.worker_claim()[0]["id"], small["id"])
+    @staticmethod
+    def capacity(cpu=4000, memory=8192, disk=32768):
+        return {"cpu_milli": cpu, "memory_mb": memory, "disk_mb": disk}
 
-    def test_concurrent_claims_cannot_overallocate_two_standard_jobs(self):
+    def test_two_large_jobs_fit_on_two_capable_workers_and_cancellation_keeps_reservation(self):
+        large = self.job(size=600 * MIB); second_large = self.job(size=600 * MIB)
+        small = self.job()
+        running, _ = self.store.worker_claim("machine-a", self.capacity())
+        self.assertEqual(running["id"], large["id"])
+        another, _ = self.store.worker_claim("machine-b", self.capacity())
+        self.assertEqual(another["id"], second_large["id"])
+        self.assertEqual(self.store.budget()["running"], 2)
+        self.store.cancel(large["id"])
+        self.assertIsNone(self.store.worker_claim("machine-c", self.capacity())[0])
+        self.store.finish(large["id"], "machine-a", "cancelled", "test stopped", 0, {})
+        self.assertEqual(self.store.worker_claim("machine-c", self.capacity())[0]["id"], small["id"])
+
+    def test_concurrent_distinct_claimers_cannot_overallocate_global_two_slots(self):
         for _ in range(3): self.job("scan.pdf")
         with ThreadPoolExecutor(max_workers=3) as pool:
-            claimed = list(pool.map(lambda _: self.store.worker_claim()[0], range(3)))
+            claimed = list(pool.map(lambda index: self.store.worker_claim(f"machine-{index}", self.capacity())[0], range(3)))
         self.assertEqual(sum(job is not None for job in claimed), 2)
-        self.assertEqual(self.store.budget()["resources_used"], {"cpu_milli": 4000, "memory_mb": 8192, "disk_mb": 32768})
 
-    def test_fifo_does_not_starve_large_job_behind_small(self):
-        first = self.job(); large = self.job(size=600 * MIB); self.job()
-        self.assertEqual(self.store.worker_claim()[0]["id"], first["id"])
-        self.assertIsNone(self.store.worker_claim()[0])
-        self.store.finish(first["id"], "completed", "test", 0, {})
-        self.assertEqual(self.store.worker_claim()[0]["id"], large["id"])
+    def test_one_worker_has_one_active_job(self):
+        first, second = self.job(), self.job()
+        self.assertEqual(self.store.worker_claim("machine-a", self.capacity())[0]["id"], first["id"])
+        self.assertIsNone(self.store.worker_claim("machine-a", self.capacity())[0])
+        self.assertEqual(self.store.worker_claim("machine-b", self.capacity())[0]["id"], second["id"])
 
-    def test_cpu_and_disk_are_gates_and_plan_persists(self):
-        job = self.job("scan.pdf")
-        self.store.resource_pool["cpu_milli"] = 2000
-        self.store.worker_claim(); self.job()
-        self.assertIsNone(self.store.worker_claim()[0])
-        self.assertEqual(self.store.get(job["id"])["resource_plan"]["profile"], "standard")
-        self.store.resource_pool["disk_mb"] = 8192
-        with self.assertRaisesRegex(ValueError, "larger than this worker"):
-            self.job("scan.pdf")
+    def test_capacity_skips_unsuitable_older_job_and_keeps_fifo_among_fit_jobs(self):
+        large = self.job(size=600 * MIB)
+        small = self.job()
+        claimed, _ = self.store.worker_claim("small-host", self.capacity(cpu=1000, memory=2048, disk=8192))
+        self.assertEqual(claimed["id"], small["id"])
+        self.assertEqual(self.store.get(large["id"])["status"], "queued")
+        self.assertEqual(self.store.get(small["id"])["resource_plan"]["profile"], "small")
 
-    def test_legacy_running_job_is_not_counted_as_free(self):
-        job = self.job(); self.store.worker_claim()
-        self.store.db.execute("UPDATE jobs SET resource_plan=NULL WHERE id=?", (job["id"],)); self.store.db.commit()
-        self.assertEqual(self.store.budget()["resources_used"], PROFILES["standard"])
+    def test_malformed_capacity_is_rejected(self):
+        self.job()
+        for capacity in ({}, {"cpu_milli": 1, "memory_mb": 1, "disk_mb": 0}, {"cpu_milli": True, "memory_mb": 1, "disk_mb": 1}):
+            with self.assertRaisesRegex(ValueError, "worker capacity"):
+                self.store.worker_claim("machine-a", capacity)
