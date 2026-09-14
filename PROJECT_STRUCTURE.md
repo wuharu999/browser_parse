@@ -51,23 +51,24 @@ browser_parse/
 │   ├── store.py               # SQLite queue, budget reservations, claims and versions
 │   ├── resources.py           # Deterministic upload-driven CPU/RAM/disk profiles
 │   ├── guard.py               # Pre-execution LLM security guard (OWASP injection detection & prompt sanitization)
-│   └── worker.py              # Cube-only transfers, security guard gate, concurrency, cancel and timeout
+│   └── worker.py              # Cube-only transfers, security guard gate, virtualenv injection, token-based cost, cancel & timeout
 ├── sandbox/
-│   ├── Dockerfile             # Boot-tested reusable Cube image; Codex + Poppler
+│   ├── Dockerfile             # Boot-tested reusable Cube image; Codex + Poppler + Python analysis venv
 │   ├── requirements.in / .lock # Hashed Python analysis dependencies, built with uv
 │   ├── check_environment.py   # Offline file-format/OCR/import fixtures
 │   ├── HostVM.Dockerfile       # Unprivileged Docker wrapper for local QEMU tools
-│   ├── run_codex.py           # In-VM headless runner and bounded public telemetry
+│   ├── run_codex.py           # In-VM headless runner, virtualenv auto-sourcing, .db3 pre-scan, and subagent supervisor
 │   └── runtime/
-│       ├── MAIN_PROMPT.md     # Main analysis prompt shared across jobs
+│       ├── MAIN_PROMPT.md     # Main analysis prompt with 3-subagent delegation guidance
 │       ├── ENVIRONMENT.md     # File-type tools and prebuilt image constraints
 │       ├── evidence.py        # Bounded wiki/log retrieval and SQLite FTS index
-│       ├── .codex/agents/     # Log investigator and evidence reviewer roles
+│       ├── .codex/agents/     # Subagent definitions (log_investigator, telemetry_investigator, evidence_reviewer)
 │       └── .agents/skills/    # Sandbox context, robot evidence and PDF-reading skills
 ├── knowledge/
 │   ├── README.md              # Wiki location and indexing guidance
 │   └── wiki/                  # Local wiki copy, intentionally Git-ignored
-├── tests_backend/             # API, security guard pipeline, mocked Cube worker, runner and evidence checks
+├── tests_backend/             # API, guard pipeline, mock Cube worker, runner, telemetry scanner and evidence checks
+│   ├── test_runner.py         # Unit tests for runner, concurrency, virtualenv, evidence compaction, and db3 scan
 └── tests/
     ├── sources.test.ts        # TAR/GZIP/ZIP, safety limits and source identities
     ├── lines.test.ts          # UTF-8, CRLF, oversized and damaged lines

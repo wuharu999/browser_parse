@@ -1,5 +1,35 @@
 # Analysis service progress
 
+## Codex runtime optimization, specialized subagents & preprocessing bridge — 2026-09-14
+
+- Implemented tiered reasoning architecture:
+  - Main orchestrator in `sandbox/run_codex.py` uses `ROBOT_CODEX_REASONING_EFFORT` (defaulting to `"high"`).
+  - Subagents in `sandbox/runtime/.codex/agents/*.toml` explicitly set to `model_reasoning_effort = "low"`,
+    reducing iterative thinking latency from ~70s down to ~8s per turn.
+  - Concurrency expanded to `max_concurrent_threads_per_session = 3`.
+- Established 3-subagent specialization roster:
+  - `log_investigator`: Text logs and journald inspection with inlined tool commands (`rg`, `evidence.py log-context`, `head`, `tail`).
+  - `telemetry_investigator` (NEW): Dedicated specialist for ROS2 SQLite `.db3` bags, odometry, `/sbus_data` joystick, and joint telemetry.
+  - `evidence_reviewer`: Counterevidence and hypothesis validation against hardware manuals and wiki pages.
+  - Inlined diagnostic CLI usage patterns directly into `developer_instructions`, eliminating redundant initial turns spent reading `SKILL.md`.
+  - Whitelisted in `sandbox/run_codex.py` (`SAFE_AGENTS`, `observed_children`) and `backend/worker.py` (`_activity` filter).
+- Frontend UI process grid:
+  - `src/main.ts`: Added `📊 Telemetry Investigator` to the 4-card process grid with live status and output drawers.
+  - Preserved page and inner transcript scroll positions across 3-second live poll intervals in `renderResult()`.
+  - Conditioned the Cube VM abstraction card to render only on active analyses (running/queued/draft), keeping history clean.
+- Sandbox Python virtualenv auto-sourcing:
+  - `backend/worker.py::_sandbox_env()` prioritizes `/opt/analysis-venv/bin` in `PATH` and exports `VIRTUAL_ENV=/opt/analysis-venv`.
+  - `sandbox/run_codex.py::_setup_virtualenv()` automatically detects `/opt/analysis-venv` at startup, updating `os.environ`, `sys.path`, and writing activation hooks to `/etc/profile.d/analysis_venv.sh` and `/workspace/.bashrc` with `BASH_ENV` configured. Subshells and Codex tool executions run with full package access (`rosbags`, `mcap`, `numpy`, `pandas`, `pypdf`, `h5py`).
+- Preprocessing pipeline bridge:
+  - `sandbox/run_codex.py::_compact_evidence()` preserves structured browser `LogPackage` metadata (`totals`, up to 30 files, up to 20 patterns, and up to 25 evidence entries) while stripping raw line payloads, providing file sizes, line counts, timestamps, and error patterns immediately on Turn 1.
+  - Fast (<0.5s) read-only SQLite `.db3` topic and timestamp scanner (`_scan_db3_telemetry`) extracts topic names, message counts, and nanosecond timestamp bounds, formatting them directly into the Turn 1 prompt.
+- Token-based cost estimation and auto model selection:
+  - SDK token counts settled against DeepSeek pricing snapshot (`deepseek-v4-flash`: $0.44/1M in, $1.32/1M out, 10% cache rate).
+  - Automatically selects `deepseek-v4-flash` for non-vision jobs, routing around multimodal overhead when no images or PDFs are present.
+  - Extended job timeout in `.env` to 1800s (30 minutes) to prevent premature timeouts on complex bag analyses.
+- Expanded backend test suite from 104 to 126 tests (`tests_backend/test_runner.py`), covering virtualenv auto-activation, evidence compaction, and SQLite `.db3` telemetry pre-scanning with synthetic database fixtures.
+- Full verification: 126 backend tests and 48 frontend tests pass 100% green; clean TypeScript build.
+
 ## Pre-execution LLM security guard (prompt injection defense) — 2026-09-11
 
 - Implemented host-side pre-execution security inspection (`backend/guard.py`)

@@ -134,16 +134,43 @@ Before provisioning any CubeSandbox VM or launching Codex, the worker runs an au
   - Automatically reuses configured Codex credentials (`ROBOT_CODEX_PROVIDER_URL` and `ROBOT_CODEX_API_KEY`).
   - Supports optional model/provider overrides via `ROBOT_GUARD_MODEL`, `ROBOT_GUARD_PROVIDER_URL`, and `ROBOT_GUARD_API_KEY`.
 
+### Codex Execution & Preprocessing Optimization
+
+To prevent exploratory tool stalls, redundant skill reads, and multi-minute reasoning latencies, the workbench employs a multi-tiered execution and preprocessing architecture:
+
+- **Tiered Reasoning Architecture**:
+  - **Orchestrator**: Runs with `model_reasoning_effort = "high"` (configurable via `ROBOT_CODEX_REASONING_EFFORT`, default `high`) for comprehensive task planning and final evidence-based report synthesis.
+  - **Subagents**: Explicitly configured with `model_reasoning_effort = "low"` across all subagent `.toml` files, reducing per-turn thinking latency from ~70s down to ~8s during iterative tool calls.
+  - **Concurrency**: `max_concurrent_threads_per_session = 3` allows up to three subagents to run without thread blocking.
+- **Three-Subagent Specialization Roster**:
+  - **`log_investigator`**: Specialized in text logs, journald streams, and error keyword scanning (`rg`, `evidence.py log-context`, `head`, `tail`).
+  - **`telemetry_investigator`**: Specialized in ROS/ROS2 SQLite `.db3` bags, IMU drift, `/sbus_data` joystick streams, and joint states.
+  - **`evidence_reviewer`**: Dedicated to hypothesis verification, counterevidence testing, and hardware manual/wiki cross-checking.
+  - **Inlined Tool Commands**: Critical CLI usage patterns are inlined directly into `developer_instructions` in `.codex/agents/*.toml`, eliminating redundant turns spent reading `SKILL.md` before tool execution.
+- **Frontend Process Grid Integration**:
+  - `src/main.ts` renders a live 4-card process grid (`Codex Orchestrator`, `Log Investigator`, `Telemetry Investigator`, and `Evidence Reviewer`) with live status badges and expandable intermediate output inspection drawers.
+  - Page and transcript scroll positions are automatically preserved across 3-second live poll intervals (`renderResult`).
+  - The Cube VM abstraction card is cleanly scoped to active analyses (running/queued/draft) and hidden on completed history views.
+- **Sandbox Python Virtualenv Auto-Sourcing**:
+  - `backend/worker.py::_sandbox_env()` prioritizes `/opt/analysis-venv/bin` in `PATH` and exports `VIRTUAL_ENV=/opt/analysis-venv`.
+  - `sandbox/run_codex.py::_setup_virtualenv()` automatically detects and activates pre-installed virtualenvs at startup, updating `os.environ`, `sys.path`, and writing activation hooks to `/etc/profile.d/analysis_venv.sh` and `/workspace/.bashrc` with `BASH_ENV` configured. Subshells and Codex tool executions run with full package access (`rosbags`, `mcap`, `numpy`, `pandas`, `pypdf`, `h5py`).
+- **Preprocessing Pipeline Bridge**:
+  - `sandbox/run_codex.py::_compact_evidence()` preserves structured browser `LogPackage` metadata (`totals`, up to 30 files, up to 20 patterns, and up to 25 evidence entries) while stripping raw line payloads, providing file sizes, line counts, timestamps, and error patterns immediately on Turn 1.
+  - Fast (<0.5s) read-only SQLite `.db3` topic and timestamp scanner (`_scan_db3_telemetry`) extracts topic names, message counts, and nanosecond timestamp bounds, formatting them directly into the Turn 1 prompt.
+- **Token-Based Cost Settlement**:
+  - Token counts (`input_tokens`, `output_tokens`, `cached_tokens`) reported by the SDK are settled using snapshot rates (`deepseek-v4-flash`: $0.44/1M in, $1.32/1M out, 10% cache rate).
+  - Automatically selects `deepseek-v4-flash` for non-vision jobs, routing around multimodal overhead when no images or PDFs are present.
+
 Resource sizing is automatic and token-free: small (1 CPU/2 GiB), standard (2 CPU/4 GiB), or large (4 CPU/8 GiB), selected from uploaded sizes, file types and browser expansion hints. Configure matching `CUBE_TEMPLATES_JSON` IDs and the API's resource pool before starting the worker; missing/mismatched templates fail closed. The current local VM supports small/standard only. See [resource profiles](docs/resource-profiles.md) for thresholds, queue reservations, prepared packages and the no-model sandbox verification command.
 
 Reports include **Back to upload** controls that preserve the current draft. The shared daily allowance bar distinguishes accounted estimates, running reservations and remaining allowance; it indicates when new work can queue or when pending slots are full. It is not a provider billing or real-time CPU/RAM usage meter.
 
 The model key enters the sandbox and is accessible to a full-permission agent. Use a dedicated, restricted-budget provider key and limit sandbox network access externally. Provider replacement uses `ROBOT_CODEX_PROVIDER_URL`, `ROBOT_CODEX_API_KEY_ENV` and `ROBOT_CODEX_MODEL`; the endpoint must be compatible with Codex's Responses protocol. Arbitrary providers are not automatically supported.
 
-Defaults admit at most two concurrent jobs, with 20 pending/uploading jobs and a USD 5 reservation per job against a **USD 10 Asia/Shanghai-day admission cap**. Active reservations count across midnight. Unknown actual cost is conservatively settled at the reservation. This is **not verified billing or a hard USD 10 final-charge ceiling**: in-flight jobs finish and can exceed estimates. The requested DeepSeek vision alias completed a 93-second synthetic log/image pilot with two native subagents; the aggregate provider bill remains unknown. The local pilot uses one worker and a 600-second timeout. CPU/RAM/disk allocation is selected in the Cube template; tiny-case observations and provisional cloud sizing are separated in [resource profiles](docs/resource-profiles.md).
+Defaults admit at most two concurrent jobs, with 20 pending/uploading jobs and a USD 5 reservation per job against a **USD 10 Asia/Shanghai-day admission cap**. Active reservations count across midnight. Unknown actual cost is conservatively settled at the reservation. This is **not verified billing or a hard USD 10 final-charge ceiling**: in-flight jobs finish and can exceed estimates. The requested DeepSeek vision alias completed a 93-second synthetic log/image pilot with two native subagents; the aggregate provider bill remains unknown. The local pilot uses one worker and an 1800-second (30-minute) timeout. CPU/RAM/disk allocation is selected in the Cube template; tiny-case observations and provisional cloud sizing are separated in [resource profiles](docs/resource-profiles.md).
 
 ```sh
-uv run python -m unittest discover -s tests_backend -v
+PYTHONPATH=. pytest tests_backend -v
 npm test
 npm run build
 ```
