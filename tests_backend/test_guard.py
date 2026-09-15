@@ -95,6 +95,8 @@ class CompletedProcess:
 
 class FakeDockerRuntime:
     created: list[FakeDockerJob] = []
+    data_dir = Path("/fake/docker-root")
+
     def available_capacity(self, maxima, memory_reserve_mb=1024): return maxima
     def preflight(self): pass
     def cleanup_orphans(self): pass

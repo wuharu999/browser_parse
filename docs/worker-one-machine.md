@@ -130,7 +130,8 @@ ROBOT_WORKER_PARALLEL=1
 ROBOT_DOCKER_IMAGE=sha256:PASTE_THE_LOCAL_IMAGE_ID_FROM_INSPECT
 ROBOT_DOCKER_NETWORK=robot-analysis-jobs
 ROBOT_EGRESS_PROXY_URL=http://robot-egress-proxy:3128
-ROBOT_DOCKER_DATA_DIR=/var/lib/docker
+# Leave blank to detect the local daemon DockerRootDir automatically.
+ROBOT_DOCKER_DATA_DIR=
 
 # Per-job maxima. Keep headroom for Docker, the OS, image layers and the proxy.
 ROBOT_WORKER_CPU_MILLI=4000

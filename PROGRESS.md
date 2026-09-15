@@ -1,5 +1,13 @@
 # Analysis service progress
 
+## Upload visibility and automatic Docker storage detection — 2026-09-15
+
+- Replaced file-upload fetch calls with raw-body XHR progress: exact byte counts, per-file count/name, average speed, ETA, and a 10-second no-progress warning. Fully transmitted bytes wait for server acceptance before submission.
+- Added submission-lifetime refresh protection and best-effort screen wake lock, including visibility/release races and cleanup. HTTP public origins cannot use screen wake lock; background continuation is not guaranteed. Cancelling while draft creation is pending retains the response ID so the draft can be cancelled.
+- Worker preflight detects the local daemon's actual DockerRootDir and checks that filesystem for capacity and runtime disk health. Empty or legacy default configuration auto-detects; another explicit path remains an expected-path assertion. Detection does not move data or reclaim disk space.
+- Validation: 58 frontend tests, 129 backend tests, and production build passed. Real localhost browser uploads verified byte progress, stall/recovery, English/Chinese text, two-file ordering, native refresh confirmation, cancel/completion cleanup, cancellation during delayed draft creation, and no horizontal overflow at 390 pixels. These were synthetic tests without ECS/model calls.
+- All temporary local test services were stopped. ECS SSH still closed before authentication, so these changes have not been deployed to ECS by this session. No Worker SSH was attempted.
+
 ## Docker worker migration — 2026-09-14
 
 - Replaced the Cube SDK/configuration and KVM image base with a local Docker runtime. The two worker machines poll ECS independently; there is no peer networking or shared worker storage.

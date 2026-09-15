@@ -26,6 +26,7 @@ class FinishedProcess:
 
 class FakeDockerRuntime:
     def __init__(self) -> None:
+        self.data_dir = Path("/fake/docker-root")
         self.created: list[tuple[str, dict, dict]] = []
         self.copied: dict[str, bytes] = {}
         self.started: list[DockerJob] = []
@@ -192,6 +193,7 @@ class DockerWorkerTests(unittest.TestCase):
         # Exercise the real capacity calculation with the remote screenshot's
         # 10169 MiB free, rather than a fake pre-computed capacity dictionary.
         worker.runtime._info = {"NCPU": 8, "MemTotal": 16 * 1024**3}
+        worker.runtime.data_dir = Path("/var/lib/docker")
         output = io.StringIO()
         with patch("backend.docker_runtime.Path.read_text", return_value="MemAvailable: 12582912 kB\n"), patch(
             "backend.docker_runtime.shutil.disk_usage", return_value=SimpleNamespace(free=10169 * 1024**2)

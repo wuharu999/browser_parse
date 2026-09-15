@@ -12,7 +12,7 @@ from backend.docker_runtime import DockerError, DockerRuntime
 
 
 class DockerRuntimePreflightTests(unittest.TestCase):
-    def runtime(self, directory: Path) -> DockerRuntime:
+    def runtime(self, directory: Path | None) -> DockerRuntime:
         return DockerRuntime(
             image="sha256:" + "a" * 64,
             network="robot-analysis-jobs",
@@ -58,6 +58,83 @@ class DockerRuntimePreflightTests(unittest.TestCase):
             with patch.object(DockerRuntime, "_run", side_effect=fake_run):
                 runtime.preflight()
             self.assertEqual(runtime.image, "sha256:" + "b" * 64)
+            self.assertEqual(runtime.data_dir, directory.resolve())
+
+    def test_preflight_discovers_relocated_root_when_no_path_is_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"DOCKER_HOST": "unix:///var/run/docker.sock"}, clear=True):
+            directory = Path(temporary)
+            responses = self.responses(directory)
+
+            def fake_run(args, **_kwargs):
+                return subprocess.CompletedProcess(args, 0, responses[args[0]], "")
+
+            runtime = self.runtime(None)
+            with patch.object(DockerRuntime, "_run", side_effect=fake_run):
+                runtime.preflight()
+            self.assertEqual(runtime.expected_data_dir, None)
+            self.assertEqual(runtime.data_dir, directory.resolve())
+
+    def test_preflight_rejects_mismatched_explicit_root(self) -> None:
+        with tempfile.TemporaryDirectory() as actual, tempfile.TemporaryDirectory() as expected, patch.dict(os.environ, {"DOCKER_HOST": "unix:///var/run/docker.sock"}, clear=True):
+            responses = self.responses(Path(actual))
+
+            def fake_run(args, **_kwargs):
+                return subprocess.CompletedProcess(args, 0, responses[args[0]], "")
+
+            with patch.object(DockerRuntime, "_run", side_effect=fake_run):
+                with self.assertRaisesRegex(DockerError, "does not match"):
+                    self.runtime(Path(expected)).preflight()
+
+    def test_preflight_rejects_missing_or_unavailable_reported_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"DOCKER_HOST": "unix:///var/run/docker.sock"}, clear=True):
+            responses = self.responses(Path(temporary))
+            reported = json.loads(responses["info"])
+            reported["DockerRootDir"] = "/not/a/real/docker-root"
+            responses["info"] = json.dumps(reported)
+
+            def fake_run(args, **_kwargs):
+                return subprocess.CompletedProcess(args, 0, responses[args[0]], "")
+
+            with patch.object(DockerRuntime, "_run", side_effect=fake_run):
+                with self.assertRaisesRegex(DockerError, "unavailable DockerRootDir"):
+                    self.runtime(None).preflight()
+
+    def test_preflight_rejects_malformed_reported_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"DOCKER_HOST": "unix:///var/run/docker.sock"}, clear=True):
+            responses = self.responses(Path(temporary))
+            reported = json.loads(responses["info"])
+            reported["DockerRootDir"] = ["not-a-path"]
+            responses["info"] = json.dumps(reported)
+
+            def fake_run(args, **_kwargs):
+                return subprocess.CompletedProcess(args, 0, responses[args[0]], "")
+
+            with patch.object(DockerRuntime, "_run", side_effect=fake_run):
+                with self.assertRaisesRegex(DockerError, "usable DockerRootDir"):
+                    self.runtime(None).preflight()
+
+    def test_capacity_uses_detected_root_filesystem(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"DOCKER_HOST": "unix:///var/run/docker.sock"}, clear=True):
+            directory = Path(temporary)
+            responses = self.responses(directory)
+            observed: list[Path] = []
+
+            def fake_run(args, **_kwargs):
+                return subprocess.CompletedProcess(args, 0, responses[args[0]], "")
+
+            class DiskUsage:
+                free = 100 * 1024**2
+
+            def disk_usage(path):
+                observed.append(Path(path))
+                return DiskUsage()
+
+            runtime = self.runtime(None)
+            with patch.object(DockerRuntime, "_run", side_effect=fake_run), patch("backend.docker_runtime.shutil.disk_usage", side_effect=disk_usage):
+                runtime.preflight()
+                capacity = runtime.available_capacity({"cpu_milli": 4000, "memory_mb": 8192, "disk_mb": 500})
+            self.assertEqual(observed, [directory.resolve(), directory.resolve()])
+            self.assertEqual(capacity["disk_mb"], 99)
 
     def test_preflight_rejects_network_that_can_route_or_enable_ipv6(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"DOCKER_HOST": "unix:///var/run/docker.sock"}, clear=True):
@@ -71,9 +148,12 @@ class DockerRuntimePreflightTests(unittest.TestCase):
                 key = args[0]
                 return subprocess.CompletedProcess(args, 0, responses[key], "")
 
+            runtime = self.runtime(directory)
             with patch.object(DockerRuntime, "_run", side_effect=fake_run):
                 with self.assertRaisesRegex(DockerError, "internal bridge"):
-                    self.runtime(directory).preflight()
+                    runtime.preflight()
+            self.assertEqual(runtime._info, {})
+            self.assertIsNone(runtime.data_dir)
 
     def test_output_reader_rejects_untrusted_paths_before_docker_execution(self) -> None:
         runtime = self.runtime(Path("/tmp"))

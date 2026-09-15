@@ -172,7 +172,7 @@ class WorkerConfig:
     docker_image: str
     docker_network: str
     egress_proxy_url: str
-    docker_data_dir: Path
+    docker_data_dir: Path | None
     codex_model: str
     codex_provider_url: str | None
     codex_api_key_env: str
@@ -212,6 +212,15 @@ class WorkerConfig:
         guard_api_key = os.environ.get("ROBOT_GUARD_API_KEY") or os.environ.get("ROBOT_CODEX_API_KEY") or codex_key
         # R1.3: Enable the guard by default in worker runtime, defaulting to ROBOT_CODEX_* settings
         guard_enabled = os.environ.get("ROBOT_GUARD_ENABLED", "").lower() not in {"0", "false", "no", "off"}
+        configured_data_dir = os.environ.get("ROBOT_DOCKER_DATA_DIR")
+        # /var/lib/docker was the previous implicit default.  Preserve it only
+        # as a compatibility value, not an assertion that blocks a relocated
+        # daemon. Any other explicit path must match DockerRootDir exactly.
+        expected_data_dir = (
+            Path(configured_data_dir)
+            if configured_data_dir and configured_data_dir != "/var/lib/docker"
+            else None
+        )
         config = cls(
             api_url=_env("ROBOT_API_URL", "http://127.0.0.1:8000").rstrip("/"),
             worker_token=_env("ROBOT_WORKER_TOKEN", required=True),
@@ -219,7 +228,7 @@ class WorkerConfig:
             docker_image=_env("ROBOT_DOCKER_IMAGE", required=True),
             docker_network=_env("ROBOT_DOCKER_NETWORK", required=True),
             egress_proxy_url=_env("ROBOT_EGRESS_PROXY_URL", required=True),
-            docker_data_dir=Path(_env("ROBOT_DOCKER_DATA_DIR", "/var/lib/docker")),
+            docker_data_dir=expected_data_dir,
             codex_model=codex_model,
             codex_provider_url=codex_provider_url,
             codex_api_key_env=key_env,
@@ -647,7 +656,7 @@ class DockerWorker:
             available = ", ".join(f"{key}={value}" for key, value in capacity.items())
             minimum = ", ".join(f"{key}={value}" for key, value in PROFILES["small"].items())
             message = (f"worker capacity: {available}; fits={','.join(fitting) or 'none'}; "
-                       f"Docker data={self.config.docker_data_dir}; disk reserve={self.config.disk_reserve_mb} MiB. "
+                       f"Docker data={self.runtime.data_dir}; disk reserve={self.config.disk_reserve_mb} MiB. "
                        f"Small requires {minimum}. "
                        "Capacity includes configured maxima and host reserves; only fitting jobs can be claimed.")
             print(_safe_text(message, self._secrets), file=sys.stderr, flush=True)

@@ -2,6 +2,7 @@ import './style.css';
 import { DEFAULT_LIMITS, type LogPackage, type WorkerResponse } from './types';
 import { parseReport } from './report';
 import { availability, type Budget } from './budget';
+import { uploadFile, protectUpload, type UploadProgress, type WakeState } from './upload';
 import { onUiLanguage, setUiLanguage, t, uiLanguage } from './i18n';
 
 type Job = { id: string; description: string; status: string; created_at: string; cancel_requested: boolean; report?: string; resource_plan?: { profile: string; cpu_milli: number; memory_mb: number; disk_mb: number } | null; review_claim?: { name: string; expires_at: string } | null; sanitized_description?: string };
@@ -16,7 +17,7 @@ const el = <K extends keyof HTMLElementTagNameMap>(tag: K, cls = '', text?: stri
 };
 const button = (text: string, cls: string, action: () => void) => { const node = el('button', cls, text); node.type = 'button'; node.addEventListener('click', action); return node; };
 const field = (label: string, input: HTMLElement) => { const node = el('label', 'field'); node.append(el('span', 'field-label', label), input); return node; };
-const size = (bytes: number) => bytes < 1048576 ? `${Math.ceil(bytes / 1024)} KB` : `${(bytes / 1048576).toFixed(1)} MB`;
+const size = (bytes: number) => bytes < 1e6 ? `${Math.ceil(bytes / 1000)} KB` : `${(bytes / 1e6).toFixed(1)} MB`;
 const date = (value: string) => new Date(value).toLocaleString(uiLanguage() === 'zh' ? 'zh-CN' : 'en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 const title = (job: Job) => job.description.replace(/^\[DEMO\]\s*/, '').split('\n')[0].slice(0, 100);
 const claimKey = (id: string) => `robot-log-claim-${id}`;
@@ -30,6 +31,8 @@ const statusBadge = (job: Job) => el('span', `status-badge ${job.status}`, statu
 let jobs: Job[] = [], active: Job[] = [], cursor: string | null = null, selected: string | null = null, historyInitialized = false;
 let online = false, busy = false, files: File[] = [], description = '', outputLanguage = uiLanguage(), outputChosen = false;
 let budget: Budget | null = null;
+let transfer: (UploadProgress & { index: number; count: number; name: string }) | undefined;
+let wakeState: WakeState = 'requesting';
 let submitMessage = '', controller: AbortController | undefined, selectedJob: Job | undefined, selectedVersions: Version[] = [];
 let selectedEvents: Event[] = [], detailSignature = '', detailSequence = 0, detailNeedsRender = false, refreshing = false;
 const drafts = new Map<string, Draft>(), events = new Map<string, Event[]>();
@@ -39,7 +42,7 @@ const pausedSessions = new Set<string>();
 const isHeartbeat = (event: Event): boolean => event.kind === 'heartbeat' || event.message.includes('Sandbox execution remains active');
 const findJob = (id: string): Job | undefined => (selectedJob?.id === id ? selectedJob : active.find(j => j.id === id) ?? jobs.find(j => j.id === id));
 const app = document.querySelector<HTMLDivElement>('#app')!;
-let history: HTMLElement, content: HTMLElement, activity: HTMLElement, connection: HTMLElement, banner: HTMLElement, activityCount: HTMLElement, usage: HTMLElement;
+let history: HTMLElement, content: HTMLElement, activity: HTMLElement, connection: HTMLElement, banner: HTMLElement, activityCount: HTMLElement, usage: HTMLElement, uploadPanel: HTMLElement;
 
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(`/api${path}`, init);
@@ -68,8 +71,9 @@ function buildShell(): void {
   banner = el('div', 'notice'); banner.hidden = true; banner.setAttribute('role', 'status');
   activity = el('section', 'live-panel'); activity.setAttribute('aria-label', t('Shared processes', '共享进程'));
   usage = el('section', 'usage-panel'); usage.setAttribute('aria-label', t('Daily analysis allowance', '每日分析额度'));
-  content = el('div', 'content'); main.append(topbar, banner, usage, activity, content); shell.append(sidebar, main); app.append(shell);
-  renderHistory(); renderActivity(); updateConnection(); renderBudget();
+  uploadPanel = el('section', 'upload-panel'); uploadPanel.setAttribute('aria-label', t('Upload status', '上传状态'));
+  content = el('div', 'content'); main.append(topbar, banner, usage, activity, uploadPanel, content); shell.append(sidebar, main); app.append(shell);
+  renderHistory(); renderActivity(); updateConnection(); renderBudget(); renderUpload();
   if (selected && selectedJob) renderResult(); else renderNew();
 }
 function submissionLabel(): string {
@@ -450,15 +454,48 @@ function renderNew(): void {
   const start = el('button', 'button primary start-analysis', submissionLabel()); start.type = 'submit'; start.disabled = busy || !availability(budget).canSubmit;
   bottom.append(field(t('Report language', '报告语言'), language), start); form.append(bottom);
   form.append(el('p', 'privacy-note', t('Submitting uploads the selected files to this shared workspace. Everyone can see the analysis and review it.', '提交后，所选文件将上传到共享工作台。所有人都可以查看分析并进行审核。')));
-  const progress = el('p', 'submit-progress', submitMessage); progress.id = 'submit-progress'; progress.setAttribute('role', 'status'); form.append(progress);
-  if (busy) form.append(button(t('Cancel upload', '取消上传'), 'button text-button', () => controller?.abort()));
   form.addEventListener('submit', event => { event.preventDefault(); void submit(); }); page.append(form);
   const demoJobs = jobs.filter(job => job.id.startsWith('demo-'));
   if (demoJobs.length) { const demos = el('div', 'demo-examples'); demos.append(el('span', 'muted', t('Want to explore first? Synthetic examples:', '先看看效果？以下为合成示例：'))); for (const job of demoJobs) demos.append(button(title(job), 'example-link', () => { void selectJob(job.id); })); page.append(demos); }
   const sample = el('a', 'example-link', t('Download a synthetic log to try uploading', '下载合成日志，体验上传')); sample.href = '/examples/doorway-stop.txt'; sample.download = 'doorway-stop.txt'; page.append(sample);
   content.append(page);
 }
-function progress(message: string): void { submitMessage = message; const target = document.querySelector('#submit-progress'); if (target) target.textContent = message; }
+function renderUpload(): void {
+  if (!uploadPanel) return;
+  uploadPanel.hidden = !busy && !submitMessage;
+  // Keep the cancel button focused and the progress element animated across ticks.
+  if (!uploadPanel.firstChild) {
+    const text = el('p', 'submit-progress'); text.id = 'submit-progress'; text.setAttribute('role', 'status');
+    const bar = el('progress', 'upload-byte-progress'); bar.max = 1; bar.setAttribute('aria-label', t('Current file upload', '当前文件上传'));
+    const warning = el('p', 'upload-stall'); warning.setAttribute('role', 'status');
+    const wake = el('p', 'upload-wake');
+    uploadPanel.append(text, bar, warning, wake, button(t('Cancel upload', '取消上传'), 'button text-button', () => controller?.abort()));
+  }
+  const text = uploadPanel.querySelector<HTMLElement>('.submit-progress')!;
+  const bar = uploadPanel.querySelector<HTMLProgressElement>('progress')!;
+  bar.hidden = !transfer;
+  if (transfer) {
+    const p = transfer, percent = p.total ? Math.floor(p.loaded / p.total * 100) : p.awaitingResponse ? 100 : 0;
+    const bytes = `${(p.loaded / 1e6).toFixed(1)} MB / ${(p.total / 1e6).toFixed(1)} MB · ${percent}%`;
+    const speed = `${(p.bytesPerSecond / 1e6).toFixed(1)} MB/s`;
+    const eta = p.remainingSeconds === null ? t('Estimating time…', '正在估算剩余时间…') : t(`About ${p.remainingSeconds}s remaining`, `预计剩余 ${p.remainingSeconds} 秒`);
+    text.textContent = t(`Uploading ${p.index}/${p.count}: ${p.name}`, `正在上传 ${p.index}/${p.count}：${p.name}`) + ` (${bytes}) · ` +
+      (p.awaitingResponse ? t('Bytes sent; waiting for server confirmation…', '文件已发送，正在等待服务器确认…') : `${speed} · ${eta}`);
+    bar.max = Math.max(1, p.total); bar.value = p.total ? p.loaded : p.awaitingResponse ? 1 : 0;
+    bar.setAttribute('aria-valuetext', `${p.loaded.toLocaleString()} / ${p.total.toLocaleString()} bytes`);
+  } else text.textContent = submitMessage;
+  uploadPanel.classList.toggle('stalled', Boolean(transfer?.stalled));
+  const warning = uploadPanel.querySelector<HTMLElement>('.upload-stall')!;
+  warning.hidden = !transfer?.stalled;
+  warning.textContent = t('⚠️ No upload progress for 10 seconds. Waiting for the connection to recover…', '⚠️ 网络传输停滞，正在等待连接恢复...');
+  const wake = uploadPanel.querySelector<HTMLElement>('.upload-wake')!;
+  wake.hidden = !busy;
+  wake.textContent = wakeState === 'active' ? t('Keeping the screen awake. Keep this tab visible while uploading.', '已保持屏幕常亮。上传期间请保持此标签页可见。') :
+    wakeState === 'requesting' ? t('Requesting screen wake lock…', '正在请求屏幕常亮…') :
+    t('Screen wake lock is unavailable. Keep this tab visible and prevent the device from sleeping.', '屏幕常亮不可用。请保持此标签页可见，并避免设备休眠。');
+  uploadPanel.querySelector<HTMLButtonElement>('button')!.hidden = !busy;
+}
+function progress(message: string): void { submitMessage = message; renderUpload(); }
 function prepare(logs: File[], signal: AbortSignal): Promise<LogPackage> {
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL('./preprocess.worker.ts', import.meta.url), { type: 'module' });
@@ -477,8 +514,9 @@ async function submit(): Promise<void> {
   if (busy) return;
   if (!files.length || !description.trim()) { notice(t('Choose files and describe the incident first.', '请先选择文件并描述问题。'), true); return; }
   if (files.some(file => file.size > 2 * 1024 ** 3) || files.reduce((n, file) => n + file.size, 0) > 4 * 1024 ** 3) { notice(t('Upload limit: 2 GiB per file and 4 GiB per analysis.', '上传限制：每个文件 2 GiB，每次分析共 4 GiB。'), true); return; }
-  busy = true; controller = new AbortController(); const signal = controller.signal; let createdId: string | undefined;
+  busy = true; transfer = undefined; wakeState = 'requesting'; controller = new AbortController(); const signal = controller.signal; let createdId: string | undefined;
   notice(''); progress(t('Preparing your files…', '正在准备文件…')); renderNew();
+  const stopProtection = protectUpload(state => { wakeState = state; renderUpload(); });
   try {
     budget = await api<Budget>('/budget', { signal }); renderBudget();
     if (!availability(budget).canSubmit) throw new Error(t('No pending slot is available. Your upload draft is preserved.', '暂无待处理空位，上传草稿已保留。'));
@@ -486,19 +524,25 @@ async function submit(): Promise<void> {
     const logs = files.filter(file => !media(file)), attachments = files.filter(media);
     const evidence = logs.length ? await prepare(logs, signal) : undefined;
     signal.throwIfAborted(); progress(t('Uploading to the workspace…', '正在上传到工作台…'));
-    const created = await api<{ job: Job; upload_token: string }>('/jobs', { ...json({ description: description.trim(), language: outputLanguage, evidence }), signal }); createdId = created.job.id;
+    // Once creation starts, retain its response even if the user cancels, so
+    // the newly allocated draft can be cancelled using its server ID.
+    const created = await api<{ job: Job; upload_token: string }>('/jobs', { ...json({ description: description.trim(), language: outputLanguage, evidence }), signal: AbortSignal.timeout(30_000) }); createdId = created.job.id;
+    signal.throwIfAborted();
     const ordered = [...logs, ...attachments];
     for (let index = 0; index < ordered.length; index++) {
-      const file = ordered[index]; progress(t(`Uploading ${index + 1} of ${ordered.length}…`, `正在上传 ${index + 1}/${ordered.length}…`));
-      await api(`/jobs/${createdId}/files?name=${encodeURIComponent(file.webkitRelativePath || file.name)}`, { method: 'PUT', headers: { Authorization: `Bearer ${created.upload_token}`, 'Content-Type': 'application/octet-stream' }, body: file, signal });
+      const file = ordered[index], name = file.webkitRelativePath || file.name;
+      await uploadFile(`/api/jobs/${createdId}/files?name=${encodeURIComponent(name)}`, file, created.upload_token, signal,
+        state => { transfer = { ...state, index: index + 1, count: ordered.length, name }; renderUpload(); });
     }
+    signal.throwIfAborted(); transfer = undefined; progress(t('Confirming submission…', '正在确认提交…'));
     await api(`/jobs/${createdId}/submit`, { ...json({}, created.upload_token), signal });
     files = []; description = ''; progress(''); await selectJob(createdId); await refresh();
   } catch (error) {
-    if (createdId) { try { await api(`/jobs/${createdId}/cancel`, { method: 'POST' }); } catch { /* The shared history retains failed upload state for inspection. */ } }
+    transfer = undefined;
+    if (createdId) { try { await api(`/jobs/${createdId}/cancel`, { method: 'POST', signal: AbortSignal.timeout(10_000) }); } catch { /* The shared history retains failed upload state for inspection. */ } }
     const message = signal.aborted ? t('Upload cancelled. Your originals are unchanged.', '上传已取消，原始文件未改变。') : `${t('Could not submit analysis', '无法提交分析')}：${error}`;
     progress(message); notice(message, !signal.aborted);
-  } finally { busy = false; controller = undefined; if (!selected) renderNew(); }
+  } finally { stopProtection(); busy = false; transfer = undefined; controller = undefined; renderUpload(); if (!selected) renderNew(); }
 }
 async function selectJob(id: string): Promise<void> { selected = id; selectedJob = undefined; detailSignature = ''; detailNeedsRender = true; notice(''); renderHistory(); content.replaceChildren(el('p', 'loading', t('Opening analysis…', '正在打开分析…'))); await loadDetail(true); }
 async function loadDetail(force = false): Promise<void> {

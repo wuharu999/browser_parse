@@ -232,3 +232,19 @@ summary { cursor: pointer; color: #70809a; }
   .evidence-item { padding: 15px 12px; }
   .workflow-editor { padding: 16px; }
 }
+
+.upload-panel { margin: 16px 40px 0; padding: 16px 20px; border: 1px solid #dce4f4; border-radius: 10px; background: #f4f7ff; min-width: 0; }
+.upload-panel[hidden], .upload-panel [hidden] { display: none; }
+.upload-panel .submit-progress { margin: 0 0 10px; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.upload-byte-progress { display: block; width: 100%; height: 12px; border: 0; border-radius: 6px; overflow: hidden; accent-color: #547bce; }
+.upload-byte-progress::-webkit-progress-bar { background: #e0e7f4; border-radius: 6px; }
+.upload-byte-progress::-webkit-progress-value { background: #547bce; transition: width .2s ease; border-radius: 6px; }
+.upload-byte-progress::-moz-progress-bar { background: #547bce; }
+.upload-panel.stalled { border-color: #d7b252; background: #fff8df; }
+.upload-panel.stalled .upload-byte-progress { accent-color: #a07818; }
+.upload-panel.stalled .upload-byte-progress::-webkit-progress-value { background: #a07818; }
+.upload-stall { color: #805e12; font-size: .85rem; }
+.upload-wake { color: #64728b; font-size: .78rem; margin: 10px 0 0; }
+@media (max-width: 900px) { .upload-panel { margin-left: 24px; margin-right: 24px; } }
+@media (max-width: 600px) { .upload-panel { margin-left: 20px; margin-right: 20px; padding: 14px; } }
+@media (prefers-reduced-motion: reduce) { .upload-byte-progress::-webkit-progress-value { transition: none; } }

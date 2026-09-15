@@ -39,7 +39,7 @@ class DockerJob:
 
 class DockerRuntime:
     def __init__(self, *, image: str, network: str, proxy_url: str, worker_id: str,
-                 data_dir: Path, disk_reserve_mb: int, pids_limit: int = 512) -> None:
+                 data_dir: Path | None, disk_reserve_mb: int, pids_limit: int = 512) -> None:
         if not re.fullmatch(r"(?:[^\s]+@)?sha256:[0-9a-f]{64}", image):
             raise DockerError("ROBOT_DOCKER_IMAGE must be a registry digest or local sha256 image ID")
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}", network):
@@ -59,7 +59,9 @@ class DockerRuntime:
         if disk_reserve_mb < 1 or not 16 <= pids_limit <= 4096:
             raise DockerError("invalid Docker disk reserve or PID limit")
         self.image, self.network, self.proxy_url = image, network, proxy_url
-        self.worker_id, self.data_dir = worker_id, Path(data_dir)
+        self.worker_id = worker_id
+        self.expected_data_dir = Path(data_dir).resolve() if data_dir is not None else None
+        self.data_dir: Path | None = None
         self.disk_reserve_mb, self.pids_limit = disk_reserve_mb, pids_limit
         self._info: dict = {}
 
@@ -86,20 +88,27 @@ class DockerRuntime:
         if not endpoint.startswith("unix://"):
             raise DockerError("worker requires a local Unix-socket Docker daemon")
         try:
-            self._info = json.loads(self._run(["info", "--format", "{{json .}}"]).stdout)
+            info = json.loads(self._run(["info", "--format", "{{json .}}"]).stdout)
             image = json.loads(self._run(["image", "inspect", self.image]).stdout)[0]
             network = json.loads(self._run(["network", "inspect", self.network]).stdout)[0]
         except (ValueError, IndexError, TypeError) as exc:
             raise DockerError("Docker inspection returned invalid data") from exc
-        if self._info.get("OSType") != "linux" or any(
-            not self._info.get(key) for key in ("MemoryLimit", "SwapLimit", "CpuCfsQuota", "PidsLimit")
+        if info.get("OSType") != "linux" or any(
+            not info.get(key) for key in ("MemoryLimit", "SwapLimit", "CpuCfsQuota", "PidsLimit")
         ):
             raise DockerError("Docker daemon cannot enforce the required Linux resource limits")
-        security = self._info.get("SecurityOptions") or []
+        security = info.get("SecurityOptions") or []
         if not any("name=seccomp" in option for option in security):
             raise DockerError("Docker daemon must support its default seccomp profile")
-        if self.data_dir.resolve() != Path(self._info["DockerRootDir"]).resolve():
-            raise DockerError("ROBOT_DOCKER_DATA_DIR must match the local Docker daemon data directory")
+        root_dir = info.get("DockerRootDir")
+        if not isinstance(root_dir, str) or not root_dir.strip():
+            raise DockerError("Docker daemon did not report a usable DockerRootDir")
+        detected_data_dir = Path(root_dir)
+        if not detected_data_dir.is_absolute() or not detected_data_dir.is_dir():
+            raise DockerError("Docker daemon reported an unavailable DockerRootDir")
+        detected_data_dir = detected_data_dir.resolve()
+        if self.expected_data_dir is not None and self.expected_data_dir != detected_data_dir:
+            raise DockerError("ROBOT_DOCKER_DATA_DIR does not match the local Docker daemon data directory")
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", image.get("Id", "")):
             raise DockerError("Docker image has no immutable local ID")
         self.image = image["Id"]
@@ -110,8 +119,17 @@ class DockerRuntime:
             network.get("EnableIPv6") or
             options.get("com.docker.network.bridge.gateway_mode_ipv4") != "isolated"):
             raise DockerError("job network must be an internal bridge with isolated IPv4 gateway and IPv6 disabled")
-        if shutil.disk_usage(self.data_dir).free < self.disk_reserve_mb * MIB:
+        if shutil.disk_usage(detected_data_dir).free < self.disk_reserve_mb * MIB:
             raise DockerError("Docker filesystem is below the free-space reserve")
+        # Do not cache partial state from a failed preflight. A caller that
+        # retries must repeat every daemon/image/network validation.
+        self._info = info
+        self.data_dir = detected_data_dir
+
+    def _data_dir(self) -> Path:
+        if self.data_dir is None:
+            raise DockerError("DockerRootDir has not been verified")
+        return self.data_dir
 
     def available_capacity(self, maxima: dict[str, int], memory_reserve_mb: int = 1024) -> dict[str, int]:
         if not self._info:
@@ -125,7 +143,7 @@ class DockerRuntime:
             "cpu_milli": max(0, min(maxima["cpu_milli"], max(0, int(self._info["NCPU"]) - 1) * 1000)),
             "memory_mb": max(0, min(maxima["memory_mb"], available - memory_reserve_mb,
                                     int(self._info["MemTotal"]) // MIB - memory_reserve_mb)),
-            "disk_mb": max(0, min(maxima["disk_mb"], shutil.disk_usage(self.data_dir).free // MIB - self.disk_reserve_mb)),
+            "disk_mb": max(0, min(maxima["disk_mb"], shutil.disk_usage(self._data_dir()).free // MIB - self.disk_reserve_mb)),
         }
 
     def _owned(self, kind: str) -> list[str]:
@@ -255,7 +273,7 @@ class DockerRuntime:
         return sum(counts)
 
     def disk_healthy(self, job: DockerJob, limit_mb: int) -> bool:
-        return (shutil.disk_usage(self.data_dir).free >= self.disk_reserve_mb * MIB and
+        return (shutil.disk_usage(self._data_dir()).free >= self.disk_reserve_mb * MIB and
                 self.workspace_bytes(job) <= limit_mb * MIB)
 
     def _exists(self, kind: str, name: str) -> bool:

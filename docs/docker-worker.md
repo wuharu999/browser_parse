@@ -81,3 +81,11 @@ For API service and two-address reverse-proxy setup, see [ECS deployment](deploy
 
 For a worker that stays idle because its Docker filesystem is too small, see
 [the disk-capacity diagnosis and storage relocation guide](docker-storage.md).
+
+The worker detects `DockerRootDir` from the local Unix-socket Docker daemon at
+preflight and uses its filesystem for capacity and runtime free-space checks.
+Leave `ROBOT_DOCKER_DATA_DIR` empty for automatic detection. The legacy value
+`/var/lib/docker` also means automatic detection; another explicit value asserts
+that Docker uses that directory and fails if it does not match. Restart the
+worker after moving daemon storage. Detection does not relocate data or add
+free space, and containerd image storage can still occupy a separate filesystem.

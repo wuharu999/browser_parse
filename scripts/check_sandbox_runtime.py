@@ -97,7 +97,17 @@ def main() -> None:
     parser.add_argument("--network", default=os.environ.get("ROBOT_DOCKER_NETWORK", "robot-analysis-jobs"))
     parser.add_argument("--proxy-url", default=os.environ.get("ROBOT_EGRESS_PROXY_URL"))
     parser.add_argument("--worker-id", default="runtime-check")
-    parser.add_argument("--docker-data-dir", type=Path, default=Path(os.environ.get("ROBOT_DOCKER_DATA_DIR", "/var/lib/docker")))
+    configured_data_dir = os.environ.get("ROBOT_DOCKER_DATA_DIR")
+    parser.add_argument(
+        "--docker-data-dir",
+        type=Path,
+        default=(
+            Path(configured_data_dir)
+            if configured_data_dir and configured_data_dir != "/var/lib/docker"
+            else None
+        ),
+        help="optional expected DockerRootDir; omit to discover it from the local daemon",
+    )
     parser.add_argument("--disk-reserve-mb", type=int, default=int(os.environ.get("ROBOT_HOST_DISK_RESERVE_MB", "8192")))
     parser.add_argument("--pids-limit", type=int, default=int(os.environ.get("ROBOT_JOB_PIDS_LIMIT", "512")))
     args = parser.parse_args()

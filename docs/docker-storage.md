@@ -132,15 +132,18 @@ have no running job or unrelated containers when its storage is copied.
    RequiresMountsFor=/home/robot-containerd
    ```
 
-5. Set the worker's existing protected environment file to match Docker:
+5. Use automatic DockerRootDir detection in the worker's existing protected
+   environment file:
 
    ```dotenv
-   ROBOT_DOCKER_DATA_DIR=/home/robot-docker
+   ROBOT_DOCKER_DATA_DIR=
    ROBOT_HOST_DISK_RESERVE_MB=8192
    ROBOT_WORKER_DISK_MB=24576
    ```
 
-   Retain the worker ID, token, provider key and immutable image ID. If host
+   Alternatively, set `/home/robot-docker` as an explicit expected-path check.
+   Automatic detection does not move Docker data. Retain the worker ID, token,
+   provider key and immutable image ID. If host
    upload/wiki staging also needs more space, create a private directory owned
    by the service user on `/home` and set `TMPDIR` in the worker environment.
    Stop all copies of that worker first: the single-worker lock also uses

@@ -212,3 +212,14 @@ The v2 browser check downloaded/parsed both exports, retrieved a 20-line context
 
 For the initial deployment with one separate worker machine, follow
 [the one-worker setup guide](docs/worker-one-machine.md).
+
+Uploads show XHR byte progress, current file/count, average transfer speed and
+estimated remaining time. Ten seconds without new bytes shows a stall warning;
+100% transmission waits for the server response before the analysis is submitted.
+Refresh protection and a best-effort screen wake lock last through submission
+and are released on success, failure or cancellation. Wake lock requires a
+secure context (HTTPS, or localhost for development) and a visible tab; it
+does not guarantee background uploads. Browsers control whether a
+`beforeunload` confirmation appears, particularly on mobile. See the
+[Screen Wake Lock API](https://developer.mozilla.org/en-US/docs/Web/API/Screen_Wake_Lock_API)
+and [beforeunload documentation](https://developer.mozilla.org/en-US/docs/Web/API/Window/beforeunload_event).
