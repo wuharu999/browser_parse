@@ -34,7 +34,7 @@ let budget: Budget | null = null;
 let transfer: (UploadProgress & { index: number; count: number; name: string }) | undefined;
 let wakeState: WakeState = 'requesting';
 let submitMessage = '', controller: AbortController | undefined, selectedJob: Job | undefined, selectedVersions: Version[] = [];
-let selectedEvents: Event[] = [], detailSignature = '', detailSequence = 0, detailNeedsRender = false, refreshing = false;
+let selectedEvents: Event[] = [], detailSignature = '', activitySignature = '', detailSequence = 0, detailNeedsRender = false, refreshing = false;
 const drafts = new Map<string, Draft>(), events = new Map<string, Event[]>();
 const sessionViews = new Map<string, { open: boolean; top: number; following: boolean }>();
 const processDrawers = new Map<string, boolean>();
@@ -112,6 +112,7 @@ function updateConnection(): void {
   connection.replaceChildren(el('span', `connection-dot ${online ? 'online' : ''}`), el('span', '', online ? t('Shared with everyone', '所有人共享') : t('Connecting to server…', '正在连接服务器…')));
 }
 function renderHistory(): void {
+  const savedHistoryScroll = history?.scrollTop ?? 0;
   history.replaceChildren();
   if (!jobs.length) history.append(el('p', 'sidebar-empty', t('Your analyses will appear here.', '分析记录将显示在这里。')));
   for (const job of jobs) {
@@ -122,6 +123,7 @@ function renderHistory(): void {
     history.append(item);
   }
   if (cursor) history.append(button(t('Load older analyses', '加载更早分析'), 'button text-button', () => { void loadOlder(); }));
+  if (savedHistoryScroll) history.scrollTop = savedHistoryScroll;
 }
 async function loadOlder(): Promise<void> {
   try { const page = await api<{ items: Job[]; next_cursor: string | null }>(`/jobs?limit=50&cursor=${encodeURIComponent(cursor ?? '')}`); mergeJobs(page.items); cursor = page.next_cursor; renderHistory(); }
@@ -138,6 +140,26 @@ function renderActivity(): void {
   }
   const running = active.filter(job => job.status === 'running').length, queued = active.filter(job => job.status === 'queued').length;
   activityCount.textContent = t(`${running} running · ${queued} queued`, `${running} 个运行中 · ${queued} 个排队中`);
+
+  const signature = JSON.stringify([
+    online,
+    active.map(j => [j.id, j.status, j.cancel_requested, j.resource_plan]),
+    active.map(j => (events.get(j.id) ?? []).length),
+    active.map(j => (events.get(j.id) ?? []).at(-1)?.seq),
+    active.map(j => (events.get(j.id) ?? []).at(-1)?.message),
+  ]);
+  if (signature === activitySignature) return;
+  activitySignature = signature;
+
+  const existingList = activity.querySelector<HTMLElement>('.live-list');
+  const savedLiveScroll = existingList ? existingList.scrollTop : 0;
+  const savedWindowScroll = window.scrollY;
+  const savedDrawers = new Map<string, number>();
+  for (const drawer of activity.querySelectorAll<HTMLDetailsElement>('.process-output-drawer')) {
+    const body = drawer.querySelector<HTMLElement>('.process-drawer-body');
+    if (body && drawer.dataset.drawerKey) savedDrawers.set(drawer.dataset.drawerKey, body.scrollTop);
+  }
+
   activity.replaceChildren();
   if (!active.length) { activity.append(el('p', 'quiet-state', online ? t('●  No analyses running right now', '●  当前没有正在运行的分析') : t('Checking shared processes…', '正在检查共享进程…'))); return; }
   const heading = el('div', 'live-heading'); heading.append(el('h2', '', t('Running & queued', '运行与排队')), el('span', 'muted', t('Visible to everyone', '所有人可见'))); activity.append(heading);
@@ -150,9 +172,18 @@ function renderActivity(): void {
     card.append(stop); list.append(card);
   }
   activity.append(list);
+  if (savedLiveScroll) list.scrollTop = savedLiveScroll;
   for (const panel of activity.querySelectorAll<HTMLDetailsElement>('.session-panel')) {
     const transcript = panel.querySelector<HTMLElement>('.session-transcript')!, state = sessionViews.get(panel.dataset.job!);
     transcript.scrollTop = !state || state.following ? transcript.scrollHeight : state.top;
+  }
+  for (const [key, top] of savedDrawers) {
+    const drawer = activity.querySelector<HTMLDetailsElement>(`.process-output-drawer[data-drawer-key="${key}"]`);
+    const body = drawer?.querySelector<HTMLElement>('.process-drawer-body');
+    if (body) body.scrollTop = top;
+  }
+  if (window.scrollY !== savedWindowScroll) {
+    window.scrollTo({ top: savedWindowScroll, behavior: 'instant' as ScrollBehavior });
   }
 }
 function sandboxAbstractionPanel(id: string, records: Event[]): HTMLElement {
@@ -288,6 +319,7 @@ function sandboxAbstractionPanel(id: string, records: Event[]): HTMLElement {
 
     const drawer = el('details', 'process-output-drawer');
     const drawerKey = `${id}:${def.id}`;
+    drawer.dataset.drawerKey = drawerKey;
     drawer.open = processDrawers.get(drawerKey) ?? false;
     drawer.addEventListener('toggle', () => {
       processDrawers.set(drawerKey, drawer.open);
@@ -565,6 +597,7 @@ function reportSection(number: string, name: string): HTMLElement { const sectio
 function renderResult(): void {
   const job = selectedJob; if (!job || selected !== job.id) return;
   // Preserve scroll positions before blowing away the DOM.
+  const savedWindowScroll = window.scrollY;
   const savedContentScroll = content.scrollTop;
   const existingTranscript = content.querySelector<HTMLElement>('.session-transcript');
   if (existingTranscript) {
@@ -573,6 +606,11 @@ function renderResult(): void {
       top: existingTranscript.scrollTop,
       following: existingTranscript.scrollHeight - existingTranscript.scrollTop - existingTranscript.clientHeight < 30,
     });
+  }
+  const savedDrawers = new Map<string, number>();
+  for (const drawer of content.querySelectorAll<HTMLDetailsElement>('.process-output-drawer')) {
+    const body = drawer.querySelector<HTMLElement>('.process-drawer-body');
+    if (body && drawer.dataset.drawerKey) savedDrawers.set(drawer.dataset.drawerKey, body.scrollTop);
   }
   content.replaceChildren(); const page = el('article', 'result-page');
   const navigation = el('div', 'report-navigation'); navigation.append(button(t('← Back to upload', '← 返回上传'), 'button secondary back-to-upload', showNew)); page.append(navigation);
@@ -614,10 +652,18 @@ function renderResult(): void {
   page.append(sessionPanel(job.id, events.get(job.id) ?? selectedEvents), button(t('← Back to upload', '← 返回上传'), 'button secondary back-to-upload', showNew)); content.append(page);
   // Restore page scroll and inner transcript scroll after DOM rebuild.
   content.scrollTop = savedContentScroll;
+  if (window.scrollY !== savedWindowScroll) {
+    window.scrollTo({ top: savedWindowScroll, behavior: 'instant' as ScrollBehavior });
+  }
   const newTranscript = content.querySelector<HTMLElement>('.session-transcript');
   if (newTranscript) {
     const state = sessionViews.get(job.id);
     newTranscript.scrollTop = !state || state.following ? newTranscript.scrollHeight : state.top;
+  }
+  for (const [key, top] of savedDrawers) {
+    const drawer = content.querySelector<HTMLDetailsElement>(`.process-output-drawer[data-drawer-key="${key}"]`);
+    const body = drawer?.querySelector<HTMLElement>('.process-drawer-body');
+    if (body) body.scrollTop = top;
   }
 }
 function renderEditor(section: HTMLElement, job: Job, draft: Draft): void {
