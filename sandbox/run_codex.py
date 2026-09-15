@@ -522,6 +522,7 @@ def _write_config(model: str) -> None:
     key_env = os.environ.get("CODEX_PROVIDER_ENV_KEY", "OPENAI_API_KEY")
     deepseek_modalities = {
         "deepseek-flash": ["text", "image"],
+        "deepseek-v4.1-flash": ["text", "image"],
         # Retained provider aliases: Flash and Pro are text-only; the retired
         # experimental vision alias remains image-capable for existing jobs.
         "deepseek-v4-flash": ["text"],
