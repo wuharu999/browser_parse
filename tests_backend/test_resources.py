@@ -102,4 +102,21 @@ class ResourceQueueTests(unittest.TestCase):
         self.assertIsNotNone(claimed)
         self.assertEqual(claimed["id"], job["id"])
         self.assertEqual(claimed["resource_plan"]["profile"], "large")
+        self.assertEqual(claimed["timeout_seconds"], 2700)
+
+    def test_large_task_granted_one_and_half_times_allowed_time(self):
+        small_job = self.job(name="small.log", size=100)
+        large_job = self.job(name="big.zip", size=1100 * MIB)
+        cap = {"cpu_milli": 4000, "memory_mb": 8192, "disk_mb": 32768}
+
+        # Small job gets standard 1800s
+        claimed_small, _ = self.store.worker_claim("worker-s", cap)
+        self.assertEqual(claimed_small["id"], small_job["id"])
+        self.assertEqual(claimed_small["timeout_seconds"], 1800)
+
+        # Large job gets 1.5x allowance (2700s)
+        claimed_large, _ = self.store.worker_claim("worker-l", cap)
+        self.assertEqual(claimed_large["id"], large_job["id"])
+        self.assertEqual(claimed_large["timeout_seconds"], 2700)
+
 

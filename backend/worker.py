@@ -155,8 +155,8 @@ class WorkerConfig:
     def from_env(cls) -> "WorkerConfig":
         key_env = _env("ROBOT_CODEX_API_KEY_ENV", "OPENAI_API_KEY")
         timeout = int(_env("ROBOT_JOB_TIMEOUT_SECONDS", "1800"))
-        if not 1 <= timeout <= 1800:
-            raise WorkerError("ROBOT_JOB_TIMEOUT_SECONDS must be between 1 and 1800")
+        if not 1 <= timeout <= 3600:
+            raise WorkerError("ROBOT_JOB_TIMEOUT_SECONDS must be between 1 and 3600")
         runtime = Path(_env("ROBOT_SANDBOX_RUNTIME", str(Path(__file__).resolve().parents[1] / "sandbox" / "runtime")))
         wiki = os.environ.get("ROBOT_WIKI_DIR")
         default_wiki = Path(__file__).resolve().parents[1] / "knowledge" / "wiki"
@@ -382,13 +382,23 @@ class DockerWorker:
             self.api.event(job_id, kind, _safe_text(message, self._secrets), agent, subagent)
 
     def _timeout_for(self, job: dict[str, Any]) -> int:
-        """The API may make a short approved benchmark; no job can exceed 30 min."""
-        requested = job.get("timeout_seconds", self.config.timeout_seconds)
-        if not isinstance(requested, int):
+        """The API may make a short approved benchmark; large jobs get 1.5x allowance (up to 2700s/45m)."""
+        plan = job.get("resource_plan")
+        is_large = isinstance(plan, dict) and plan.get("profile") == "large"
+        max_allowed = int(1800 * 1.5) if is_large else 1800
+        default_timeout = int(self.config.timeout_seconds * 1.5) if is_large else self.config.timeout_seconds
+
+        requested = job.get("timeout_seconds")
+        if requested is None:
+            requested = default_timeout
+        elif not isinstance(requested, int):
             raise WorkerError("job timeout_seconds must be an integer")
+        elif is_large and requested == 1800:
+            requested = int(1800 * 1.5)
+
         if job.get("benchmark"):
             requested = min(requested, 600)
-        return max(1, min(requested, 1800))
+        return max(1, min(requested, max_allowed))
 
     def _activity(self, container: DockerJob, job_id: str, seen: int) -> int:
         try:

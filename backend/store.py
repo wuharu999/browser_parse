@@ -66,7 +66,7 @@ class Store:
             daily_limit_shots = int(daily_limit)
         if daily_limit_shots <= 0:
             raise ValueError("daily_limit_shots must be a positive integer")
-        if not 1 <= max_running <= 2 or not 1 <= max_pending <= 100 or not 1 <= lease_seconds <= 1800 or not 1 <= runtime_seconds <= 1800:
+        if not 1 <= max_running <= 2 or not 1 <= max_pending <= 100 or not 1 <= lease_seconds <= 3600 or not 1 <= runtime_seconds <= 3600:
             raise ValueError("invalid queue, lease, or runtime setting")
         self.path, self.upload_dir = Path(db_path), Path(upload_dir)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -210,6 +210,11 @@ class Store:
         item = self._public(row) or {}
         item["files"] = self._files(item["id"])
         item["evidence"] = json.loads(row["evidence"]) if row["evidence"] else None
+        plan = item.get("resource_plan")
+        if isinstance(plan, dict) and plan.get("profile") == "large":
+            item["timeout_seconds"] = int(self.runtime_seconds * 1.5)
+        else:
+            item["timeout_seconds"] = self.runtime_seconds
         return item
 
     def create(self, description: str, language: str, evidence: object | None) -> tuple[dict, str]:
@@ -377,7 +382,8 @@ class Store:
             if not row: self.db.commit(); return None, budget
             plan = json.loads(row["resource_plan"]) if row["resource_plan"] else estimate_resources(self._files(row["id"]), json.loads(row["evidence"]) if row["evidence"] else None)
             until = stamp(now() + timedelta(seconds=self.lease_seconds)); current = stamp(); day = datetime.now(SHANGHAI).date().isoformat()
-            deadline = stamp(now() + timedelta(seconds=self.runtime_seconds))
+            runtime = int(self.runtime_seconds * 1.5) if (isinstance(plan, dict) and plan.get("profile") == "large") else self.runtime_seconds
+            deadline = stamp(now() + timedelta(seconds=runtime))
             self.db.execute("UPDATE jobs SET status='running',reservation=?,reservation_day=?,lease_until=?,run_deadline=?,updated_at=?,resource_plan=?,worker_id=? WHERE id=?", (self.estimate, day, until, deadline, current, json.dumps(plan), worker_id, row["id"]))
             self._event(row["id"], "system", "api", f"Worker lease granted to {worker_id}.")
             updated = self.db.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()

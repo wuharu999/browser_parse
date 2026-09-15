@@ -225,8 +225,21 @@ class DockerWorkerTests(unittest.TestCase):
     def test_benchmark_timeout_is_limited_to_ten_minutes(self) -> None:
         worker, _, _ = self.worker(None)
         self.assertEqual(worker._timeout_for({"timeout_seconds": 1800, "benchmark": True}), 600)
+        self.assertEqual(worker._timeout_for({"resource_plan": {"profile": "large"}, "benchmark": True}), 600)
         with self.assertRaisesRegex(WorkerError, "must be an integer"):
             worker._timeout_for({"timeout_seconds": "600"})
+
+    def test_large_tasks_timeout_is_one_and_half_times_default(self) -> None:
+        worker, _, _ = self.worker(None)
+        # Normal job: 1800s (30m)
+        self.assertEqual(worker._timeout_for({}), 1800)
+        self.assertEqual(worker._timeout_for({"resource_plan": {"profile": "small"}}), 1800)
+        self.assertEqual(worker._timeout_for({"resource_plan": {"profile": "standard"}}), 1800)
+        # Large job: 1.5x (2700s / 45m)
+        self.assertEqual(worker._timeout_for({"resource_plan": {"profile": "large"}}), 2700)
+        self.assertEqual(worker._timeout_for({"resource_plan": {"profile": "large"}, "timeout_seconds": 1800}), 2700)
+        self.assertEqual(worker._timeout_for({"resource_plan": {"profile": "large"}, "timeout_seconds": 2500}), 2500)
+        self.assertEqual(worker._timeout_for({"resource_plan": {"profile": "large"}, "timeout_seconds": 3000}), 2700)
 
     def test_activity_redacts_and_suppresses_unsafe_tool_payload(self) -> None:
         worker, api, runtime = self.worker(None)
