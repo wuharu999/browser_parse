@@ -85,3 +85,21 @@ class ResourceQueueTests(unittest.TestCase):
         for capacity in ({}, {"cpu_milli": 1, "memory_mb": 1, "disk_mb": 0}, {"cpu_milli": True, "memory_mb": 1, "disk_mb": 1}):
             with self.assertRaisesRegex(ValueError, "worker capacity"):
                 self.store.worker_claim("machine-a", capacity)
+
+    def test_hard_limit_job_allocated_8gb_tier_and_claimed_by_8gb_worker(self):
+        # A 1.1 GB multi-file upload hits the large hard-limit tier.
+        job = self.job(name="archive.zip", size=1100 * MIB)
+        plan = self.store.get(job["id"])["resource_plan"]
+        self.assertEqual(plan["profile"], "large")
+        self.assertEqual(plan["cpu_milli"], 4000)
+        self.assertEqual(plan["memory_mb"], 7168)
+        self.assertEqual(plan["disk_mb"], 24576)
+
+        # An 8 GB physical host (MemTotal ~8192-8744 MB minus 1024 MB OS reserve)
+        # advertises ~7720 MB RAM. It must claim the large job by default.
+        eight_gb_worker_capacity = {"cpu_milli": 4000, "memory_mb": 7720, "disk_mb": 24576}
+        claimed, _ = self.store.worker_claim("worker-8gb-node", eight_gb_worker_capacity)
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed["id"], job["id"])
+        self.assertEqual(claimed["resource_plan"]["profile"], "large")
+

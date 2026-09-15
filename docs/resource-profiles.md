@@ -6,7 +6,7 @@ The API selects a resource plan from verified upload sizes and evidence hints. T
 | --- | ---: | ---: | ---: |
 | Small | 1 CPU | 2 GiB | 8 GiB |
 | Standard | 2 CPU | 4 GiB | 16 GiB |
-| Large | 4 CPU | 8 GiB | 24 GiB |
+| Large | 4 CPU | 7 GiB (8 GiB node) | 24 GiB |
 
 Upload volume, expanded-data hints, entry count and media choose a profile in `backend/resources.py`. Configure each machine's per-job maxima; it can claim any of the three profiles that fit its currently available capacity. The central limit is two jobs, one per worker; it is not a claim that both jobs fit any particular host.
 

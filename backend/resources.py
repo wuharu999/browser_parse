@@ -8,7 +8,9 @@ GIB = 1024**3
 PROFILES = {
     "small": {"cpu_milli": 1000, "memory_mb": 2048, "disk_mb": 8192},
     "standard": {"cpu_milli": 2000, "memory_mb": 4096, "disk_mb": 16384},
-    "large": {"cpu_milli": 4000, "memory_mb": 8192, "disk_mb": 24576},
+    # 7168 MiB (7 GiB) is the container limit on an 8 GiB host node, reserving
+    # ~1 GiB for the Linux kernel, Docker daemon, and host processes.
+    "large": {"cpu_milli": 4000, "memory_mb": 7168, "disk_mb": 24576},
 }
 
 

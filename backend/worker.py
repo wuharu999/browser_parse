@@ -567,7 +567,10 @@ class DockerWorker:
         try:
             plan = job.get("resource_plan") or {"profile": "small", **PROFILES["small"]}
             profile = plan.get("profile") if isinstance(plan, dict) else None
-            if plan is not None and (profile not in PROFILES or any(plan.get(key) != value for key, value in PROFILES[profile].items())):
+            if plan is not None and (profile not in PROFILES or
+                                     plan.get("cpu_milli") != PROFILES[profile]["cpu_milli"] or
+                                     plan.get("disk_mb") != PROFILES[profile]["disk_mb"] or
+                                     not (min(PROFILES[profile]["memory_mb"], 7168) <= plan.get("memory_mb", 0) <= max(PROFILES[profile]["memory_mb"], 8192))):
                 raise WorkerError("Job resource plan does not match a supported profile")
             if not isinstance(plan, dict): raise WorkerError("job resource plan is invalid")
             capacity = self.runtime.available_capacity({"cpu_milli": self.config.cpu_milli, "memory_mb": self.config.memory_mb, "disk_mb": self.config.disk_mb})
