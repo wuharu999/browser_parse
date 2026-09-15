@@ -73,6 +73,12 @@ this worker.
 
 ## 3. Build the immutable job image and proxy network
 
+Before building, check free space on Docker's actual filesystem. With the
+default reserve, a standard job needs at least **24 GiB free after the build**
+and a large job needs 32 GiB. A large `/home` partition does not help while Docker
+still stores data on `/`. Follow [Docker storage checks and relocation](docker-storage.md)
+if the root filesystem is too small.
+
 The host-side worker runs Python directly. Each analysis runs in a newly
 created Docker container, with no Docker socket, host bind mount, host network,
 or published port.

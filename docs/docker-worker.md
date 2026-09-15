@@ -78,3 +78,6 @@ On restart the worker reconciles only containers and volumes carrying both its m
 Local validation built the image, checked its tools and limits, and exercised synthetic HTTP jobs through two worker identities and real Docker containers. Proxy checks verified provider TLS and denial of non-allowed destinations. The local VPN returned synthetic `198.18.0.0/15` DNS addresses, so the provider-positive test used a temporary mapping to its public-DNS address. Do not weaken private-address ACLs for VPN fake DNS; ensure the deployed proxy resolves the provider to real public addresses. No ECS/two-machine deployment or paid model job is claimed.
 
 For API service and two-address reverse-proxy setup, see [ECS deployment](deploy-ecs-worker.md).
+
+For a worker that stays idle because its Docker filesystem is too small, see
+[the disk-capacity diagnosis and storage relocation guide](docker-storage.md).

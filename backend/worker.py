@@ -327,6 +327,7 @@ class DockerWorker:
             secrets_list.append(config.guard_api_key)
         self._secrets = tuple(s for s in secrets_list if s)
         self.guard = guard
+        self._capacity_profiles: tuple[str, ...] | None = None
         guard_disabled = os.environ.get("ROBOT_GUARD_ENABLED", "").lower() in {"0", "false", "no", "off"}
         if self.guard is None and not guard_disabled and (
             config.guard_enabled
@@ -640,7 +641,18 @@ class DockerWorker:
 
     def run_once(self) -> bool:
         capacity = self.runtime.available_capacity({"cpu_milli": self.config.cpu_milli, "memory_mb": self.config.memory_mb, "disk_mb": self.config.disk_mb})
-        if any(capacity.get(key, 0) < PROFILES["small"][key] for key in ("cpu_milli", "memory_mb", "disk_mb")):
+        fitting = tuple(name for name, plan in PROFILES.items()
+                        if all(capacity.get(key, 0) >= needed for key, needed in plan.items()))
+        if fitting != self._capacity_profiles:
+            available = ", ".join(f"{key}={value}" for key, value in capacity.items())
+            minimum = ", ".join(f"{key}={value}" for key, value in PROFILES["small"].items())
+            message = (f"worker capacity: {available}; fits={','.join(fitting) or 'none'}; "
+                       f"Docker data={self.config.docker_data_dir}; disk reserve={self.config.disk_reserve_mb} MiB. "
+                       f"Small requires {minimum}. "
+                       "Capacity includes configured maxima and host reserves; only fitting jobs can be claimed.")
+            print(_safe_text(message, self._secrets), file=sys.stderr, flush=True)
+            self._capacity_profiles = fitting
+        if not fitting:
             return False
         job = self.api.claim(capacity)
         if job is None:

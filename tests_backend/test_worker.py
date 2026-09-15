@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stderr
 from dataclasses import replace
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -181,6 +184,35 @@ class DockerWorkerTests(unittest.TestCase):
         self.assertFalse(worker.run_once())
         self.assertEqual(runtime.created, [])
         self.assertIsNone(api.claimed_capacity)
+
+    def test_low_docker_disk_is_explained_once_and_recovers_without_bypassing_limits(self) -> None:
+        config = replace(self.config, docker_data_dir=Path("/var/lib/docker"), disk_reserve_mb=8192)
+        api = FakeApi(None)
+        worker = DockerWorker(config, api=api)
+        # Exercise the real capacity calculation with the remote screenshot's
+        # 10169 MiB free, rather than a fake pre-computed capacity dictionary.
+        worker.runtime._info = {"NCPU": 8, "MemTotal": 16 * 1024**3}
+        output = io.StringIO()
+        with patch("backend.docker_runtime.Path.read_text", return_value="MemAvailable: 12582912 kB\n"), patch(
+            "backend.docker_runtime.shutil.disk_usage", return_value=SimpleNamespace(free=10169 * 1024**2)
+        ) as disk, redirect_stderr(output):
+            self.assertFalse(worker.run_once())
+            self.assertIsNone(api.claimed_capacity)
+            blocked = output.getvalue()
+            self.assertIn("disk_mb=1977", blocked)
+            self.assertIn("fits=none", blocked)
+            self.assertIn("/var/lib/docker", blocked)
+            self.assertIn("8192", blocked)
+            self.assertFalse(worker.run_once())
+            self.assertEqual(output.getvalue(), blocked)
+            # A larger storage filesystem restores claims at the unchanged
+            # profile limits and reserve; no Docker daemon is started here.
+            disk.return_value = SimpleNamespace(free=82 * 1024**3)
+            self.assertFalse(worker.run_once())
+            self.assertEqual(api.claimed_capacity["disk_mb"], 24576)
+            self.assertIn("fits=small,standard,large", output.getvalue())
+        self.assertNotIn(config.worker_token, output.getvalue())
+        self.assertNotIn(config.codex_api_key, output.getvalue())
 
     def test_vision_variant_downgrades_only_without_visual_input(self) -> None:
         worker, _, _ = self.worker(None)
