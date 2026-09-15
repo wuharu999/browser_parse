@@ -79,31 +79,65 @@ function buildShell(): void {
 }
 function submissionLabel(): string {
   const state = availability(budget).state;
-  return busy ? t('Working…', '处理中…') : state === 'unknown' ? t('Checking availability…', '正在检查额度…') : state === 'queue_full' ? t('Queue full', '队列已满') : state === 'available' ? t('Analyze incident  →', '开始分析  →') : t('Queue analysis  →', '加入分析队列  →');
+  return busy ? t('Working…', '处理中…') : state === 'unknown' ? t('Checking availability…', '正在检查额度…') : state === 'queue_full' ? t('Queue full', '队列已满') : state === 'budget_wait' ? t('Daily limit reached (20/20)', '今日额度已满 (20/20)') : state === 'available' ? t('Analyze incident  →', '开始分析  →') : t('Queue analysis  →', '加入分析队列  →');
 }
 function renderBudget(): void {
-  const state = availability(budget), money = (value: number) => `$${value.toFixed(2)}`;
+  const state = availability(budget);
   usage.replaceChildren();
   if (!budget || state.state === 'unknown') {
     usage.append(el('p', 'usage-status', t('Daily allowance unavailable. Checking again; your upload draft is preserved.', '暂时无法读取每日额度，正在重试；上传草稿已保留。')));
   } else {
+    const limitShots = budget.daily_limit_shots ?? Math.round(budget.daily_limit_usd ?? 20);
+    const usedShots = budget.used_today ?? Math.round(budget.admission_used_usd ?? 0);
+    const completedShots = budget.completed_today ?? Math.round(budget.spent_usd ?? 0);
+    const runningShots = budget.running ?? 0;
+    const remainingShots = Math.max(0, limitShots - usedShots);
+
     const top = el('div', 'usage-heading');
-    top.append(el('strong', '', t("Today's analysis allowance", '今日分析额度')), el('span', '', `${money(budget.admission_used_usd)} / ${money(budget.daily_limit_usd)}`));
-    const bar = el('div', 'usage-bar'); bar.setAttribute('role', 'progressbar'); bar.setAttribute('aria-label', t('Accounted usage and active reservations', '已计入用量和运行预留额度'));
-    bar.setAttribute('aria-valuemin', '0'); bar.setAttribute('aria-valuemax', String(budget.daily_limit_usd || 1)); bar.setAttribute('aria-valuenow', String(Math.min(budget.daily_limit_usd, budget.admission_used_usd)));
-    bar.setAttribute('aria-valuetext', `${money(budget.admission_used_usd)} / ${money(budget.daily_limit_usd)}`);
-    const settled = el('span', 'usage-settled'), reserved = el('span', 'usage-reserved'); settled.style.width = `${state.settledPercent}%`; reserved.style.width = `${state.reservedPercent}%`; bar.append(settled, reserved);
+    top.append(
+      el('strong', '', t("Today's analysis quota", '今日分析额度')),
+      el('span', '', `${usedShots} / ${limitShots} ${t('shots', '次')}`)
+    );
+    const bar = el('div', 'usage-bar');
+    bar.setAttribute('role', 'progressbar');
+    bar.setAttribute('aria-label', t('Completed and running analyses today', '今日已完成与运行中分析任务'));
+    bar.setAttribute('aria-valuemin', '0');
+    bar.setAttribute('aria-valuemax', String(limitShots));
+    bar.setAttribute('aria-valuenow', String(Math.min(limitShots, usedShots)));
+    bar.setAttribute('aria-valuetext', `${usedShots} / ${limitShots} ${t('shots', '次')}`);
+
+    const settled = el('span', 'usage-settled'), reserved = el('span', 'usage-reserved');
+    settled.style.width = `${state.settledPercent}%`;
+    reserved.style.width = `${state.reservedPercent}%`;
+    bar.append(settled, reserved);
+
     const messages: Record<string, string> = {
-      available: t('You can submit a new analysis. It starts when a worker is ready.', '可以提交新分析；工作器就绪后开始。'),
-      budget_wait: t('You can queue a new analysis, but it must wait for enough allowance to become available.', '可以新建排队任务，但需等待可用额度足够后再开始。'),
+      available: t(`You can submit a new analysis (remaining: ${remainingShots}/${limitShots}). It starts when a worker is ready.`, `可以提交新分析（今日剩余 ${remainingShots}/${limitShots} 次）；工作器就绪后开始。`),
+      budget_wait: t('Daily limit of 20 analyses reached. Resets at 00:00 (Asia/Shanghai).', '今日 20 次分析额度已全部用完，将于次日 00:00（Asia/Shanghai）重置。'),
       capacity_wait: t('Workers are at capacity. New analyses will queue.', '运行名额已满，新分析将排队。'),
       queue_wait: t('You can submit; queued analyses are ahead of the new task.', '可以提交新分析；已有排队任务将先处理。'),
       queue_full: t('Queue full. Wait for a pending slot before submitting a new analysis.', '队列已满。请等待出现空位后再提交新分析。'),
     };
-    usage.append(top, bar, el('p', 'usage-breakdown', t(`Accounted: ${money(budget.spent_usd)} · Running reservations: ${money(budget.active_reservations_usd)} · Remaining: ${money(state.remaining)}`, `已计入：${money(budget.spent_usd)} · 运行预留：${money(budget.active_reservations_usd)} · 剩余：${money(state.remaining)}`)), el('p', 'usage-status', messages[state.state]), el('p', 'usage-note', t(`${state.reservations} job reservations available at ${money(budget.estimated_per_job_usd)} each · ${budget.pending}/${budget.max_pending} pending slots used. Daily reset: ${budget.resets_at.slice(0, 10)} 00:00 (Asia/Shanghai); running reservations carry over. Estimates/reservations, not a verified provider bill.`, `每个任务预留 ${money(budget.estimated_per_job_usd)}，额度可覆盖 ${state.reservations} 个任务 · 待处理名额 ${budget.pending}/${budget.max_pending}。每日重置：${budget.resets_at.slice(0, 10)} 00:00（Asia/Shanghai）；运行中的预留额度跨日保留。这里是估算／预留额度，并非已核实的供应商账单。`)));
+
+    usage.append(
+      top,
+      bar,
+      el('p', 'usage-breakdown', t(
+        `Completed: ${completedShots} · Running: ${runningShots} · Remaining: ${remainingShots}`,
+        `已完成：${completedShots} 次 · 运行中：${runningShots} 次 · 剩余：${remainingShots} 次`
+      )),
+      el('p', 'usage-status', messages[state.state] || messages.available),
+      el('p', 'usage-note', t(
+        `Hard limit: ${limitShots} analyses per day · ${budget.pending}/${budget.max_pending} pending slots used. Daily reset: ${budget.resets_at.slice(0, 10)} 00:00 (Asia/Shanghai).`,
+        `每日上限：${limitShots} 次分析任务 · 待处理名额 ${budget.pending}/${budget.max_pending}。每日重置：${budget.resets_at.slice(0, 10)} 00:00（Asia/Shanghai）。`
+      ))
+    );
     if (budget.resource_envelope) {
-      const limit = budget.resource_envelope;
-      usage.append(el('p', 'usage-note', t(`Maximum per job: ${limit.cpu_milli / 1000} CPU · ${limit.memory_mb / 1024} GiB RAM · ${limit.disk_mb / 1024} GiB monitored disk. Actual worker availability is checked when a worker claims the job.`, `单个任务上限：CPU ${limit.cpu_milli / 1000} 核 · 内存 ${limit.memory_mb / 1024} GiB · 监控磁盘 ${limit.disk_mb / 1024} GiB。实际工作器可用性会在工作器领取任务时确认。`)));
+      const envelope = budget.resource_envelope;
+      usage.append(el('p', 'usage-note', t(
+        `Maximum per job: ${envelope.cpu_milli / 1000} CPU · ${envelope.memory_mb / 1024} GiB RAM · ${envelope.disk_mb / 1024} GiB disk. Actual worker availability is checked when a worker claims the job.`,
+        `单个任务上限：CPU ${envelope.cpu_milli / 1000} 核 · 内存 ${envelope.memory_mb / 1024} GiB · 磁盘 ${envelope.disk_mb / 1024} GiB。实际工作器可用性会在工作器领取任务时确认。`
+      )));
     }
   }
   const start = content.querySelector<HTMLButtonElement>('.start-analysis');

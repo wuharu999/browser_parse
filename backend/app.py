@@ -74,7 +74,8 @@ def bearer(value: str | None) -> str:
 
 
 def create_app(*, db_path: str | None = None, upload_dir: str | None = None) -> FastAPI:
-    store = Store(db_path or os.getenv("JOB_DB", "data/jobs.sqlite3"), upload_dir or os.getenv("JOB_UPLOAD_DIR", "data/uploads"), estimate=float(os.getenv("JOB_ESTIMATE_USD", "5")), daily_limit=float(os.getenv("JOB_DAILY_LIMIT_USD", "10")), max_running=int(os.getenv("JOB_MAX_RUNNING", "2")), max_pending=int(os.getenv("JOB_MAX_PENDING", "20")), lease_seconds=int(os.getenv("JOB_CLAIM_TTL_SECONDS", "1800")), runtime_seconds=int(os.getenv("JOB_MAX_RUNTIME_SECONDS", "1800")), pool_cpu_milli=int(os.getenv("JOB_POOL_CPU_MILLI", "4000")), pool_memory_mb=int(os.getenv("JOB_POOL_MEMORY_MB", "8192")), pool_disk_mb=int(os.getenv("JOB_POOL_DISK_MB", "32768")))
+    daily_shots = int(os.getenv("JOB_DAILY_LIMIT_SHOTS", os.getenv("JOB_DAILY_LIMIT_USD", "20")))
+    store = Store(db_path or os.getenv("JOB_DB", "data/jobs.sqlite3"), upload_dir or os.getenv("JOB_UPLOAD_DIR", "data/uploads"), daily_limit_shots=daily_shots, max_running=int(os.getenv("JOB_MAX_RUNNING", "2")), max_pending=int(os.getenv("JOB_MAX_PENDING", "20")), lease_seconds=int(os.getenv("JOB_CLAIM_TTL_SECONDS", "1800")), runtime_seconds=int(os.getenv("JOB_MAX_RUNTIME_SECONDS", "1800")), pool_cpu_milli=int(os.getenv("JOB_POOL_CPU_MILLI", "4000")), pool_memory_mb=int(os.getenv("JOB_POOL_MEMORY_MB", "8192")), pool_disk_mb=int(os.getenv("JOB_POOL_DISK_MB", "32768")))
     app = FastAPI(title="Robot Log Workbench API", docs_url=None, redoc_url=None)
     app.state.store = store
     configured_origins = {x.strip() for x in os.getenv("JOB_ALLOWED_ORIGINS", "").split(",") if x.strip()}

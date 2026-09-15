@@ -61,15 +61,19 @@ def clean_report(value: str) -> str:
 
 class Store:
     # ponytail: a process-wide SQLite lock; move writes behind a DB service only if traffic needs it.
-    def __init__(self, db_path: str, upload_dir: str, *, estimate: float = 5, daily_limit: float = 10, max_running: int = 2, max_pending: int = 20, lease_seconds: int = 1800, runtime_seconds: int = 1800, pool_cpu_milli: int = 4000, pool_memory_mb: int = 8192, pool_disk_mb: int = 32768):
-        if not math.isfinite(estimate) or estimate <= 0 or not math.isfinite(daily_limit) or daily_limit <= 0 or estimate > daily_limit:
-            raise ValueError("budget settings must be positive finite numbers")
+    def __init__(self, db_path: str, upload_dir: str, *, daily_limit_shots: int = 20, estimate: float = 5, daily_limit: float | None = None, max_running: int = 2, max_pending: int = 20, lease_seconds: int = 1800, runtime_seconds: int = 1800, pool_cpu_milli: int = 4000, pool_memory_mb: int = 8192, pool_disk_mb: int = 32768):
+        if daily_limit is not None and daily_limit > 0:
+            daily_limit_shots = int(daily_limit)
+        if daily_limit_shots <= 0:
+            raise ValueError("daily_limit_shots must be a positive integer")
         if not 1 <= max_running <= 2 or not 1 <= max_pending <= 100 or not 1 <= lease_seconds <= 1800 or not 1 <= runtime_seconds <= 1800:
             raise ValueError("invalid queue, lease, or runtime setting")
         self.path, self.upload_dir = Path(db_path), Path(upload_dir)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
-        self.estimate, self.daily_limit = estimate, daily_limit
+        self.daily_limit_shots = daily_limit_shots
+        self.daily_limit = float(daily_limit_shots)
+        self.estimate = float(estimate) if estimate and estimate > 0 else 5.0
         self.max_running, self.max_pending = max_running, max_pending
         self.lease_seconds, self.runtime_seconds = lease_seconds, runtime_seconds
         if pool_cpu_milli < 1000 or pool_memory_mb < 2048 or pool_disk_mb < 8192:
@@ -318,10 +322,35 @@ class Store:
         with self.lock:
             spent = self.db.execute("SELECT COALESCE(SUM(cost_usd),0) n FROM jobs WHERE finished_day=?", (day,)).fetchone()["n"]
             reserved = self.db.execute("SELECT COALESCE(SUM(reservation),0) n FROM jobs WHERE status='running'", ()).fetchone()["n"]
+            completed_today = self.db.execute("SELECT count(*) n FROM jobs WHERE finished_day=? AND status='completed'", (day,)).fetchone()["n"]
             running = self.db.execute("SELECT count(*) n FROM jobs WHERE status='running'", ()).fetchone()["n"]
+            used_today = completed_today + running
+            remaining_shots = max(0, self.daily_limit_shots - used_today)
             pending = self.db.execute("SELECT count(*) n FROM jobs WHERE status IN ('draft','queued')").fetchone()["n"]
             queued = self.db.execute("SELECT count(*) n FROM jobs WHERE status='queued'").fetchone()["n"]
-        return {"day": day, "timezone": "Asia/Shanghai", "resets_at": resets_at, "daily_limit_usd": self.daily_limit, "estimated_per_job_usd": self.estimate, "spent_usd": spent, "active_reservations_usd": reserved, "admission_used_usd": spent + reserved, "max_running": self.max_running, "running": running, "max_pending": self.max_pending, "pending": pending, "queued": queued, "resource_envelope": self.resource_envelope, "resource_wait": False, "note": "Admission control, not a hard billing ceiling; each worker's advertised Docker capacity decides whether it can claim a queued job."}
+        return {
+            "day": day,
+            "timezone": "Asia/Shanghai",
+            "resets_at": resets_at,
+            "daily_limit_shots": self.daily_limit_shots,
+            "completed_today": completed_today,
+            "used_today": used_today,
+            "remaining_shots": remaining_shots,
+            "max_running": self.max_running,
+            "running": running,
+            "max_pending": self.max_pending,
+            "pending": pending,
+            "queued": queued,
+            # Compatibility fields for legacy consumers
+            "daily_limit_usd": self.daily_limit,
+            "estimated_per_job_usd": self.estimate,
+            "spent_usd": spent,
+            "active_reservations_usd": reserved,
+            "admission_used_usd": spent + reserved,
+            "resource_envelope": self.resource_envelope,
+            "resource_wait": False,
+            "note": f"Hard limit: {self.daily_limit_shots} analysis shots per day. Resets daily at 00:00 Asia/Shanghai."
+        }
 
     def _expire_leases(self) -> None:
         expired = self.db.execute("SELECT id,reservation FROM jobs WHERE status='running' AND (lease_until<? OR run_deadline<?)", (stamp(), stamp())).fetchall()
@@ -335,7 +364,7 @@ class Store:
         with self.lock:
             self._tx(); self._expire_leases()
             budget = self.budget()
-            if budget["running"] >= self.max_running or budget["admission_used_usd"] + self.estimate > self.daily_limit:
+            if budget["running"] >= self.max_running or budget["used_today"] >= self.daily_limit_shots:
                 self.db.commit(); return None, budget
             if self.db.execute("SELECT 1 FROM jobs WHERE status='running' AND worker_id=?", (worker_id,)).fetchone():
                 self.db.commit(); return None, budget
@@ -354,6 +383,7 @@ class Store:
             updated = self.db.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()
             self.db.commit()
             return self._worker(updated), self.budget()
+
 
     def worker_job(self, job_id: str, worker_id: str) -> dict | None:
         worker_id = self._worker_identity(worker_id)

@@ -107,19 +107,6 @@ def _input_path(file_id: str, name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Cost estimation — token-count based, using snapshot pricing (USD / 1M tokens)
-# Rates: https://api-docs.deepseek.com/quick_start/pricing/  (as of 2026-09-11)
-# Output token price covers reasoning tokens (billed identically by DeepSeek).
-# Cache-hit discount: 0.1× input rate.
-# ---------------------------------------------------------------------------
-_DEEPSEEK_RATES: dict[str, tuple[float, float]] = {
-    # model                              in/1M   out/1M  (peak, non-off-peak)
-    "deepseek-v4-flash":              (0.44,  1.32),
-    "deepseek-v4-flash-vision-exp":   (0.44,  1.32),
-    "deepseek-v4-pro":                (1.32,  3.96),
-}
-_CACHE_DISCOUNT = 0.1  # cached input tokens billed at 10% of input rate
-
 # Extensions that require a vision endpoint (image or PDF content)
 _VISION_EXTENSIONS = frozenset({
     ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tiff", ".tif", ".pdf",
@@ -134,33 +121,6 @@ def _needs_vision(files: list[dict]) -> bool:
         if ext in _VISION_EXTENSIONS:
             return True
     return False
-
-
-def _compute_cost(model: str, usage: dict[str, int]) -> tuple[float, str]:
-    """Estimate cost_usd from SDK-reported token counts.
-
-    Returns (cost_usd, cost_source).  Falls back to (0.0, "no_usage") when
-    usage is empty or the model is not in the pricing table.
-
-    Token key names follow the OpenAI / DeepSeek SDK convention:
-      input_tokens          — prompt tokens (may overlap with cached_tokens)
-      output_tokens         — completion tokens (includes reasoning tokens)
-      input_tokens_details  — dict containing "cached_tokens" sub-key
-    """
-    rates = _DEEPSEEK_RATES.get(model)
-    if not rates or not usage:
-        return 0.0, "no_usage"
-    input_rate, output_rate = rates
-    cache_rate = input_rate * _CACHE_DISCOUNT
-
-    total_in  = int(usage.get("input_tokens",  0))
-    total_out = int(usage.get("output_tokens", 0))
-    details   = usage.get("input_tokens_details") or {}
-    cached    = int(details.get("cached_tokens", 0)) if isinstance(details, dict) else 0
-
-    billable_in = max(0, total_in - cached)
-    cost = (billable_in * input_rate + cached * cache_rate + total_out * output_rate) / 1_000_000
-    return round(cost, 8), "token_based"
 
 
 
@@ -609,12 +569,9 @@ class DockerWorker:
             result = self._result(container)
             metrics = dict(result.get("metrics") or {})
             runtime_s = round(time.monotonic() - started, 3)
-            # Compute token-based cost from SDK usage report in result metrics
             codex_usage = metrics.get("codex_usage") or {}
-            cost_usd, cost_source = _compute_cost(self.config.codex_model, codex_usage)
             metrics.update({
                 "runtime_seconds": runtime_s,
-                "cost_source": cost_source,
                 "model": self.config.codex_model,
                 # Preserve raw token counts for display/audit
                 "input_tokens":  codex_usage.get("input_tokens",  0),
@@ -627,8 +584,7 @@ class DockerWorker:
                 self._unconfirmed_kill(job_id)
                 return
             container = None
-            # Pass cost_usd=None when unknown (store falls back to reservation)
-            self.api.finish(job_id, status, report, cost_usd if cost_source == "token_based" else None, metrics)
+            self.api.finish(job_id, status, report, 0.0, metrics)
         except JobCancelled:
             if container is not None and not self.runtime.remove(container):
                 self._unconfirmed_kill(job_id)
