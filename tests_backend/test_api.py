@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import tempfile
+import sqlite3
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -13,6 +14,21 @@ from backend.app import create_app  # noqa: E402
 
 
 class ApiTest(unittest.TestCase):
+    def test_events_schema_migrates_from_pre_subagent_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "old.sqlite3"
+            db = sqlite3.connect(path)
+            db.execute("CREATE TABLE events (seq INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT, created_at TEXT, kind TEXT, agent TEXT, message TEXT)")
+            db.execute("INSERT INTO events(job_id,created_at,kind,agent,message) VALUES('legacy','2026-01-01','notice','codex','Legacy event')")
+            db.commit(); db.close()
+            app = create_app(db_path=str(path), upload_dir=str(Path(directory) / "uploads"))
+            columns = {row["name"] for row in app.state.store.db.execute("PRAGMA table_info(events)")}
+            self.assertIn("subagent", columns)
+            rows, _ = app.state.store.events("legacy", 0)
+            self.assertEqual(rows[0]["message"], "Legacy event")
+            self.assertIsNone(rows[0]["subagent"])
+            app.state.store.db.close()
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
@@ -250,6 +266,64 @@ class ApiTest(unittest.TestCase):
         versions = self.client.get(f"/api/jobs/{jid}/versions").json()
         self.assertEqual(len(versions), 1)
         self.assertEqual(versions[0]["reviewer_name"], "Reviewer")
+
+    def test_native_codex_lifecycle_reaches_public_api_through_worker(self):
+        from types import SimpleNamespace
+        from sandbox.run_codex import _activity
+        from backend.worker import DockerWorker
+        from backend.docker_runtime import DockerJob
+
+        jid = self.submit(self.job()); self.claim_worker()
+        target = Path(self.temp.name) / "activity.jsonl"
+        observed = set()
+        _activity({"type": "item.completed", "item": {"type": "collab_tool_call", "tool": "spawn_agent",
+                   "status": "completed", "sender_thread_id": "parent", "receiver_thread_ids": ["child"],
+                   "prompt": "private child task", "agents_states": {"child": {"status": "running", "message": "private result"}}}}, target, observed)
+
+        def event(job_id, kind, message, agent="worker", subagent=None):
+            response = self.client.post(f"/api/worker/jobs/{job_id}/events", headers=self.worker,
+                json={"kind": kind, "message": message, "agent": agent, "subagent": subagent})
+            self.assertEqual(response.status_code, 201)
+
+        worker = DockerWorker.__new__(DockerWorker)
+        worker.runtime = SimpleNamespace(copy_out_text=lambda *_args: target.read_text())
+        worker.api = SimpleNamespace(event=event)
+        worker._secrets = ()
+        self.assertEqual(worker._activity(DockerJob("fixture", "volume"), jid, 0), 1)
+        detail = self.client.get(f"/api/jobs/{jid}").json()
+        self.assertEqual(observed, {"child"})
+        self.assertEqual(detail["subagents"][0]["thread_id"], "child")
+        self.assertEqual(detail["subagents"][0]["status"], "running")
+        public_events = self.client.get(f"/api/jobs/{jid}/events").json()
+        self.assertNotIn("private child task", json.dumps(public_events))
+        self.assertNotIn("private result", json.dumps(public_events))
+
+    def test_subagent_event_roundtrip_validation_and_full_history_summary(self):
+        jid = self.submit(self.job()); self.claim_worker()
+        child = {"thread_id": "child/one:1", "parent_thread_id": None, "status": "running", "tool": "spawn_agent", "role": "log_investigator"}
+        response = self.client.post(f"/api/worker/jobs/{jid}/events", headers=self.worker, json={"kind": "subagent", "agent": "subagent", "message": "Subagent lifecycle update.", "subagent": child})
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()["subagent"], child)
+        for bad in ({**child, "thread_id": "bad space"}, {**child, "status": []}, {**child, "tool": {}},
+                    {**child, "role": []}, {**child, "prompt": "private"}):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.client.post(f"/api/worker/jobs/{jid}/events", headers=self.worker,
+                    json={"kind": "subagent", "message": "x", "subagent": bad}).status_code, 422)
+        store = self.client.app.state.store
+        with store.lock:
+            old_child = {**child, "thread_id": "child-old", "status": "completed"}
+            old_event = store._event(jid, "subagent", "subagent", "Subagent lifecycle update.", old_child)
+            for number in range(501): store._event(jid, "notice", "worker", str(number))
+            store._event(jid, "subagent", "subagent", "Subagent lifecycle update.", {**child, "status": "completed", "tool": "wait"})
+            store.db.commit()
+        detail = self.client.get(f"/api/jobs/{jid}").json()
+        self.assertEqual(detail["subagents"][0], {**old_child, "seq": old_event["seq"]})
+        self.assertEqual(detail["subagents"][1]["status"], "completed")
+        active = self.client.get("/api/jobs/active").json()["items"]
+        self.assertEqual(next(job for job in active if job["id"] == jid)["subagents"], detail["subagents"])
+        page = self.client.get(f"/api/jobs/{jid}/events?latest=true").json()["events"]
+        self.assertFalse(any(event["subagent"] and event["subagent"]["thread_id"] == "child-old" for event in page))
+        self.assertEqual(self.client.get(f"/api/jobs/{jid}/events?latest=true").json()["events"][-1]["subagent"]["status"], "completed")
 
 
 if __name__ == "__main__": unittest.main()

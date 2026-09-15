@@ -60,6 +60,43 @@ class RunnerTests(unittest.TestCase):
             self.assertGreater(len(records), 1)
             self.assertEqual(records[-1]["seq"], 200)
 
+    def test_native_collaboration_tracks_all_children_without_exposing_payloads(self):
+        event = {"type": "item.completed", "item": {"type": "collab_tool_call",
+                 "tool": "spawn_agent", "status": "completed", "sender_thread_id": "parent",
+                 "receiver_thread_ids": ["child-a", "child-b"], "prompt": "private task",
+                 "agents_states": {"child-a": {"status": "running", "message": "private result"},
+                                   "child-b": {"status": "pending_init"}}}}
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory, "activity.jsonl")
+            children = set()
+            run_codex._activity(event, target, children)
+            self.assertEqual(children, {"child-a", "child-b"})
+            records = [json.loads(line) for line in target.read_text().splitlines()]
+            self.assertEqual([r["seq"] for r in records], [1, 2])
+            self.assertEqual([r["subagent"]["status"] for r in records], ["running", "pending_init"])
+            self.assertTrue(all(r["subagent"]["parent_thread_id"] == "parent" for r in records))
+            self.assertTrue(all(r["agent"] == "subagent" for r in records))
+            self.assertNotIn("private", target.read_text())
+            event["type"] = "item.updated"
+            event["item"]["tool"] = "wait"
+            event["item"]["agents_states"]["child-a"]["status"] = "completed"
+            run_codex._activity(event, target, children)
+            self.assertEqual(json.loads(target.read_text().splitlines()[-2])["subagent"]["status"], "completed")
+
+    def test_native_collaboration_rejects_invalid_identity_and_does_not_invent_spawn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory, "activity.jsonl")
+            event = {"type": "item.started", "item": {"type": "collab_tool_call", "tool": "spawn_agent", "status": "in_progress", "receiver_thread_ids": []}}
+            run_codex._activity(event, target)
+            self.assertFalse(target.exists())
+            event["item"]["receiver_thread_ids"] = [None, {}, "bad id", "x" * 121, "good-id", "good-id"]
+            event["item"]["agents_states"] = {"good-id": {"status": "unexpected private text"}}
+            run_codex._activity(event, target)
+            records = [json.loads(line) for line in target.read_text().splitlines()]
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["subagent"], {"thread_id": "good-id", "parent_thread_id": None, "status": "unknown", "tool": "spawn_agent"})
+            self.assertNotIn("private", target.read_text())
+
     def test_final_report_keeps_long_structured_json_and_source_path(self):
         report = json.dumps({"schemaVersion": "robot-analysis/v1", "source": "archive/folder/log.txt", "findings": ["x" * 8500]})
         event = {"type": "item.completed", "item": {"type": "agent_message", "channel": "final", "text": report}}

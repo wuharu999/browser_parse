@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import signal
 import sqlite3
 import subprocess
@@ -221,9 +222,41 @@ def _safe_tool_action(item: dict[str, Any], event_type: str) -> str:
     return action_label[:ACTIVITY_MESSAGE_MAX_CHARS]
 
 
-def _activity(event: dict[str, Any], output: Path) -> tuple[str | None, str | None]:
+CHILD_STATUSES = {"pending_init", "running", "interrupted", "completed", "errored", "shutdown", "not_found", "unknown"}
+COLLAB_TOOLS = {"spawn_agent", "send_input", "wait", "close_agent"}
+
+
+def _thread_id(value: object) -> str | None:
+    return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9._:/-]{1,120}", value) else None
+
+
+def _append_activity(output: Path, additions: list[dict[str, Any]]) -> None:
+    old = output.read_text(errors="replace") if output.exists() else ""
+    sequence = 1
+    if old:
+        try:
+            sequence = int(json.loads(old.splitlines()[-1]).get("seq", 0)) + 1
+        except (ValueError, TypeError, json.JSONDecodeError):
+            pass
+    records = old.splitlines()
+    for addition in additions:
+        records.append(json.dumps({**addition, "seq": sequence}, separators=(",", ":")))
+        sequence += 1
+    # Keep whole records and monotonically increasing cursors across ring rotation.
+    retained: list[str] = []
+    used = 0
+    for line in reversed(records):
+        size = len((line + "\n").encode("utf-8"))
+        if size > ACTIVITY_MAX_BYTES or used + size > ACTIVITY_MAX_BYTES:
+            break
+        retained.append(line)
+        used += size
+    output.write_text("\n".join(reversed(retained)) + ("\n" if retained else ""))
+
+
+def _activity(event: dict[str, Any], output: Path, observed_children: set[str] | None = None) -> tuple[str | None, str | None]:
     event_type = event.get("type")
-    if not isinstance(event_type, str) or event_type not in {"thread.started", "thread.completed", "turn.started", "turn.completed", "turn.failed", "item.started", "item.completed"}:
+    if not isinstance(event_type, str) or event_type not in {"thread.started", "thread.completed", "turn.started", "turn.completed", "turn.failed", "item.started", "item.updated", "item.completed"}:
         return None, None
     item = event.get("item") if isinstance(event.get("item"), dict) else {}
     if item.get("type") == "reasoning" or item.get("channel") in {"analysis", "reasoning"} or event.get("channel") in {"analysis", "reasoning"}:
@@ -234,13 +267,32 @@ def _activity(event: dict[str, Any], output: Path) -> tuple[str | None, str | No
     agent = agent if agent in SAFE_AGENTS else "codex"
     thread_id = event.get("thread_id") or item.get("thread_id")
     thread_id = thread_id if isinstance(thread_id, str) and len(thread_id) <= 120 else None
-    sequence = 1
-    old = output.read_text(errors="replace") if output.exists() else ""
-    if old:
-        try:
-            sequence = int(json.loads(old.splitlines()[-1]).get("seq", 0)) + 1
-        except (ValueError, TypeError, json.JSONDecodeError):
-            pass
+    if item.get("type") == "collab_tool_call":
+        tool = item.get("tool")
+        if not isinstance(tool, str) or tool not in COLLAB_TOOLS:
+            return None, None
+        parent = _thread_id(item.get("sender_thread_id"))
+        receivers = item.get("receiver_thread_ids")
+        states = item.get("agents_states")
+        states = states if isinstance(states, dict) else {}
+        children = dict.fromkeys(child for value in (receivers if isinstance(receivers, list) else [])
+                                 if (child := _thread_id(value)) and child != parent)
+        additions = []
+        for child in children:
+            state = states.get(child)
+            status = state.get("status") if isinstance(state, dict) else None
+            status = status if isinstance(status, str) and status in CHILD_STATUSES else "unknown"
+            # A completed collaboration tool does not mean its child finished.
+            metadata = {"thread_id": child, "parent_thread_id": parent, "status": status, "tool": tool}
+            additions.append({"agent": "subagent", "kind": "subagent",
+                              "message": f"Subagent {status} ({tool}).", "thread_id": child, "subagent": metadata})
+            if observed_children is not None:
+                observed_children.add(child)
+        if additions:
+            _append_activity(output, additions)
+            return "subagent", next(iter(children))
+        # Spawn-begin events have no child yet. Do not invent an identity.
+        return None, None
     message, activity_kind = f"Codex activity: {event_type}", "lifecycle"
     if (public := _activity_agent_message(event)) is not None:
         message, activity_kind = public, "message"
@@ -249,19 +301,7 @@ def _activity(event: dict[str, Any], output: Path) -> tuple[str | None, str | No
     elif item.get("type") in {"agent", "subagent", "agent_thread"}:
         state = "started" if event_type in {"thread.started", "item.started"} else "completed" if event_type in {"turn.completed", "item.completed"} else "updated"
         message, activity_kind = f"Subagent {agent} {state}.", "subagent"
-    record = json.dumps({"seq": sequence, "agent": agent, "kind": activity_kind, "message": message, "thread_id": thread_id}, separators=(",", ":")) + "\n"
-    # Retain only whole JSONL records.  A byte slice may begin mid-record and
-    # makes the worker's cursor unreliable after ring rotation.
-    records = [line for line in (old.splitlines() + [record.rstrip("\n")]) if line]
-    retained: list[str] = []
-    used = 0
-    for line in reversed(records):
-        size = len((line + "\n").encode("utf-8"))
-        if size > ACTIVITY_MAX_BYTES or used + size > ACTIVITY_MAX_BYTES:
-            break
-        retained.append(line)
-        used += size
-    output.write_text("\n".join(reversed(retained)) + ("\n" if retained else ""))
+    _append_activity(output, [{"agent": agent, "kind": activity_kind, "message": message, "thread_id": thread_id}])
     return agent, thread_id
 
 
@@ -642,16 +682,19 @@ def main() -> int:
             if line:
                 try:
                     event = json.loads(line)
-                    agent, thread_id = _activity(event, WORKSPACE / "activity.jsonl")
+                    agent, thread_id = _activity(event, WORKSPACE / "activity.jsonl", observed_children)
                     if agent in {"log_investigator", "telemetry_investigator", "evidence_reviewer"} and thread_id:
                         observed_children.add(thread_id)
                     usage = _usage(event) or usage
                 except json.JSONDecodeError:
                     pass
-            elif line is None or process.poll() is not None:
+            elif line is None:
                 break
             if time.monotonic() >= deadline:
-                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
                 try:
                     process.wait(timeout=5)
                 except subprocess.TimeoutExpired:

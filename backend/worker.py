@@ -20,6 +20,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from .lifecycle import validate_subagent
 from .guard import (
     GuardError,
     GuardVerdict,
@@ -307,9 +308,9 @@ class WorkerApi:
             raise ApiError("worker file download is unavailable") from exc
         return size, digest.hexdigest()
 
-    def event(self, job_id: str, kind: str, message: str, agent: str = "worker") -> None:
+    def event(self, job_id: str, kind: str, message: str, agent: str = "worker", subagent: dict[str, Any] | None = None) -> None:
         self._request("POST", f"/api/worker/jobs/{job_id}/events", {
-            "kind": kind, "agent": agent, "message": message,
+            "kind": kind, "agent": agent, "message": message, "subagent": subagent,
         })
 
     def sanitize(self, job_id: str, original_description: str, sanitized_description: str) -> dict[str, Any]:
@@ -414,8 +415,11 @@ class DockerWorker:
             if "__pycache__" in relative.parts or relative.suffix == ".pyc": continue
             target = destination / relative; target.parent.mkdir(parents=True, exist_ok=True); target.write_bytes(path.read_bytes())
 
-    def _event(self, job_id: str, kind: str, message: str, agent: str = "worker") -> None:
-        self.api.event(job_id, kind, _safe_text(message, self._secrets), agent)
+    def _event(self, job_id: str, kind: str, message: str, agent: str = "worker", subagent: dict[str, Any] | None = None) -> None:
+        if subagent is None:
+            self.api.event(job_id, kind, _safe_text(message, self._secrets), agent)
+        else:
+            self.api.event(job_id, kind, _safe_text(message, self._secrets), agent, subagent)
 
     def _timeout_for(self, job: dict[str, Any]) -> int:
         """The API may make a short approved benchmark; no job can exceed 30 min."""
@@ -440,12 +444,12 @@ class DockerWorker:
                     continue
                 # Safe agent whitelist for activity event streaming (R2.3).
                 # Must match SAFE_AGENTS in sandbox/run_codex.py to prevent downgrading subagent events to orchestrator.
-                agent = event.get("agent") if event.get("agent") in {"codex", "log_investigator", "telemetry_investigator", "evidence_reviewer"} else "codex"
+                agent = event.get("agent") if event.get("agent") in {"codex", "log_investigator", "telemetry_investigator", "evidence_reviewer", "subagent"} else "codex"
                 message = event.get("message") if isinstance(event.get("message"), str) else "Codex activity."
                 activity_kind = event.get("kind")
                 if activity_kind not in {None, "message", "tool", "subagent", "lifecycle"}:
                     continue
-                # The UI has one public event category today; preserve a compact
+                child: dict[str, Any] | None = None
                 if activity_kind == "tool":
                     safe_prefixes = (
                         "Codex tool execution",
@@ -461,11 +465,14 @@ class DockerWorker:
                     if not any(message.startswith(p) for p in safe_prefixes):
                         message = "Codex tool execution update."
                 elif activity_kind == "subagent":
-                    if not message.startswith("Subagent "):
-                        message = f"Subagent {agent} update."
+                    try:
+                        child = validate_subagent(event.get("subagent"))
+                    except ValueError:
+                        child = None
+                    message = "Subagent lifecycle update." if child else f"Subagent {agent} update."
                 public = _safe_text(message, self._secrets)[:800]
                 if public:
-                    self._event(job_id, "progress", public, agent)
+                    self._event(job_id, "subagent" if activity_kind == "subagent" and child else "progress", public, agent, child)
                 newest = max(newest, sequence)
             except (TypeError, ValueError, json.JSONDecodeError):
                 pass
@@ -590,6 +597,8 @@ class DockerWorker:
                 seen_activity = self._activity(container, job_id, seen_activity)
                 self._event(job_id, "heartbeat", "Docker execution remains active.")
                 time.sleep(min(15, self.config.poll_seconds))
+            # The runner can flush lifecycle records immediately before exit.
+            seen_activity = self._activity(container, job_id, seen_activity)
             if command.returncode: raise WorkerError("Docker runner did not complete successfully")
             self._checkpoint(job_id, deadline)
             if not self.runtime.disk_healthy(container, plan["disk_mb"]): raise WorkerError("Docker workspace or host disk limit reached")

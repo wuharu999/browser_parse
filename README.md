@@ -149,7 +149,7 @@ To prevent exploratory tool stalls, redundant skill reads, and multi-minute reas
 - **Frontend Process Grid Integration**:
   - `src/main.ts` renders a live 4-card process grid (`Codex Orchestrator`, `Log Investigator`, `Telemetry Investigator`, and `Evidence Reviewer`) with live status badges and expandable intermediate output inspection drawers.
   - Page and transcript scroll positions are automatically preserved across 3-second live poll intervals (`renderResult`).
-  - The Docker container card is cleanly scoped to active analyses (running/queued/draft) and hidden on completed history views.
+  - Container and child-thread activity cards remain visible on completed history views. Native Codex collaboration events retain child IDs and observed states; missing historical events are shown as unknown, not proof that a child was never invoked.
 - **Sandbox Python Virtualenv Auto-Sourcing**:
   - `backend/worker.py::_container_env()` prioritizes `/opt/analysis-venv/bin` in `PATH` and exports `VIRTUAL_ENV=/opt/analysis-venv`.
   - `sandbox/run_codex.py::_setup_virtualenv()` automatically detects and activates pre-installed virtualenvs at startup, updating `os.environ`, `sys.path`, and writing the workspace activation hook `/workspace/.bashrc` with `BASH_ENV` configured; the read-only root prevents system profile changes. Subshells and Codex tool executions run with full package access (`rosbags`, `mcap`, `numpy`, `pandas`, `pypdf`, `h5py`).

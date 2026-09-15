@@ -1,13 +1,14 @@
 import './style.css';
+import { subagentStates, subagentBadge, type SubagentState, type SubagentSummary } from './subagents';
 import { DEFAULT_LIMITS, type LogPackage, type WorkerResponse } from './types';
 import { parseReport } from './report';
 import { availability, type Budget } from './budget';
 import { uploadFile, protectUpload, type UploadProgress, type WakeState } from './upload';
 import { onUiLanguage, setUiLanguage, t, uiLanguage } from './i18n';
 
-type Job = { id: string; description: string; status: string; created_at: string; cancel_requested: boolean; report?: string; resource_plan?: { profile: string; cpu_milli: number; memory_mb: number; disk_mb: number } | null; review_claim?: { name: string; expires_at: string } | null; sanitized_description?: string };
+type Job = { subagents?: SubagentSummary[]; id: string; description: string; status: string; created_at: string; cancel_requested: boolean; report?: string; resource_plan?: { profile: string; cpu_milli: number; memory_mb: number; disk_mb: number } | null; review_claim?: { name: string; expires_at: string } | null; sanitized_description?: string };
 type Version = { id: number; reviewer_name: string; success: boolean; note: string; procedure: string; created_at: string };
-type Event = { seq: number; agent: string; kind: string; message: string; created_at?: string };
+type Event = { subagent?: SubagentState | null; seq: number; agent: string; kind: string; message: string; created_at?: string };
 type Draft = { name: string; procedure: string; note: string; verdict: string; token?: string; expires_at?: string };
 const terminal = (job: Job) => ['completed', 'failed', 'cancelled'].includes(job.status);
 const el = <K extends keyof HTMLElementTagNameMap>(tag: K, cls = '', text?: string): HTMLElementTagNameMap[K] => {
@@ -143,7 +144,7 @@ function renderActivity(): void {
 
   const signature = JSON.stringify([
     online,
-    active.map(j => [j.id, j.status, j.cancel_requested, j.resource_plan]),
+    active.map(j => [j.id, j.status, j.cancel_requested, j.resource_plan, j.subagents]),
     active.map(j => (events.get(j.id) ?? []).length),
     active.map(j => (events.get(j.id) ?? []).at(-1)?.seq),
     active.map(j => (events.get(j.id) ?? []).at(-1)?.message),
@@ -249,58 +250,40 @@ function sandboxAbstractionPanel(id: string, records: Event[]): HTMLElement {
   container.append(guardBar);
 
   const processGrid = el('div', 'sandbox-process-grid');
-  // 3-subagent specialization roster (R2.1, R2.4):
-  // standardAgents defines the orchestrator and all 3 specialized subagents so each
-  // renders a process card, live status badge, and intermediate output drawer in the UI grid.
-  const standardAgents: Array<{ id: string; name: string; role: string; icon: string }> = [
+  const children = subagentStates(job?.subagents, records);
+  const roleNames: Record<string, string> = { log_investigator: 'Log Investigator', telemetry_investigator: 'Telemetry Investigator', evidence_reviewer: 'Evidence Reviewer' };
+  const agentDefs: Array<{ id: string; name: string; role: string; icon: string; child?: SubagentSummary }> = [
     { id: 'codex', name: 'Codex Orchestrator', role: t('Parent Process', '主分析进程'), icon: '⚡' },
-    { id: 'log_investigator', name: 'Log Investigator', role: t('Subagent', '诊断子进程'), icon: '🔍' },
-    { id: 'telemetry_investigator', name: 'Telemetry Investigator', role: t('Subagent', '遥测子进程'), icon: '📊' },
-    { id: 'evidence_reviewer', name: 'Evidence Reviewer', role: t('Subagent', '审查子进程'), icon: '📋' },
+    ...children.map(child => ({ id: child.thread_id,
+      name: child.role ? roleNames[child.role] ?? 'Subagent' : 'Subagent',
+      role: child.thread_id, icon: '⚙️', child })),
   ];
-  const agentDefs = [...standardAgents];
-
-  for (const rec of records) {
-    if (rec.agent && !['worker', 'guard'].includes(rec.agent) && !agentDefs.some(d => d.id === rec.agent)) {
-      agentDefs.push({ id: rec.agent, name: rec.agent, role: t('Agent Process', '分析进程'), icon: '⚙️' });
-    }
+  // Legacy named activity has no reliable child identity or completion state.
+  for (const [role, name] of Object.entries(roleNames)) {
+    if (!children.some(child => child.role === role)) agentDefs.push({ id: role, name, role: t('Configured role', '已配置角色'), icon: '⚙️' });
   }
 
   for (const def of agentDefs) {
-    const agentEvents = records.filter(e => e.agent === def.id && !isHeartbeat(e));
-    const card = el('div', `sandbox-process-card ${def.id}`);
+    const agentEvents = records.filter(e => !isHeartbeat(e) && (def.child
+      ? e.subagent?.thread_id === def.id
+      : !e.subagent && e.agent === def.id));
+    const card = el('div', `sandbox-process-card ${def.child ? 'subagent' : def.id}`);
 
     const cardHeader = el('div', 'process-card-header');
     const headerLeft = el('div', 'process-title-group');
     headerLeft.append(el('span', 'process-icon', def.icon), el('span', 'process-name', def.name), el('span', 'process-role', def.role));
 
-    let agentStatus = t('Standby', '待命');
-    let agentStatusCls = 'standby';
-    if (isRunning) {
-      if (def.id === 'codex') {
-        agentStatus = t('Active', '执行中');
-        agentStatusCls = 'active';
-      } else if (agentEvents.length > 0) {
-        const last = agentEvents[agentEvents.length - 1];
-        if (last.message.includes('completed') || last.kind === 'artifact') {
-          agentStatus = t('Completed', '已完成');
-          agentStatusCls = 'completed';
-        } else {
-          agentStatus = t('Active', '执行中');
-          agentStatusCls = 'active';
-        }
-      }
-    } else if (isCompleted) {
-      if (agentEvents.length > 0 || def.id === 'codex') {
-        agentStatus = t('Completed', '已完成');
-        agentStatusCls = 'completed';
-      } else {
-        agentStatus = t('Not invoked', '未调用');
-        agentStatusCls = 'idle';
-      }
-    } else if (isFailed || isCancelled) {
-      agentStatus = t('Stopped', '已终止');
-      agentStatusCls = 'stopped';
+    let agentStatus = t('No recorded activity', '无活动记录');
+    let agentStatusCls = 'idle';
+    if (def.child) {
+      const badge = subagentBadge(def.child, !!job && terminal(job));
+      agentStatus = t(badge.en, badge.zh);
+      agentStatusCls = badge.cls;
+    } else if (def.id === 'codex') {
+      agentStatus = isRunning ? t('Active', '执行中') : isCompleted ? t('Completed', '已完成') : isFailed || isCancelled ? t('Stopped', '已终止') : t('Standby', '待命');
+      agentStatusCls = isRunning ? 'active' : isCompleted ? 'completed' : isFailed || isCancelled ? 'stopped' : 'standby';
+    } else if (agentEvents.length) {
+      agentStatus = t('Activity recorded · state unknown', '有活动记录 · 状态未知');
     }
 
     const cardBadge = el('span', `process-badge ${agentStatusCls}`, agentStatus);
@@ -310,8 +293,10 @@ function sandboxAbstractionPanel(id: string, records: Event[]): HTMLElement {
     const latestAction = el('div', 'process-latest-action');
     if (agentEvents.length > 0) {
       latestAction.textContent = agentEvents[agentEvents.length - 1].message;
+    } else if (def.child) {
+      latestAction.textContent = t('Latest lifecycle state retained in job history.', '任务历史已保留最新生命周期状态。');
     } else if (isRunning) {
-      latestAction.textContent = def.id === 'codex' ? t('Orchestrating tasks…', '正在调度任务…') : t('Waiting for subagent task dispatch…', '等待子进程任务分派…');
+      latestAction.textContent = def.id === 'codex' ? t('Orchestrating tasks…', '正在调度任务…') : t('No child activity recorded for this role.', '此角色暂无子进程活动记录。');
     } else {
       latestAction.textContent = t('No activities recorded.', '暂无活动记录。');
     }
@@ -383,11 +368,8 @@ function sessionPanel(id: string, records: Event[]): HTMLDetailsElement {
   const panel = el('details', 'session-panel'); panel.dataset.job = id; panel.open = sessionViews.get(id)?.open ?? true;
   panel.append(el('summary', '', t('Session activity & output', '会话活动与输出')), el('p', 'session-hint', t('Public progress, tool status and output. Private reasoning and raw command output are not shared.', '公开进展、工具状态及输出；不展示私密推理和原始命令输出。')));
 
-  // Only show the isolated-container progress panel while a job is active.
-  // Completed / failed / cancelled history jobs show the transcript directly.
-  const job = findJob(id);
-  const isActive = !job || job.status === 'running' || job.status === 'queued' || job.status === 'draft';
-  if (isActive) panel.append(sandboxAbstractionPanel(id, records));
+  // Keep observed lifecycle history visible after the container is removed.
+  panel.append(sandboxAbstractionPanel(id, records));
 
   const transcriptDetails = el('details', 'transcript-collapsible');
   transcriptDetails.open = true;
@@ -589,7 +571,7 @@ async function loadDetail(force = false): Promise<void> {
       notice(t('Your editing reservation expired. Your draft is preserved; reserve editing again to save.', '编辑锁定已过期。草稿已保留，请重新申请编辑后保存。')); force = true;
     }
     if (!pausedSessions.has(id)) events.set(id, selectedEvents);
-    const signature = JSON.stringify([job.status, job.cancel_requested, job.report, job.review_claim, versions]);
+    const signature = JSON.stringify([job.status, job.cancel_requested, job.report, job.review_claim, job.subagents, versions]);
     if (force || detailNeedsRender || signature !== detailSignature) { detailSignature = signature; if (force || detailNeedsRender || !drafts.has(id)) { renderResult(); detailNeedsRender = false; } }
   } catch (error) { if (selected === id) notice(`${t('Could not open analysis', '无法打开分析')}：${error}`, true); }
 }

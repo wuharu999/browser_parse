@@ -97,8 +97,8 @@ class FakeApi:
     def get_job(self, _job_id: str) -> dict:
         return {"cancel_requested": self.cancel_requested}
 
-    def event(self, _job_id: str, kind: str, message: str, agent: str = "worker") -> None:
-        self.events.append({"kind": kind, "message": message, "agent": agent})
+    def event(self, _job_id: str, kind: str, message: str, agent: str = "worker", subagent=None) -> None:
+        self.events.append({"kind": kind, "message": message, "agent": agent, "subagent": subagent})
 
     def finish(self, _job_id: str, status: str, report: str, cost_usd, metrics: dict) -> None:
         self.finished.append({"status": status, "report": report, "cost_usd": cost_usd, "metrics": metrics})
@@ -239,6 +239,32 @@ class DockerWorkerTests(unittest.TestCase):
         self.assertNotIn("model-key", api.events[1]["message"])
         self.assertIn("reviewed evidence", api.events[1]["message"])
 
+    def test_activity_forwards_safe_subagent_lifecycle(self) -> None:
+        worker, api, runtime = self.worker(None)
+        child = {"thread_id": "child/1", "parent_thread_id": None, "status": "running", "tool": "spawn_agent", "role": "log_investigator"}
+        runtime.activity = json.dumps({"seq": 1, "agent": "subagent", "kind": "subagent", "message": "private prompt", "subagent": child})
+        self.assertEqual(worker._activity(DockerJob("c", "v"), "job", 0), 1)
+        self.assertEqual(api.events[0]["kind"], "subagent")
+        self.assertEqual(api.events[0]["agent"], "subagent")
+        self.assertEqual(api.events[0]["subagent"], child)
+
+    def test_activity_rejects_private_metadata_before_forwarding(self) -> None:
+        worker, api, runtime = self.worker(None)
+        runtime.activity = json.dumps({"seq": 1, "agent": "subagent", "kind": "subagent",
+                                      "subagent": {"thread_id": "child", "prompt": "private task"}})
+        worker._activity(DockerJob("c", "v"), "job", 0)
+        self.assertIsNone(api.events[0]["subagent"])
+        self.assertNotIn("private", json.dumps(api.events))
+
+    def test_finished_runner_drains_child_events_before_cleanup(self) -> None:
+        job = {"id": "final-drain", "resource_plan": {"profile": "small", **PROFILES["small"]}}
+        worker, api, runtime = self.worker(job)
+        child = {"thread_id": "final-child", "parent_thread_id": "parent", "status": "completed", "tool": "wait"}
+        runtime.activity = json.dumps({"seq": 1, "agent": "subagent", "kind": "subagent", "subagent": child})
+        worker.run_once()
+        self.assertTrue(runtime.removed)
+        self.assertEqual([event["subagent"] for event in api.events if event["subagent"]], [child])
+
     def test_cleanup_uncertainty_keeps_job_non_terminal(self) -> None:
         job = {"id": "cleanup", "resource_plan": {"profile": "small", **PROFILES["small"]}}
         worker, api, runtime = self.worker(job)
@@ -273,6 +299,23 @@ class DockerWorkerTests(unittest.TestCase):
 
 
 class WorkerApiTests(unittest.TestCase):
+    def test_event_forwards_structured_subagent(self) -> None:
+        seen: dict[str, object] = {}
+
+        class Response:
+            def read(self) -> bytes: return b"{}"
+            def __enter__(self): return self
+            def __exit__(self, *_args): return False
+
+        def fake_open(request, timeout):
+            seen["body"] = request.data
+            return Response()
+
+        child = {"thread_id": "child-1", "parent_thread_id": None, "status": "running", "tool": "spawn_agent"}
+        with patch("backend.worker.urlopen", fake_open):
+            WorkerApi("http://server", "token", "worker-a").event("job", "subagent", "Subagent lifecycle update.", "subagent", child)
+        self.assertEqual(json.loads(seen["body"])["subagent"], child)
+
     def test_claim_sends_worker_identity_and_capacity(self) -> None:
         seen: dict[str, object] = {}
 

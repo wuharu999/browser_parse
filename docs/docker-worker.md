@@ -89,3 +89,22 @@ Leave `ROBOT_DOCKER_DATA_DIR` empty for automatic detection. The legacy value
 that Docker uses that directory and fails if it does not match. Restart the
 worker after moving daemon storage. Detection does not relocate data or add
 free space, and containerd image storage can still occupy a separate filesystem.
+
+### Subagent lifecycle updates
+
+One fresh container is created per analysis job from the prepared image. Codex
+subagents and their shell/Python subprocesses share its workspace and resource
+limits. They do not require Docker access or additional containers.
+
+The runner forwards native `collab_tool_call` child IDs and observed lifecycle
+states through the Worker to ECS. A completed spawn tool does not imply a completed
+child. Job details retain each child's latest recorded state beyond the activity
+page limit, including after the job ends. Older jobs without recorded child IDs
+cannot have that history reconstructed. Child token usage remains unknown when
+the provider does not report it separately.
+
+For this update, deploy the ECS API and frontend, then rebuild `sandbox/Dockerfile`
+on the worker using the image-build procedure above, update `ROBOT_DOCKER_IMAGE`
+to the new immutable image ID/digest, and restart `backend.worker` after active
+jobs finish. A source pull alone does not update the runner baked into an existing
+image. No Worker SSH from the development machine is needed.

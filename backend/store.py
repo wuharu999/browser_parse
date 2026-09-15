@@ -12,12 +12,13 @@ import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from .lifecycle import validate_subagent
 from .resources import estimate_resources
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 TERMINAL = {"completed", "failed", "cancelled"}
-EVENT_KINDS = {"progress", "notice", "warning", "error", "analysis", "artifact", "system", "heartbeat"}
+EVENT_KINDS = {"progress", "notice", "warning", "error", "analysis", "artifact", "system", "heartbeat", "subagent"}
 WORKER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}\Z")
 RESOURCE_KEYS = ("cpu_milli", "memory_mb", "disk_mb")
 
@@ -101,7 +102,7 @@ class Store:
         );
         CREATE TABLE IF NOT EXISTS events (
           seq INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL REFERENCES jobs(id),
-          created_at TEXT NOT NULL, kind TEXT NOT NULL, agent TEXT NOT NULL, message TEXT NOT NULL
+          created_at TEXT NOT NULL, kind TEXT NOT NULL, agent TEXT NOT NULL, message TEXT NOT NULL, subagent TEXT
         );
         CREATE TABLE IF NOT EXISTS claims (
           job_id TEXT PRIMARY KEY REFERENCES jobs(id), name TEXT NOT NULL, token_hash TEXT NOT NULL,
@@ -122,6 +123,8 @@ class Store:
         for name, sql in (("run_deadline", "TEXT"), ("finished_day", "TEXT"), ("upload_reserved", "INTEGER NOT NULL DEFAULT 0"), ("resource_plan", "TEXT"), ("original_description", "TEXT"), ("sanitized_description", "TEXT"), ("worker_id", "TEXT")):
             if name not in columns:
                 self.db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {sql}")
+        if "subagent" not in {row["name"] for row in self.db.execute("PRAGMA table_info(events)")}:
+            self.db.execute("ALTER TABLE events ADD COLUMN subagent TEXT")
         self.db.commit()
 
     @staticmethod
@@ -157,13 +160,22 @@ class Store:
     def _tx(self):
         self.db.execute("BEGIN IMMEDIATE")
 
-    def _event(self, job_id: str, kind: str, agent: str, message: str) -> dict:
+    def _event(self, job_id: str, kind: str, agent: str, message: str, subagent: dict | None = None) -> dict:
         created = stamp()
-        cur = self.db.execute("INSERT INTO events(job_id,created_at,kind,agent,message) VALUES(?,?,?,?,?)", (job_id, created, kind, clean(agent, 80) or "system", clean(message, 2000)))
-        return {"seq": cur.lastrowid, "created_at": created, "kind": kind, "agent": clean(agent, 80) or "system", "message": clean(message, 2000)}
+        payload = json.dumps(subagent, separators=(",", ":")) if subagent else None
+        cur = self.db.execute("INSERT INTO events(job_id,created_at,kind,agent,message,subagent) VALUES(?,?,?,?,?,?)", (job_id, created, kind, clean(agent, 80) or "system", clean(message, 2000), payload))
+        return {"seq": cur.lastrowid, "created_at": created, "kind": kind, "agent": clean(agent, 80) or "system", "message": clean(message, 2000), "subagent": subagent}
 
     def _files(self, job_id: str) -> list[dict]:
         return [dict(row) for row in self.db.execute("SELECT id,name,size,sha256,created_at FROM files WHERE job_id=? ORDER BY rowid", (job_id,))]
+
+    def _subagents(self, job_id: str) -> list[dict]:
+        latest: dict[str, dict] = {}
+        for row in self.db.execute("SELECT seq,subagent FROM events WHERE job_id=? AND subagent IS NOT NULL ORDER BY seq", (job_id,)):
+            try: child = json.loads(row["subagent"])
+            except (TypeError, json.JSONDecodeError): continue
+            if isinstance(child, dict) and isinstance(child.get("thread_id"), str): latest[child["thread_id"]] = {**child, "seq": row["seq"]}
+        return sorted(latest.values(), key=lambda child: (child["seq"], child["thread_id"]))
 
     def _public(self, row: sqlite3.Row | None) -> dict | None:
         if not row:
@@ -184,6 +196,7 @@ class Store:
             items = []
             for row in rows:
                 item = self._public(row) or {}
+                item["subagents"] = self._subagents(item["id"])
                 for field in ("report", "metrics", "files"):
                     item.pop(field, None)
                 items.append(item)
@@ -214,7 +227,10 @@ class Store:
 
     def get(self, job_id: str) -> dict | None:
         with self.lock:
-            return self._public(self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
+            item = self._public(self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
+            if item is not None:
+                item["subagents"] = self._subagents(job_id)
+            return item
 
     def list(self, limit: int, cursor: int | None) -> tuple[list[dict], str | None]:
         with self.lock:
@@ -284,10 +300,16 @@ class Store:
     def events(self, job_id: str, after: int, limit: int = 500, *, latest: bool = False, before: int | None = None) -> tuple[list[dict], int | None]:
         with self.lock:
             if latest or before is not None:
-                rows = self.db.execute("SELECT seq,created_at,kind,agent,message FROM events WHERE job_id=? AND seq>? AND seq<? ORDER BY seq DESC LIMIT ?", (job_id, after, before if before is not None else 9223372036854775807, limit)).fetchall()[::-1]
+                rows = self.db.execute("SELECT seq,created_at,kind,agent,message,subagent FROM events WHERE job_id=? AND seq>? AND seq<? ORDER BY seq DESC LIMIT ?", (job_id, after, before if before is not None else 9223372036854775807, limit)).fetchall()[::-1]
             else:
-                rows = self.db.execute("SELECT seq,created_at,kind,agent,message FROM events WHERE job_id=? AND seq>? ORDER BY seq LIMIT ?", (job_id, after, limit)).fetchall()
-            return [dict(row) for row in rows], rows[-1]["seq"] if rows else None
+                rows = self.db.execute("SELECT seq,created_at,kind,agent,message,subagent FROM events WHERE job_id=? AND seq>? ORDER BY seq LIMIT ?", (job_id, after, limit)).fetchall()
+            items = []
+            for row in rows:
+                item = dict(row)
+                try: item["subagent"] = json.loads(item["subagent"]) if item["subagent"] else None
+                except json.JSONDecodeError: item["subagent"] = None
+                items.append(item)
+            return items, rows[-1]["seq"] if rows else None
 
     def budget(self) -> dict:
         current = datetime.now(SHANGHAI)
@@ -349,16 +371,20 @@ class Store:
             path = self.upload_dir / row["stored_name"]
             return (path, row["name"]) if path.is_file() else None
 
-    def worker_event(self, job_id: str, worker_id: str, kind: str, agent: str, message: str) -> dict:
+    def worker_event(self, job_id: str, worker_id: str, kind: str, agent: str, message: str, subagent: dict | None = None) -> dict:
         worker_id = self._worker_identity(worker_id)
         if kind not in EVENT_KINDS - {"system"}: raise ValueError("event kind is not allowed")
         if not clean(message, 2000): raise ValueError("message is required")
+        if subagent is not None:
+            if kind != "subagent":
+                raise ValueError("subagent lifecycle requires subagent event kind")
+            subagent = validate_subagent(subagent)
         with self.lock:
             self._tx(); self._expire_leases()
             row = self._owned_job(job_id, worker_id)
             if not row: self.db.rollback(); raise KeyError(job_id)
             if row["status"] != "running": self.db.commit(); raise ValueError("job is not running")
-            event = self._event(job_id, kind, agent or "worker", message)
+            event = self._event(job_id, kind, agent or "worker", message, subagent)
             self.db.execute("UPDATE jobs SET lease_until=?,updated_at=? WHERE id=?", (stamp(now() + timedelta(seconds=self.lease_seconds)), stamp(), job_id))
             self.db.commit(); return event
 
