@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
 import re
 import secrets
 import shutil
+from contextlib import asynccontextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
@@ -14,8 +16,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, StrictInt
+from starlette.background import BackgroundTask
 
 from .store import Store
+from .chat import ChatService
 
 
 GIB = 1024 ** 3
@@ -58,6 +62,16 @@ class Finish(BaseModel):
     report: str = Field(max_length=20000)
     cost_usd: float | None = Field(default=None, ge=0, le=100000)
     metrics: dict[str, Any] = Field(default_factory=dict)
+    analysis_context: Any | None = None
+
+
+class QuestionIn(BaseModel):
+    question: str = Field(min_length=1, max_length=4000)
+    request_id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
+
+
+class AnalysisContextIn(BaseModel):
+    analysis_context: Any | None = None
 
 
 class WorkerCapacity(BaseModel):
@@ -80,8 +94,15 @@ def bearer(value: str | None) -> str:
 def create_app(*, db_path: str | None = None, upload_dir: str | None = None) -> FastAPI:
     daily_shots = int(os.getenv("JOB_DAILY_LIMIT_SHOTS", os.getenv("JOB_DAILY_LIMIT_USD", "20")))
     store = Store(db_path or os.getenv("JOB_DB", "data/jobs.sqlite3"), upload_dir or os.getenv("JOB_UPLOAD_DIR", "data/uploads"), daily_limit_shots=daily_shots, max_running=int(os.getenv("JOB_MAX_RUNNING", "2")), max_pending=int(os.getenv("JOB_MAX_PENDING", "20")), lease_seconds=int(os.getenv("JOB_CLAIM_TTL_SECONDS", "1800")), runtime_seconds=int(os.getenv("JOB_MAX_RUNTIME_SECONDS", "1800")), pool_cpu_milli=int(os.getenv("JOB_POOL_CPU_MILLI", "4000")), pool_memory_mb=int(os.getenv("JOB_POOL_MEMORY_MB", "8192")), pool_disk_mb=int(os.getenv("JOB_POOL_DISK_MB", "32768")))
-    app = FastAPI(title="Robot Log Workbench API", docs_url=None, redoc_url=None)
+    @asynccontextmanager
+    async def lifespan(app):
+        store.interrupt_questions()
+        yield
+        store.interrupt_questions()
+
+    app = FastAPI(title="Robot Log Workbench API", docs_url=None, redoc_url=None, lifespan=lifespan)
     app.state.store = store
+    app.state.chat = ChatService()
     configured_origins = {x.strip() for x in os.getenv("JOB_ALLOWED_ORIGINS", "").split(",") if x.strip()}
 
     @app.middleware("http")
@@ -211,6 +232,58 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None) -> 
     @app.get("/api/jobs/{job_id}")
     async def get_job(job_id: str): return job_or_404(job_id)
 
+    @app.get("/api/jobs/{job_id}/questions")
+    async def questions(job_id: str, limit: int = 50, before: int | None = None):
+        job = job_or_404(job_id)
+        if not 1 <= limit <= 100 or (before is not None and not 1 <= before <= 9223372036854775807):
+            raise HTTPException(422, "invalid question page")
+        return {**store.questions(job_id, limit, before), "available": app.state.chat.available,
+                "context_mode": "report_and_notes" if job["has_analysis_context"] else "report_only"}
+
+    @app.post("/api/jobs/{job_id}/questions")
+    async def ask_question(job_id: str, body: QuestionIn):
+        job_or_404(job_id)
+        chat = app.state.chat
+        if not chat.available: raise HTTPException(503, "analysis Q&A is not configured")
+        try:
+            item, created = store.begin_question(job_id, body.request_id, body.question)
+        except KeyError: raise HTTPException(404, "job not found")
+        except ValueError as exc: raise HTTPException(409, str(exc))
+        if not created: return {"item": item, "replayed": True}
+
+        def encode(event: str, **data) -> str:
+            return json.dumps({"type": event, **data}, ensure_ascii=False) + "\n"
+
+        async def stream():
+            answer = ""
+            try:
+                yield encode("started", item=item)
+                context, history = store.chat_context(job_id)
+                async with asyncio.timeout(chat.timeout_seconds):
+                    async for delta in chat.answer(context, history, item["question"]):
+                        answer += delta
+                        if len(answer) > 20000: raise ValueError("answer too large")
+                        # Send cumulative redacted text so split tokens cannot leave an
+                        # unredacted credential in the saved answer or final display.
+                        saved = store.update_question(item["id"], chat.sanitize(answer))
+                        yield encode("answer", item=saved)
+                if not answer.strip(): raise ValueError("empty answer")
+                saved = store.update_question(item["id"], chat.sanitize(answer), "completed")
+                yield encode("done", item=saved)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                saved = store.update_question(item["id"], chat.sanitize(answer), "interrupted", "generation_interrupted")
+                yield encode("interrupted", item=saved)
+            finally:
+                store.update_question(item["id"], chat.sanitize(answer), "interrupted", "connection_closed")
+
+        # Covers a disconnect before the iterator starts as well as normal cleanup.
+        def abandoned():
+            store.update_question(item["id"], "", "interrupted", "connection_closed")
+        return StreamingResponse(stream(), media_type="application/x-ndjson",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}, background=BackgroundTask(abandoned))
+
     @app.get("/api/jobs/{job_id}/events")
     async def events(job_id: str, after: int = 0, latest: bool = False, before: int | None = None):
         job_or_404(job_id)
@@ -311,9 +384,16 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None) -> 
         except KeyError: raise HTTPException(404, "job not found")
         except ValueError as exc: raise HTTPException(422, str(exc))
 
+    @app.post("/api/worker/jobs/{job_id}/analysis-context")
+    async def worker_analysis_context(job_id: str, body: AnalysisContextIn, authorization: str | None = Header(default=None), x_worker_id: str | None = Header(default=None)):
+        try:
+            saved = store.save_analysis_context(job_id, owned_worker_identity(job_id, authorization, x_worker_id), body.analysis_context)
+            return {"saved": saved}
+        except ValueError as exc: raise HTTPException(409, str(exc))
+
     @app.post("/api/worker/jobs/{job_id}/finish")
     async def worker_finish(job_id: str, body: Finish, authorization: str | None = Header(default=None), x_worker_id: str | None = Header(default=None)):
-        try: return store.finish(job_id, owned_worker_identity(job_id, authorization, x_worker_id), body.status, body.report, body.cost_usd, body.metrics)
+        try: return store.finish(job_id, owned_worker_identity(job_id, authorization, x_worker_id), body.status, body.report, body.cost_usd, body.metrics, body.analysis_context)
         except KeyError: raise HTTPException(404, "job not found")
         except ValueError as exc: raise HTTPException(409, str(exc))
 

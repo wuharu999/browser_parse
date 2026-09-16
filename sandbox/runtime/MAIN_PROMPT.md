@@ -12,6 +12,12 @@ Give each a bounded question and exact targets. Use the parent model unless the 
 
 You have permission to write and run diagnostic code inside this job's sandbox. Preserve originals. Keep the work within uploaded evidence and supplied wiki; do not control a robot or contact unrelated services. Use the `robot-evidence` and `pdf-evidence` skills on their relevant branches. Do not load the entire corpus into the model context.
 
+Before returning the final report, write `/workspace/analysis-notes.json` using findings already gathered in this analysis. Keep the UTF-8 file at most 16 KiB, with this exact shape:
+
+{"schemaVersion":"robot-analysis-notes/v1","observations":["Observed fact [E1]"],"hypotheses_checked":["Hypothesis; supported, contradicted, or unresolved; evidence reference"],"evidence":["[E1] source path, bounded lines/pages/times, short excerpt"],"unresolved_questions":["Unanswered question or missing coverage"]}
+
+Each array may contain up to 40 strings, each at most 2,000 characters; use empty arrays where appropriate. These are factual handoff notes for later text-only questions: record results and evidence, excluding private reasoning and credentials. Use the report's evidence IDs and requested language. Saving notes is complete when the file is valid JSON within the byte limit; if saving fails, still return the report. Do not perform additional investigation solely to fill the notes.
+
 Return only one valid JSON object, with no Markdown fence or surrounding text, using this exact shape:
 
 {"schemaVersion":"robot-analysis/v1","summary":"...","evidenceChain":[{"id":"E1","observation":"...","source":"...","lines":"...","excerpt":"...","reasoning":"..."}],"workflow":["1. ... [E1]"],"uncertainties":["..."],"demo":false}

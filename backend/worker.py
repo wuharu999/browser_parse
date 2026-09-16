@@ -29,6 +29,8 @@ from .guard import (
     is_non_log_attachment,
 )
 from .resources import PROFILES
+from sandbox.analysis_context import validate_context
+
 from .docker_runtime import DockerCleanupError, DockerError, DockerJob, DockerRuntime
 
 
@@ -284,9 +286,12 @@ class WorkerApi:
             "sanitized_description": sanitized_description,
         })
 
-    def finish(self, job_id: str, status: str, report: str, cost_usd: float | None, metrics: dict[str, Any]) -> None:
+    def save_analysis_context(self, job_id: str, context: dict) -> None:
+        self._request("POST", f"/api/worker/jobs/{job_id}/analysis-context", {"analysis_context": context})
+
+    def finish(self, job_id: str, status: str, report: str, cost_usd: float | None, metrics: dict[str, Any], analysis_context: dict | None = None) -> None:
         self._request("POST", f"/api/worker/jobs/{job_id}/finish", {
-            "status": status, "report": report, "cost_usd": cost_usd, "metrics": metrics,
+            "status": status, "report": report, "cost_usd": cost_usd, "metrics": metrics, "analysis_context": analysis_context,
         })
 
 
@@ -478,7 +483,7 @@ class DockerWorker:
         raise CleanupUnconfirmed("Docker cleanup was not confirmed; worker stops before claiming another job")
 
     def _result(self, container: DockerJob) -> dict[str, Any]:
-        raw = self.runtime.copy_out_text(container, "/workspace/result.json", 65536)
+        raw = self.runtime.copy_out_text(container, "/workspace/result.json", 96 * 1024)
         if raw is None: raise WorkerError("Docker runner result is unavailable")
         value = json.loads(raw)
         if not isinstance(value, dict):
@@ -604,6 +609,7 @@ class DockerWorker:
             if not self.runtime.disk_healthy(container, plan["disk_mb"]): raise WorkerError("Docker workspace or host disk limit reached")
 
             result = self._result(container)
+            analysis_context = validate_context(result.get("analysis_context"), lambda text: _safe_text(text, self._secrets))
             metrics = dict(result.get("metrics") or {})
             runtime_s = round(time.monotonic() - started, 3)
             codex_usage = metrics.get("codex_usage") or {}
@@ -617,11 +623,13 @@ class DockerWorker:
             metrics["docker_workspace_bytes"] = self.runtime.workspace_bytes(container)
             status = "completed" if result.get("status") == "completed" else "failed"
             report = _safe_report(result.get("report") or "Docker run produced no final report.", self._secrets)
+            if analysis_context:
+                self.api.save_analysis_context(job_id, analysis_context)
             if not self.runtime.remove(container):
                 self._unconfirmed_kill(job_id)
                 return
             container = None
-            self.api.finish(job_id, status, report, 0.0, metrics)
+            self.api.finish(job_id, status, report, 0.0, metrics, analysis_context)
         except JobCancelled:
             if container is not None and not self.runtime.remove(container):
                 self._unconfirmed_kill(job_id)

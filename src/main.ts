@@ -1,4 +1,5 @@
 import './style.css';
+import { QuestionsPanel } from './questions';
 import { observedAgents, subagentBadge, type SubagentState, type SubagentSummary } from './subagents';
 import { DEFAULT_LIMITS, type LogPackage, type WorkerResponse } from './types';
 import { parseReport } from './report';
@@ -36,6 +37,7 @@ let transfer: (UploadProgress & { index: number; count: number; name: string }) 
 let wakeState: WakeState = 'requesting';
 let submitMessage = '', controller: AbortController | undefined, selectedJob: Job | undefined, selectedVersions: Version[] = [];
 let selectedEvents: Event[] = [], detailSignature = '', activitySignature = '', detailSequence = 0, detailNeedsRender = false, refreshing = false;
+const questionPanels = new Map<string, QuestionsPanel>();
 const drafts = new Map<string, Draft>(), events = new Map<string, Event[]>();
 const sessionViews = new Map<string, { open: boolean; top: number; following: boolean }>();
 const processDrawers = new Map<string, boolean>();
@@ -649,6 +651,10 @@ function renderResult(): void {
     const body = drawer.querySelector<HTMLElement>('.process-drawer-body');
     if (body && drawer.dataset.drawerKey) savedDrawers.set(drawer.dataset.drawerKey, body.scrollTop);
   }
+  const existingQuestions = content.querySelector<HTMLElement>('.question-transcript');
+  const questionScroll = existingQuestions ? existingQuestions.scrollTop : undefined;
+  const focusedQuestion = content.querySelector<HTMLTextAreaElement>('.question-input');
+  const questionFocus = focusedQuestion && document.activeElement === focusedQuestion ? [focusedQuestion.selectionStart, focusedQuestion.selectionEnd] : undefined;
   content.replaceChildren(); const page = el('article', 'result-page');
   const navigation = el('div', 'report-navigation'); navigation.append(button(t('← Back to upload', '← 返回上传'), 'button secondary back-to-upload', showNew)); page.append(navigation);
   const meta = el('div', 'report-meta'); meta.append(statusBadge(job), el('span', 'muted', date(job.created_at))); page.append(meta, el('h1', '', title(job)), el('p', 'incident-description', job.description.replace(/^\[DEMO\]\s*/, '')));
@@ -686,7 +692,20 @@ function renderResult(): void {
   }
   page.append(workflow);
   if (selectedVersions.length) { const revisions = el('details', 'revision-history'); revisions.append(el('summary', '', t(`Review history (${selectedVersions.length} versions)`, `审核历史（${selectedVersions.length} 个版本）`))); for (const version of [...selectedVersions].reverse()) { const item = el('div', 'revision'); item.append(el('strong', '', `v${version.id} · ${version.reviewer_name} · ${version.success ? t('Successful', '成功') : t('Unsuccessful', '未成功')}`), el('p', 'muted', date(version.created_at)), el('p', '', version.note), el('p', 'workflow-text', version.procedure)); revisions.append(item); } page.append(revisions); }
+  if (job.status === 'completed') {
+    let panel = questionPanels.get(job.id);
+    if (!panel) { panel = new QuestionsPanel(job.id); questionPanels.set(job.id, panel); }
+    page.append(panel.element);
+  }
   page.append(sessionPanel(job.id, events.get(job.id) ?? selectedEvents), button(t('← Back to upload', '← 返回上传'), 'button secondary back-to-upload', showNew)); content.append(page);
+  const questionPanel = questionPanels.get(job.id);
+  questionPanel?.labels();
+  if (questionScroll !== undefined) { const transcript = content.querySelector<HTMLElement>('.question-transcript'); if (transcript) transcript.scrollTop = questionScroll; }
+  if (questionFocus && questionPanel) {
+    questionPanel.input.focus({ preventScroll: true });
+    questionPanel.input.setSelectionRange(questionFocus[0], questionFocus[1]);
+  }
+  if (questionPanel) void questionPanel.poll();
   // Restore page scroll and inner transcript scroll after DOM rebuild.
   content.scrollTop = savedContentScroll;
   if (window.scrollY !== savedWindowScroll) {
@@ -743,4 +762,4 @@ async function refresh(): Promise<void> {
   finally { refreshing = false; }
 }
 onUiLanguage(() => { if (!outputChosen) outputLanguage = uiLanguage(); buildShell(); });
-buildShell(); void refresh(); window.setInterval(() => { void refresh(); }, 3000);
+buildShell(); void refresh(); window.setInterval(() => { void refresh(); if (selected) void questionPanels.get(selected)?.poll(); }, 3000);

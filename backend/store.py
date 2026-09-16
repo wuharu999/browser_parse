@@ -14,6 +14,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from .lifecycle import validate_subagent
 from .resources import estimate_resources
+from sandbox.analysis_context import validate_context
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -117,6 +118,15 @@ class Store:
           reviewer_name TEXT NOT NULL, success INTEGER NOT NULL, note TEXT NOT NULL,
           procedure TEXT NOT NULL, created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS questions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL REFERENCES jobs(id),
+          request_id TEXT NOT NULL, question TEXT NOT NULL, answer TEXT NOT NULL DEFAULT '',
+          status TEXT NOT NULL CHECK(status IN ('generating','completed','interrupted')),
+          error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, finished_at TEXT,
+          UNIQUE(job_id, request_id)
+        );
+        CREATE INDEX IF NOT EXISTS questions_job_id ON questions(job_id, id);
+        CREATE UNIQUE INDEX IF NOT EXISTS questions_one_active ON questions(job_id) WHERE status='generating';
         CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status);
         CREATE INDEX IF NOT EXISTS events_job_seq ON events(job_id, seq);
         CREATE INDEX IF NOT EXISTS files_job ON files(job_id);
@@ -124,7 +134,7 @@ class Store:
         """)
         # Keep local development databases usable after additive schema changes.
         columns = {row["name"] for row in self.db.execute("PRAGMA table_info(jobs)")}
-        for name, sql in (("run_deadline", "TEXT"), ("finished_day", "TEXT"), ("upload_reserved", "INTEGER NOT NULL DEFAULT 0"), ("resource_plan", "TEXT"), ("original_description", "TEXT"), ("sanitized_description", "TEXT"), ("worker_id", "TEXT")):
+        for name, sql in (("analysis_context", "TEXT"), ("run_deadline", "TEXT"), ("finished_day", "TEXT"), ("upload_reserved", "INTEGER NOT NULL DEFAULT 0"), ("resource_plan", "TEXT"), ("original_description", "TEXT"), ("sanitized_description", "TEXT"), ("worker_id", "TEXT")):
             if name not in columns:
                 self.db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {sql}")
         if "subagent" not in {row["name"] for row in self.db.execute("PRAGMA table_info(events)")}:
@@ -192,6 +202,7 @@ class Store:
         item = dict(row)
         for key in ("token_hash", "evidence", "lease_until", "run_deadline", "reservation_day", "finished_day", "upload_reserved", "worker_id"):
             item.pop(key, None)
+        item["has_analysis_context"] = bool(item.pop("analysis_context", None))
         item["cancel_requested"] = bool(item["cancel_requested"])
         item["codex_started"] = self.db.execute("SELECT 1 FROM events WHERE job_id=? AND agent='codex' LIMIT 1", (item["id"],)).fetchone() is not None
         item["resource_plan"] = json.loads(item["resource_plan"]) if item.get("resource_plan") else None
@@ -471,13 +482,34 @@ class Store:
             self.db.commit()
             return self.get(job_id)
 
-    def finish(self, job_id: str, worker_id: str, status: str, report: str, cost: float | None, metrics: object | None) -> dict:
+    def save_analysis_context(self, job_id: str, worker_id: str, value: object) -> bool:
+        context = validate_context(value, lambda text: clean(text, 2000))
+        with self.lock:
+            self._tx()
+            try:
+                self._expire_leases()
+                row = self._owned_running(job_id, self._worker_identity(worker_id))
+                if not row: raise ValueError("job is not running for this worker")
+                if context:
+                    encoded = json.dumps(context, ensure_ascii=False)
+                    if row["analysis_context"] and row["analysis_context"] != encoded:
+                        raise ValueError("analysis context is already saved")
+                    self.db.execute("UPDATE jobs SET analysis_context=? WHERE id=?", (encoded, job_id))
+                self.db.commit()
+                return context is not None
+            except Exception:
+                self.db.rollback()
+                raise
+
+    def finish(self, job_id: str, worker_id: str, status: str, report: str, cost: float | None, metrics: object | None, analysis_context: object | None = None) -> dict:
         worker_id = self._worker_identity(worker_id)
         if status not in TERMINAL: raise ValueError("invalid terminal status")
         if cost is not None and (not math.isfinite(cost) or cost < 0 or cost > 100000): raise ValueError("invalid cost")
         try: metrics_json = json.dumps(metrics or {}, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
         except (TypeError, ValueError) as exc: raise ValueError("metrics must be finite JSON") from exc
         report = clean_report(report)
+        context = validate_context(analysis_context, lambda text: clean(text, 2000))
+        context_json = json.dumps(context, ensure_ascii=False) if context else None
         if not report: raise ValueError("report is required")
         with self.lock:
             self._tx(); self._expire_leases(); row = self._owned_job(job_id, worker_id)
@@ -485,7 +517,7 @@ class Store:
             if row["status"] != "running": self.db.commit(); raise ValueError("job is not running")
             if row["cancel_requested"]: status = "cancelled"
             charged = row["reservation"] if cost is None else cost
-            finished = stamp(); self.db.execute("UPDATE jobs SET status=?,report=?,metrics=?,cost_usd=?,reservation=0,lease_until=NULL,run_deadline=NULL,finished_at=?,finished_day=?,updated_at=? WHERE id=?", (status, report, metrics_json, charged, finished, datetime.now(SHANGHAI).date().isoformat(), finished, job_id))
+            finished = stamp(); self.db.execute("UPDATE jobs SET status=?,report=?,analysis_context=COALESCE(analysis_context,?),metrics=?,cost_usd=?,reservation=0,lease_until=NULL,run_deadline=NULL,finished_at=?,finished_day=?,updated_at=? WHERE id=?", (status, report, context_json, metrics_json, charged, finished, datetime.now(SHANGHAI).date().isoformat(), finished, job_id))
             self._event(job_id, "system", "worker", f"Job {status}.")
             self.db.commit(); return self.get(job_id)
 
@@ -537,3 +569,54 @@ class Store:
     def versions(self, job_id: str) -> list[dict]:
         with self.lock:
             return [{**dict(row), "success": bool(row["success"])} for row in self.db.execute("SELECT id,reviewer_name,success,note,procedure,created_at FROM versions WHERE job_id=? ORDER BY id", (job_id,))]
+
+    def interrupt_questions(self) -> None:
+        """Called once at startup; this deployment uses one API process."""
+        with self.lock, self.db:
+            self.db.execute("UPDATE questions SET status='interrupted',error='server_restarted',updated_at=?,finished_at=? WHERE status='generating'", (stamp(), stamp()))
+
+    def questions(self, job_id: str, limit: int = 50, before: int | None = None) -> dict:
+        with self.lock:
+            rows = self.db.execute("SELECT * FROM questions WHERE job_id=? AND id<? ORDER BY id DESC LIMIT ?", (job_id, before or 9223372036854775807, limit + 1)).fetchall()
+            page = rows[:limit]
+            active = self.db.execute("SELECT * FROM questions WHERE job_id=? AND status='generating'", (job_id,)).fetchone()
+            return {"items": [dict(row) for row in reversed(page)], "next_before": page[-1]["id"] if len(rows) > limit else None, "active": dict(active) if active else None}
+
+    def begin_question(self, job_id: str, request_id: str, question: str) -> tuple[dict, bool]:
+        question = clean(question, 4000)
+        if not question: raise ValueError("question is required")
+        with self.lock:
+            self._tx()
+            try:
+                job = self.db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+                if not job: raise KeyError(job_id)
+                if job["status"] != "completed": raise ValueError("only completed analyses support questions")
+                existing = self.db.execute("SELECT * FROM questions WHERE job_id=? AND request_id=?", (job_id, request_id)).fetchone()
+                if existing:
+                    if existing["question"] != question: raise ValueError("request ID already used for another question")
+                    self.db.commit()
+                    return dict(existing), False
+                if self.db.execute("SELECT 1 FROM questions WHERE job_id=? AND status='generating'", (job_id,)).fetchone():
+                    raise ValueError("an answer is already generating for this analysis")
+                when = stamp()
+                cur = self.db.execute("INSERT INTO questions(job_id,request_id,question,status,created_at,updated_at) VALUES(?,?,?,'generating',?,?)", (job_id, request_id, question, when, when))
+                row = self.db.execute("SELECT * FROM questions WHERE id=?", (cur.lastrowid,)).fetchone()
+                self.db.commit()
+                return dict(row), True
+            except Exception:
+                self.db.rollback()
+                raise
+
+    def update_question(self, question_id: int, answer: str, status: str = "generating", error: str | None = None) -> dict:
+        if status not in {"generating", "completed", "interrupted"}: raise ValueError("invalid question status")
+        with self.lock, self.db:
+            self.db.execute("UPDATE questions SET answer=?,status=?,error=?,updated_at=?,finished_at=? WHERE id=? AND status='generating'", (answer, status, error, stamp(), stamp() if status != "generating" else None, question_id))
+            return dict(self.db.execute("SELECT * FROM questions WHERE id=?", (question_id,)).fetchone())
+
+    def chat_context(self, job_id: str) -> tuple[dict, list[dict]]:
+        with self.lock:
+            job = self.db.execute("SELECT description,report,analysis_context FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if not job: raise KeyError(job_id)
+            version = self.db.execute("SELECT procedure,note,success,reviewer_name FROM versions WHERE job_id=? ORDER BY id DESC LIMIT 1", (job_id,)).fetchone()
+            history = self.db.execute("SELECT question,answer FROM questions WHERE job_id=? AND status='completed' ORDER BY id DESC LIMIT 12", (job_id,)).fetchall()
+            return {"incident_description": job["description"], "original_report": job["report"], "investigation_notes": json.loads(job["analysis_context"]) if job["analysis_context"] else None, "latest_human_reviewed_workflow": dict(version) if version else None}, [dict(row) for row in reversed(history)]

@@ -22,6 +22,7 @@ ENV PATH="/opt/analysis-venv/bin:${PATH}" \
 COPY sandbox/check_environment.py /opt/sandbox/check_environment.py
 RUN python3 /opt/sandbox/check_environment.py > /opt/sandbox/environment.json
 
+COPY sandbox/analysis_context.py /opt/sandbox/analysis_context.py
 COPY sandbox/run_codex.py /opt/sandbox/run_codex.py
 RUN chmod 0755 /opt/sandbox/run_codex.py \
  && useradd --create-home --uid 10001 --shell /usr/sbin/nologin analysis \

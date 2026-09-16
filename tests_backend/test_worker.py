@@ -81,6 +81,7 @@ class FakeApi:
         self.job = job
         self.blobs = blobs or {}
         self.finished: list[dict] = []
+        self.saved_context: dict | None = None
         self.events: list[dict] = []
         self.cancel_requested = False
         self.claimed_capacity: dict | None = None
@@ -100,8 +101,11 @@ class FakeApi:
     def event(self, _job_id: str, kind: str, message: str, agent: str = "worker", subagent=None) -> None:
         self.events.append({"kind": kind, "message": message, "agent": agent, "subagent": subagent})
 
-    def finish(self, _job_id: str, status: str, report: str, cost_usd, metrics: dict) -> None:
-        self.finished.append({"status": status, "report": report, "cost_usd": cost_usd, "metrics": metrics})
+    def save_analysis_context(self, _job_id: str, context: dict) -> None:
+        self.saved_context = context
+
+    def finish(self, _job_id: str, status: str, report: str, cost_usd, metrics: dict, analysis_context=None) -> None:
+        self.finished.append({"status": status, "report": report, "cost_usd": cost_usd, "metrics": metrics, "analysis_context": analysis_context})
 
 
 class DockerWorkerTests(unittest.TestCase):
@@ -156,6 +160,23 @@ class DockerWorkerTests(unittest.TestCase):
         self.assertEqual(runtime.created[0][2]["OPENAI_API_KEY"], "model-key")
         self.assertEqual(api.finished[0]["status"], "completed")
         self.assertEqual(runtime.removed[0].container, "container-job-1")
+
+    def test_notes_are_redacted_and_captured_before_container_cleanup(self) -> None:
+        from tests_backend.test_questions import notes
+        job = {"id": "notes-job", "files": [], "resource_plan": {"profile": "small", **PROFILES["small"]}}
+        worker, api, runtime = self.worker(job)
+        runtime.result = json.dumps({"status": "completed", "report": "Report", "metrics": {}, "analysis_context": notes(observations=["model-key motor stopped"])})
+        original_remove = runtime.remove
+        def remove(container):
+            self.assertIsNotNone(api.saved_context)
+            runtime.result = None
+            return original_remove(container)
+        runtime.remove = remove
+        worker.run_once()
+        self.assertTrue(runtime.removed)
+        self.assertEqual(api.finished[0]["status"], "completed")
+        self.assertIn("motor stopped", api.finished[0]["analysis_context"]["observations"][0])
+        self.assertNotIn("model-key", json.dumps(api.finished[0]))
 
     def test_bad_manifest_hash_never_creates_container(self) -> None:
         job = {"id": "job-2", "files": [{"id": "x", "name": "x.log", "size": 1, "sha256": "0" * 64}], "resource_plan": {"profile": "small", **PROFILES["small"]}}

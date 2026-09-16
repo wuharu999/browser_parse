@@ -21,6 +21,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+try:
+    from .analysis_context import MAX_CONTEXT_BYTES, validate_context
+except ImportError:  # Executed as /opt/sandbox/run_codex.py in the job image.
+    from analysis_context import MAX_CONTEXT_BYTES, validate_context
+
 
 WORKSPACE = Path("/workspace")
 RESULT = WORKSPACE / "result.json"
@@ -601,6 +606,20 @@ def _write_config(model: str) -> None:
     os.environ["CODEX_HOME"] = str(home)
 
 
+def _analysis_context() -> dict | None:
+    path = WORKSPACE / "analysis-notes.json"
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        with path.open("rb") as source:
+            raw = source.read(MAX_CONTEXT_BYTES + 1)
+        if len(raw) > MAX_CONTEXT_BYTES:
+            return None
+        return validate_context(json.loads(raw), _redact_debug)
+    except (OSError, ValueError, RecursionError):
+        return None
+
+
 def _finish(status: str, report: str, started: float, peak_rss: int, usage: dict[str, int] | None = None, observed_children: set[str] | None = None) -> int:
     metrics: dict[str, Any] = {
         "runner_runtime_seconds": round(time.monotonic() - started, 3),
@@ -616,6 +635,7 @@ def _finish(status: str, report: str, started: float, peak_rss: int, usage: dict
     RESULT.write_text(json.dumps({
         "status": status,
         "report": report[:12_000],
+        "analysis_context": _analysis_context() if status == "completed" else None,
         "metrics": metrics,
     }, ensure_ascii=False))
     return 0 if status == "completed" else 1

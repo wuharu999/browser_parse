@@ -154,7 +154,7 @@ class MockWorkerApi:
         })
         return {"id": job_id, "original_description": original, "sanitized_description": sanitized}
 
-    def finish(self, _job_id: str, status: str, report: str, cost_usd: float | None, metrics: dict) -> None:
+    def finish(self, _job_id: str, status: str, report: str, cost_usd: float | None, metrics: dict, analysis_context=None) -> None:
         self.finished.append({
             "status": status,
             "report": report,
