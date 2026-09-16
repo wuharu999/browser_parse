@@ -4,7 +4,6 @@ import re
 _IDENT = re.compile(r"[A-Za-z0-9._:/-]{1,120}\Z")
 _STATUSES = {"pending_init", "running", "interrupted", "completed", "errored", "shutdown", "not_found", "unknown"}
 _TOOLS = {"spawn_agent", "send_input", "wait", "close_agent"}
-_ROLES = {"log_investigator", "telemetry_investigator", "evidence_reviewer"}
 
 
 def validate_subagent(value: object) -> dict:
@@ -19,7 +18,7 @@ def validate_subagent(value: object) -> dict:
         if not isinstance(value.get(field), str) or value[field] not in allowed:
             raise ValueError(f"invalid subagent {field}")
     role = value.get("role")
-    if role is not None and (not isinstance(role, str) or role not in _ROLES):
+    if role is not None and (not isinstance(role, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", role)):
         raise ValueError("invalid subagent role")
     return {"thread_id": child, "parent_thread_id": parent, "status": value["status"], "tool": value["tool"],
             **({"role": role} if role is not None else {})}

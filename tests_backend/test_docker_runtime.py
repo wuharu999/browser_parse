@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from backend.docker_runtime import DockerError, DockerRuntime
+from backend.docker_runtime import DockerJob, DockerError, DockerRuntime
 
 
 class DockerRuntimePreflightTests(unittest.TestCase):
@@ -36,6 +36,26 @@ class DockerRuntimePreflightTests(unittest.TestCase):
                 "Options": {"com.docker.network.bridge.gateway_mode_ipv4": "isolated"},
             }]),
         }
+
+    def test_debug_cursor_reads_complete_unicode_records_without_full_file_copy(self):
+        import sys
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "debug.jsonl"
+            line = json.dumps({"message": "电机数据" * 500}, ensure_ascii=False) + "\n"
+            output.write_text(line * 4 + '{"partial":')
+            runtime = self.runtime(root)
+            def execute_reader(args, **kwargs):
+                program = args[5].replace("'/workspace/codex-debug.jsonl'", repr(str(output)))
+                return subprocess.run([sys.executable, "-I", "-c", program, *args[6:]], capture_output=True, text=True)
+            with patch.object(runtime, "_run", side_effect=execute_reader):
+                text, cursor = runtime.read_activity(DockerJob("c", "v"), 0, 16384)
+                self.assertEqual(text, line * 2)
+                self.assertEqual(cursor, len(text.encode()))
+                text2, next_cursor = runtime.read_activity(DockerJob("c", "v"), cursor, 16384)
+                self.assertEqual(text2, line * 2)
+                self.assertEqual(next_cursor, len((line * 4).encode()))
+                self.assertEqual(runtime.read_activity(DockerJob("c", "v"), next_cursor, 16384), ("", next_cursor))
 
     def test_preflight_accepts_local_limited_daemon_and_isolated_network(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"DOCKER_HOST": "unix:///var/run/docker.sock"}, clear=True):

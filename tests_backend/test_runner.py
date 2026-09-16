@@ -21,24 +21,24 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("Language: zh", prompt)
             self.assertNotIn("private full log body", prompt)
 
-    def test_activity_excludes_raw_commands_and_reasoning(self):
+    def test_debug_includes_emitted_commands_while_final_report_stays_separate(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory, "activity.jsonl")
             event = {"type": "item.completed", "item": {"type": "command_execution", "command": "private shell command", "aggregated_output": "private log body"}}
             run_codex._activity(event, target)
             public = target.read_text()
-            self.assertNotIn("private", public)
+            self.assertIn("private shell command", public)
             self.assertIsNone(run_codex._agent_message({"item": {"type": "reasoning", "text": "private thoughts"}}))
-            self.assertEqual(json.loads(public)["message"], "Codex tool execution completed.")
+            self.assertEqual(json.loads(json.loads(public)["message"])["item"]["aggregated_output"], "private log body")
 
-    def test_activity_includes_only_completed_public_messages(self):
+    def test_debug_includes_emitted_messages_and_reasoning_items(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory, "activity.jsonl")
             run_codex._activity({"type": "item.completed", "item": {"type": "agent_message", "channel": "final", "text": "Reviewed 3 records."}}, target)
             run_codex._activity({"type": "item.completed", "item": {"type": "reasoning", "text": "hidden chain of thought"}}, target)
             records = [json.loads(line) for line in target.read_text().splitlines()]
-            self.assertEqual(records[0]["message"], "Reviewed 3 records.")
-            self.assertEqual(len(records), 1)
+            self.assertEqual(json.loads(records[0]["message"])["item"]["text"], "Reviewed 3 records.")
+            self.assertEqual(len(records), 2)
 
     def test_activity_redacts_sensitive_values(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"TEST_API_TOKEN": "very-secret-value"}):
@@ -49,18 +49,18 @@ class RunnerTests(unittest.TestCase):
             self.assertNotIn("abc.def.ghi", public)
             self.assertNotIn("sk-abcdefghijklmnop", public)
 
-    def test_activity_ring_is_64kib_and_contains_complete_jsonl_records(self):
+    def test_activity_history_retains_complete_records_beyond_64kib(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory, "activity.jsonl")
             for number in range(200):
                 run_codex._activity({"type": "item.completed", "item": {"type": "agent_message", "channel": "commentary", "text": f"{number}: " + "x" * 790}}, target)
             raw = target.read_bytes()
-            self.assertLessEqual(len(raw), 64 * 1024)
+            self.assertGreater(len(raw), 64 * 1024)
             records = [json.loads(line) for line in raw.decode().splitlines()]
-            self.assertGreater(len(records), 1)
+            self.assertEqual(len(records), 200)
             self.assertEqual(records[-1]["seq"], 200)
 
-    def test_native_collaboration_tracks_all_children_without_exposing_payloads(self):
+    def test_native_collaboration_tracks_children_and_emitted_call_payloads(self):
         event = {"type": "item.completed", "item": {"type": "collab_tool_call",
                  "tool": "spawn_agent", "status": "completed", "sender_thread_id": "parent",
                  "receiver_thread_ids": ["child-a", "child-b"], "prompt": "private task",
@@ -72,11 +72,12 @@ class RunnerTests(unittest.TestCase):
             run_codex._activity(event, target, children)
             self.assertEqual(children, {"child-a", "child-b"})
             records = [json.loads(line) for line in target.read_text().splitlines()]
-            self.assertEqual([r["seq"] for r in records], [1, 2])
+            self.assertEqual([r["seq"] for r in records], [1, 2, 3])
+            records = [r for r in records if r.get("subagent")]
             self.assertEqual([r["subagent"]["status"] for r in records], ["running", "pending_init"])
             self.assertTrue(all(r["subagent"]["parent_thread_id"] == "parent" for r in records))
             self.assertTrue(all(r["agent"] == "subagent" for r in records))
-            self.assertNotIn("private", target.read_text())
+            self.assertIn("private", target.read_text())
             event["type"] = "item.updated"
             event["item"]["tool"] = "wait"
             event["item"]["agents_states"]["child-a"]["status"] = "completed"
@@ -88,14 +89,15 @@ class RunnerTests(unittest.TestCase):
             target = Path(directory, "activity.jsonl")
             event = {"type": "item.started", "item": {"type": "collab_tool_call", "tool": "spawn_agent", "status": "in_progress", "receiver_thread_ids": []}}
             run_codex._activity(event, target)
-            self.assertFalse(target.exists())
+            self.assertFalse(any(json.loads(line).get("subagent") for line in target.read_text().splitlines()))
             event["item"]["receiver_thread_ids"] = [None, {}, "bad id", "x" * 121, "good-id", "good-id"]
             event["item"]["agents_states"] = {"good-id": {"status": "unexpected private text"}}
             run_codex._activity(event, target)
             records = [json.loads(line) for line in target.read_text().splitlines()]
+            records = [r for r in records if r.get("subagent")]
             self.assertEqual(len(records), 1)
             self.assertEqual(records[0]["subagent"], {"thread_id": "good-id", "parent_thread_id": None, "status": "unknown", "tool": "spawn_agent"})
-            self.assertNotIn("private", target.read_text())
+            self.assertIn("private", target.read_text())
 
     def test_final_report_keeps_long_structured_json_and_source_path(self):
         report = json.dumps({"schemaVersion": "robot-analysis/v1", "source": "archive/folder/log.txt", "findings": ["x" * 8500]})
@@ -105,7 +107,7 @@ class RunnerTests(unittest.TestCase):
         self.assertGreater(len(final or ""), 800)
         self.assertEqual(json.loads(final or "") ["source"], "archive/folder/log.txt")
 
-    def test_commentary_is_activity_only_and_unknown_channels_are_suppressed(self):
+    def test_debug_includes_unknown_channels_without_using_them_as_final_report(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory, "activity.jsonl")
             commentary = {"type": "item.completed", "item": {"type": "agent_message", "channel": "commentary", "text": "Public progress."}}
@@ -113,7 +115,7 @@ class RunnerTests(unittest.TestCase):
             run_codex._activity(commentary, target)
             run_codex._activity(unknown, target)
             self.assertIsNone(run_codex._agent_message(commentary))
-            self.assertEqual([json.loads(line)["message"] for line in target.read_text().splitlines()], ["Public progress."])
+            self.assertEqual([json.loads(json.loads(line)["message"])["item"]["text"] for line in target.read_text().splitlines()], ["Public progress.", "must hide"])
 
     def test_installed_codex_json_agent_message_without_channel_is_public(self):
         # Matches the locally installed Codex SDK's documented JSONL item shape.
@@ -121,7 +123,7 @@ class RunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory, "activity.jsonl")
             run_codex._activity(event, target)
-            self.assertEqual(json.loads(target.read_text())["message"], "Hi!")
+            self.assertEqual(json.loads(json.loads(target.read_text())["message"])["item"]["text"], "Hi!")
         self.assertEqual(run_codex._agent_message(event), "Hi!")
 
     def test_provider_configuration_stays_inside_workspace(self):

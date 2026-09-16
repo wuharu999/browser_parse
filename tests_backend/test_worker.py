@@ -252,6 +252,23 @@ class DockerWorkerTests(unittest.TestCase):
         self.assertNotIn("model-key", api.events[1]["message"])
         self.assertIn("reviewed evidence", api.events[1]["message"])
 
+    def test_finished_runner_drains_all_debug_pages_in_batches(self) -> None:
+        job = {"id": "debug-pages", "resource_plan": {"profile": "small", **PROFILES["small"]}}
+        worker, api, runtime = self.worker(job)
+        records = [{"seq": index + 1, "kind": "debug", "agent": "codex", "message": "  output " + str(index) + "  "} for index in range(210)]
+        chunks = ["".join(json.dumps(row) + "\n" for row in records[start:start + 105]) for start in (0, 105)]
+        cursors = [0, len(chunks[0].encode()), len("".join(chunks).encode())]
+        def read(_container, cursor):
+            index = cursors.index(cursor)
+            return (chunks[index], cursors[index + 1]) if index < 2 else ("", cursor)
+        received = []
+        runtime.read_activity = read
+        api.events_batch = lambda _job, batch: received.extend(batch)
+        worker.run_once()
+        self.assertEqual([row["message"] for row in received], [row["message"] for row in records])
+        self.assertTrue(runtime.removed)
+        self.assertEqual(api.finished[0]["status"], "completed")
+
     def test_activity_forwards_safe_subagent_lifecycle(self) -> None:
         worker, api, runtime = self.worker(None)
         child = {"thread_id": "child/1", "parent_thread_id": None, "status": "running", "tool": "spawn_agent", "role": "log_investigator"}

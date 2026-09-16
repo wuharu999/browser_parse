@@ -1,12 +1,12 @@
 import './style.css';
-import { subagentStates, subagentBadge, type SubagentState, type SubagentSummary } from './subagents';
+import { observedAgents, subagentBadge, type SubagentState, type SubagentSummary } from './subagents';
 import { DEFAULT_LIMITS, type LogPackage, type WorkerResponse } from './types';
 import { parseReport } from './report';
 import { availability, type Budget } from './budget';
 import { uploadFile, protectUpload, type UploadProgress, type WakeState } from './upload';
 import { onUiLanguage, setUiLanguage, t, uiLanguage } from './i18n';
 
-type Job = { subagents?: SubagentSummary[]; id: string; description: string; status: string; created_at: string; cancel_requested: boolean; report?: string; resource_plan?: { profile: string; cpu_milli: number; memory_mb: number; disk_mb: number } | null; review_claim?: { name: string; expires_at: string } | null; sanitized_description?: string };
+type Job = { codex_started?: boolean; subagents?: SubagentSummary[]; id: string; description: string; status: string; created_at: string; cancel_requested: boolean; report?: string; resource_plan?: { profile: string; cpu_milli: number; memory_mb: number; disk_mb: number } | null; review_claim?: { name: string; expires_at: string } | null; sanitized_description?: string };
 type Version = { id: number; reviewer_name: string; success: boolean; note: string; procedure: string; created_at: string };
 type Event = { subagent?: SubagentState | null; seq: number; agent: string; kind: string; message: string; created_at?: string };
 type Draft = { name: string; procedure: string; note: string; verdict: string; token?: string; expires_at?: string };
@@ -178,7 +178,7 @@ function renderActivity(): void {
 
   const signature = JSON.stringify([
     online,
-    active.map(j => [j.id, j.status, j.cancel_requested, j.resource_plan, j.subagents]),
+    active.map(j => [j.id, j.status, j.cancel_requested, j.resource_plan, j.codex_started, j.subagents]),
     active.map(j => (events.get(j.id) ?? []).length),
     active.map(j => (events.get(j.id) ?? []).at(-1)?.seq),
     active.map(j => (events.get(j.id) ?? []).at(-1)?.message),
@@ -284,18 +284,15 @@ function sandboxAbstractionPanel(id: string, records: Event[]): HTMLElement {
   container.append(guardBar);
 
   const processGrid = el('div', 'sandbox-process-grid');
-  const children = subagentStates(job?.subagents, records);
+  const { parent, children } = observedAgents(job, records);
   const roleNames: Record<string, string> = { log_investigator: 'Log Investigator', telemetry_investigator: 'Telemetry Investigator', evidence_reviewer: 'Evidence Reviewer' };
   const agentDefs: Array<{ id: string; name: string; role: string; icon: string; child?: SubagentSummary }> = [
-    { id: 'codex', name: 'Codex Orchestrator', role: t('Parent Process', '主分析进程'), icon: '⚡' },
+    ...(parent ? [{ id: 'codex', name: 'Codex Orchestrator', role: t('Parent Process', '主分析进程'), icon: '⚡' }] : []),
     ...children.map(child => ({ id: child.thread_id,
-      name: child.role ? roleNames[child.role] ?? 'Subagent' : 'Subagent',
+      name: child.role ? roleNames[child.role] ?? child.role : 'Subagent',
       role: child.thread_id, icon: '⚙️', child })),
   ];
-  // Legacy named activity has no reliable child identity or completion state.
-  for (const [role, name] of Object.entries(roleNames)) {
-    if (!children.some(child => child.role === role)) agentDefs.push({ id: role, name, role: t('Configured role', '已配置角色'), icon: '⚙️' });
-  }
+  if (!agentDefs.length) processGrid.append(el('p', 'muted-note', t('No agent has started yet.', '尚无代理启动。')));
 
   for (const def of agentDefs) {
     const agentEvents = records.filter(e => !isHeartbeat(e) && (def.child
@@ -400,7 +397,7 @@ function sandboxAbstractionPanel(id: string, records: Event[]): HTMLElement {
 
 function sessionPanel(id: string, records: Event[]): HTMLDetailsElement {
   const panel = el('details', 'session-panel'); panel.dataset.job = id; panel.open = sessionViews.get(id)?.open ?? true;
-  panel.append(el('summary', '', t('Session activity & output', '会话活动与输出')), el('p', 'session-hint', t('Public progress, tool status and output. Private reasoning and raw command output are not shared.', '公开进展、工具状态及输出；不展示私密推理和原始命令输出。')));
+  panel.append(el('summary', '', t('Session activity & output', '会话活动与输出')), el('p', 'session-hint', t('Codex debug output, tool calls, results and child activity. Credentials are redacted. Large outputs continue across entries.', '显示 Codex 调试输出、工具调用、结果与子代理活动；凭据已脱敏。较长输出会分成连续记录。')));
 
   // Keep observed lifecycle history visible after the container is removed.
   panel.append(sandboxAbstractionPanel(id, records));
@@ -408,6 +405,9 @@ function sessionPanel(id: string, records: Event[]): HTMLDetailsElement {
   const transcriptDetails = el('details', 'transcript-collapsible');
   transcriptDetails.open = true;
   transcriptDetails.append(el('summary', 'transcript-summary', t('Detailed Activity Log', '详细活动日志')));
+  const download = el('a', 'button text-button', t('Download debug JSONL', '下载调试 JSONL'));
+  download.href = `/api/jobs/${encodeURIComponent(id)}/events.jsonl`; download.download = `${id}-events.jsonl`;
+  transcriptDetails.append(download);
 
   const transcript = el('div', 'session-transcript'); transcript.tabIndex = 0; transcript.setAttribute('aria-label', t('Scrollable session activity', '可滚动会话活动'));
   if (!records.length) transcript.append(el('p', 'muted', t('Waiting for worker activity.', '等待工作器活动。')));
@@ -605,7 +605,7 @@ async function loadDetail(force = false): Promise<void> {
       notice(t('Your editing reservation expired. Your draft is preserved; reserve editing again to save.', '编辑锁定已过期。草稿已保留，请重新申请编辑后保存。')); force = true;
     }
     if (!pausedSessions.has(id)) events.set(id, selectedEvents);
-    const signature = JSON.stringify([job.status, job.cancel_requested, job.report, job.review_claim, job.subagents, versions]);
+    const signature = JSON.stringify([job.status, job.cancel_requested, job.report, job.review_claim, job.codex_started, job.subagents, selectedEvents.at(-1)?.seq, versions]);
     if (force || detailNeedsRender || signature !== detailSignature) { detailSignature = signature; if (force || detailNeedsRender || !drafts.has(id)) { renderResult(); detailNeedsRender = false; } }
   } catch (error) { if (selected === id) notice(`${t('Could not open analysis', '无法打开分析')}：${error}`, true); }
 }

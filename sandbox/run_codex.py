@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """In-container wrapper for one headless Codex job.
 
-It deliberately keeps Codex JSON/stdout private to the sandbox and writes only
-a compact final report plus coarse resource measurements for the worker API.
+Streams credential-redacted Codex output and child activity for debugging,
+then writes the final report and coarse resource measurements for the worker API.
 """
 
 from __future__ import annotations
@@ -24,8 +24,6 @@ from typing import Any
 
 WORKSPACE = Path("/workspace")
 RESULT = WORKSPACE / "result.json"
-ACTIVITY_MAX_BYTES = 64 * 1024
-ACTIVITY_MESSAGE_MAX_CHARS = 800
 PUBLIC_AGENT_TYPES = {"agent_message", "message"}
 # Safe agent identifiers permitted in activity streams and child process accounting.
 # Includes orchestrator (codex) and all 3 specialized subagents (R2.3).
@@ -37,24 +35,6 @@ def _secret_values() -> tuple[str, ...]:
     names = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
     return tuple(value for name, value in os.environ.items()
                  if any(part in name.upper() for part in names) and len(value) >= 4)
-
-
-def _public_text(value: object) -> str | None:
-    """Bound and redact text that is deliberately eligible for the job activity UI."""
-    if not isinstance(value, str):
-        return None
-    text = value.replace("\x00", " ").replace("\r\n", "\n").replace("\r", "\n")
-    for secret in _secret_values():
-        text = text.replace(secret, "[redacted]")
-    # Common credential forms, including values not present in this process env.
-    import re
-    text = re.sub(r"(?i)(bearer\s+)[^\s]+", r"\1[redacted]", text)
-    text = re.sub(r"(?i)\b(api[_-]?key|token|secret|password)\s*[:=]\s*[^\s,;]+", r"\1=[redacted]", text)
-    text = re.sub(r"\b(?:sk|pk|rk|AKIA)[-_A-Za-z0-9]{12,}\b", "[redacted]", text)
-    text = re.sub(r"(?<!:)\/(?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+", "[path]", text)
-    text = re.sub(r"\b[A-Za-z]:\\(?:[^\s\\]+\\)+[^\s\\]+", "[path]", text)
-    text = "\n".join(" ".join(line.split()) for line in text.split("\n")).strip()
-    return text[:ACTIVITY_MESSAGE_MAX_CHARS] or None
 
 
 def _item_text(item: dict[str, Any]) -> str | None:
@@ -92,7 +72,7 @@ def _agent_message(event: dict[str, Any]) -> str | None:
     """Legacy event fallback; the CLI output file is authoritative for the final."""
     item = event.get("item")
     # A reasoning item, an in-progress message, or an unknown channel must never
-    # become the final report or be exposed as activity.
+    # become the final report. Debug output is captured separately.
     if event.get("type") != "item.completed" or not isinstance(item, dict) or item.get("type") not in PUBLIC_AGENT_TYPES:
         return None
     channel = item.get("channel", event.get("channel"))
@@ -101,18 +81,6 @@ def _agent_message(event: dict[str, Any]) -> str | None:
     if channel not in {None, "final"}:
         return None
     return _item_text(item)
-
-
-def _activity_agent_message(event: dict[str, Any]) -> str | None:
-    """Return a safe, short public progress/final excerpt for the activity UI."""
-    item = event.get("item")
-    if event.get("type") != "item.completed" or not isinstance(item, dict) or item.get("type") not in PUBLIC_AGENT_TYPES:
-        return None
-    channel = item.get("channel", event.get("channel"))
-    # The current exec schema omits this field; reject only explicit unknown phases.
-    if channel not in {None, "commentary", "final"}:
-        return None
-    return _public_text(_item_text(item))
 
 
 def _usage(event: dict[str, Any]) -> dict[str, int] | None:
@@ -188,40 +156,6 @@ def _compact_evidence(value: Any) -> str:
     return json.dumps(out, ensure_ascii=False, indent=2)[:10_000]
 
 
-def _safe_tool_action(item: dict[str, Any], event_type: str) -> str:
-    state = "started" if event_type == "item.started" else "completed" if event_type == "item.completed" else "updated"
-    default_msg = f"Codex tool execution {state}."
-    cmd = item.get("command") or ""
-    fn_name = item.get("name") or ""
-    args = item.get("arguments") or ""
-    if isinstance(args, dict):
-        args = json.dumps(args, ensure_ascii=False)
-    raw_target = f"{cmd} {fn_name} {args}"
-    import re
-    input_match = re.search(r"inputs/([A-Za-z0-9_.-]+)", raw_target)
-    target_file = input_match.group(1) if input_match else None
-    is_evidence = "evidence" in raw_target.lower() or "metadata.yaml" in raw_target.lower()
-    action_label = None
-    if target_file:
-        verb = "Inspecting" if state == "started" else "Inspected" if state == "completed" else "Inspecting"
-        action_label = f"{verb} file: {target_file}"
-    elif is_evidence:
-        verb = "Checking" if state == "started" else "Checked" if state == "completed" else "Checking"
-        sub = "metadata" if "metadata" in raw_target.lower() else "evidence"
-        action_label = f"{verb} {sub}"
-    if not action_label:
-        return default_msg
-    if state == "completed":
-        out = item.get("aggregated_output") or item.get("output") or item.get("result")
-        if isinstance(out, str) and out.strip():
-            clean_out = _public_text(out)
-            if clean_out:
-                first_line = clean_out.splitlines()[0][:120].strip()
-                if first_line and not any(k in first_line.lower() for k in ("traceback", "syntaxerror", "exception:")):
-                    action_label = f"{action_label} · {first_line}"
-    return action_label[:ACTIVITY_MESSAGE_MAX_CHARS]
-
-
 CHILD_STATUSES = {"pending_init", "running", "interrupted", "completed", "errored", "shutdown", "not_found", "unknown"}
 COLLAB_TOOLS = {"spawn_agent", "send_input", "wait", "close_agent"}
 
@@ -230,79 +164,132 @@ def _thread_id(value: object) -> str | None:
     return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9._:/-]{1,120}", value) else None
 
 
+def _redact_debug(value: Any) -> Any:
+    """Preserve emitted data and formatting, removing credentials before chunking."""
+    if isinstance(value, dict):
+        return {key: "[redacted]" if re.search(r"(?i)^(authorization|api[_-]?key|access[_-]?token|password|secret)$", key)
+                else _redact_debug(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_debug(item) for item in value]
+    if not isinstance(value, str):
+        return value
+    for secret in _secret_values():
+        value = value.replace(secret, "[redacted]")
+    value = re.sub(r"(?i)(bearer\s+)[^\s]+", r"\1[redacted]", value)
+    value = re.sub(r"(?i)(\b(?:api[_-]?key|token|secret|password)[\"']?\s*[:=]\s*[\"']?)[^\s,;\"'}]+", r"\1[redacted]", value)
+    return re.sub(r"\b(?:sk|pk|rk|AKIA)[-_A-Za-z0-9]{12,}\b", "[redacted]", value)
+
+
 def _append_activity(output: Path, additions: list[dict[str, Any]]) -> None:
-    old = output.read_text(errors="replace") if output.exists() else ""
+    # Append-only: a verbose tool must not evict unseen spawn events. Each record
+    # is small enough for bounded incremental Docker reads and the event API.
     sequence = 1
-    if old:
-        try:
-            sequence = int(json.loads(old.splitlines()[-1]).get("seq", 0)) + 1
-        except (ValueError, TypeError, json.JSONDecodeError):
-            pass
-    records = old.splitlines()
-    for addition in additions:
-        records.append(json.dumps({**addition, "seq": sequence}, separators=(",", ":")))
-        sequence += 1
-    # Keep whole records and monotonically increasing cursors across ring rotation.
-    retained: list[str] = []
-    used = 0
-    for line in reversed(records):
-        size = len((line + "\n").encode("utf-8"))
-        if size > ACTIVITY_MAX_BYTES or used + size > ACTIVITY_MAX_BYTES:
-            break
-        retained.append(line)
-        used += size
-    output.write_text("\n".join(reversed(retained)) + ("\n" if retained else ""))
+    if output.exists() and output.stat().st_size:
+        with output.open("rb") as source:
+            source.seek(max(0, output.stat().st_size - 16384))
+            try:
+                sequence = int(json.loads(source.read().splitlines()[-1])["seq"]) + 1
+            except (ValueError, KeyError, IndexError, TypeError):
+                pass
+    with output.open("a") as sink:
+        for addition in additions:
+            sink.write(json.dumps({**addition, "seq": sequence}, separators=(",", ":")) + "\n")
+            sequence += 1
 
 
-def _activity(event: dict[str, Any], output: Path, observed_children: set[str] | None = None) -> tuple[str | None, str | None]:
-    event_type = event.get("type")
-    if not isinstance(event_type, str) or event_type not in {"thread.started", "thread.completed", "turn.started", "turn.completed", "turn.failed", "item.started", "item.updated", "item.completed"}:
-        return None, None
+def _activity(event: dict[str, Any], output: Path, observed_children: set[str] | None = None,
+              child_context: dict[str, Any] | None = None) -> tuple[str | None, str | None]:
+    if not isinstance(event, dict):
+        event = {"type": "stdout", "value": event}
     item = event.get("item") if isinstance(event.get("item"), dict) else {}
-    if item.get("type") == "reasoning" or item.get("channel") in {"analysis", "reasoning"} or event.get("channel") in {"analysis", "reasoning"}:
-        return None, None
-    if item.get("type") in PUBLIC_AGENT_TYPES and item.get("channel", event.get("channel")) not in {None, "commentary", "final"}:
-        return None, None
-    agent = event.get("agent") or item.get("agent") or item.get("agent_name") or "codex"
-    agent = agent if agent in SAFE_AGENTS else "codex"
-    thread_id = event.get("thread_id") or item.get("thread_id")
-    thread_id = thread_id if isinstance(thread_id, str) and len(thread_id) <= 120 else None
-    if item.get("type") == "collab_tool_call":
-        tool = item.get("tool")
-        if not isinstance(tool, str) or tool not in COLLAB_TOOLS:
-            return None, None
-        parent = _thread_id(item.get("sender_thread_id"))
-        receivers = item.get("receiver_thread_ids")
-        states = item.get("agents_states")
-        states = states if isinstance(states, dict) else {}
-        children = dict.fromkeys(child for value in (receivers if isinstance(receivers, list) else [])
-                                 if (child := _thread_id(value)) and child != parent)
-        additions = []
+    thread_id = _thread_id(event.get("thread_id") or item.get("thread_id"))
+    agent = "subagent" if child_context else "codex"
+    # All emitted JSON is visible, including deltas, calls, results and errors.
+    # This is CLI output, not access to model/provider data the CLI never emits.
+    text = json.dumps(_redact_debug(event), ensure_ascii=False, indent=2)
+    chunks = [text[pos:pos + 1200] for pos in range(0, len(text), 1200)]
+    additions = [{"agent": agent, "kind": "debug", "message": chunk,
+                  **({"subagent": child_context} if child_context else {})} for chunk in chunks]
+    if event.get("type") in {"runner.started", "thread.started"} and not child_context:
+        additions[0]["kind"] = "agent_started"
+    parent = _thread_id(item.get("sender_thread_id"))
+    receivers = item.get("receiver_thread_ids")
+    states = item.get("agents_states")
+    states = states if isinstance(states, dict) else {}
+    children = dict.fromkeys(child for value in (receivers if isinstance(receivers, list) else [])
+                             if (child := _thread_id(value)) and child != parent)
+    tool = item.get("tool")
+    if item.get("type") == "collab_tool_call" and isinstance(tool, str) and tool in COLLAB_TOOLS:
         for child in children:
             state = states.get(child)
             status = state.get("status") if isinstance(state, dict) else None
             status = status if isinstance(status, str) and status in CHILD_STATUSES else "unknown"
-            # A completed collaboration tool does not mean its child finished.
             metadata = {"thread_id": child, "parent_thread_id": parent, "status": status, "tool": tool}
-            additions.append({"agent": "subagent", "kind": "subagent",
-                              "message": f"Subagent {status} ({tool}).", "thread_id": child, "subagent": metadata})
+            role = item.get("agent_role") or item.get("agent_type")
+            if isinstance(role, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,80}", role):
+                metadata["role"] = role
+            additions.append({"agent": "subagent", "kind": "subagent", "message": f"Subagent {child}: {status} ({tool}).", "subagent": metadata})
             if observed_children is not None:
                 observed_children.add(child)
-        if additions:
-            _append_activity(output, additions)
-            return "subagent", next(iter(children))
-        # Spawn-begin events have no child yet. Do not invent an identity.
-        return None, None
-    message, activity_kind = f"Codex activity: {event_type}", "lifecycle"
-    if (public := _activity_agent_message(event)) is not None:
-        message, activity_kind = public, "message"
-    elif item.get("type") in {"command_execution", "function_call", "mcp_tool_call", "tool_call"}:
-        message, activity_kind = _safe_tool_action(item, event_type), "tool"
-    elif item.get("type") in {"agent", "subagent", "agent_thread"}:
-        state = "started" if event_type in {"thread.started", "item.started"} else "completed" if event_type in {"turn.completed", "item.completed"} else "updated"
-        message, activity_kind = f"Subagent {agent} {state}.", "subagent"
-    _append_activity(output, [{"agent": agent, "kind": activity_kind, "message": message, "thread_id": thread_id}])
-    return agent, thread_id
+    _append_activity(output, additions)
+    return ("subagent", next(iter(children))) if children else (agent, thread_id)
+
+
+class ChildOutput:
+    """Tail only this job's Codex child rollouts; discover identity from metadata."""
+    def __init__(self, home: Path, output: Path, observed: set[str]):
+        self.home, self.output, self.observed = home, output, observed
+        self.offsets: dict[Path, int] = {}
+        self.children: dict[Path, dict[str, Any]] = {}
+
+    def poll(self, *, drain: bool = False) -> None:
+        for path in sorted((self.home / "sessions").glob("**/*.jsonl")):
+            if path.is_symlink() or not path.resolve().is_relative_to(self.home.resolve()):
+                continue
+            with path.open("rb") as source:
+                source.seek(self.offsets.get(path, 0))
+                count = 0
+                while drain or count < 256:
+                    count += 1
+                    start = source.tell()
+                    line = source.readline()
+                    if not line or not line.endswith(b"\n"):
+                        source.seek(start)
+                        break
+                    self.offsets[path] = source.tell()
+                    try:
+                        record = json.loads(line)
+                    except (ValueError, UnicodeDecodeError):
+                        continue
+                    payload = record.get("payload", {})
+                    if not isinstance(payload, dict):
+                        continue
+                    if record.get("type") == "session_meta":
+                        origin = payload.get("source")
+                        spawn = origin.get("subagent", {}) if isinstance(origin, dict) else {}
+                        spawn = spawn.get("thread_spawn", {}) if isinstance(spawn, dict) else {}
+                        spawn = spawn if isinstance(spawn, dict) else {}
+                        parent = _thread_id(payload.get("parent_thread_id") or spawn.get("parent_thread_id"))
+                        child = _thread_id(payload.get("id"))
+                        if not child or not parent:
+                            continue
+                        meta = {"thread_id": child, "parent_thread_id": parent, "status": "running", "tool": "spawn_agent"}
+                        role = payload.get("agent_role") or payload.get("agent_type") or spawn.get("agent_role") or spawn.get("agent_type")
+                        if isinstance(role, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,80}", role):
+                            meta["role"] = role
+                        self.children[path] = meta
+                        self.observed.add(child)
+                        _append_activity(self.output, [{"agent": "subagent", "kind": "subagent", "message": f"Child thread started: {child}", "subagent": meta}])
+                    elif path in self.children and record.get("type") in {"event_msg", "response_item"}:
+                        # Input/system prompt snapshots are not intermediate outputs.
+                        if payload.get("type") == "message" and payload.get("role") in {"user", "system", "developer"}:
+                            continue
+                        meta = self.children[path]
+                        status = {"task_complete": "completed", "turn_aborted": "interrupted", "error": "errored", "task_started": "running"}.get(payload.get("type"))
+                        if status:
+                            meta = {**meta, "status": status, "tool": "wait"}
+                            self.children[path] = meta
+                        _activity(record, self.output, self.observed, meta)
 
 
 def _assemble_inputs(job: dict[str, Any]) -> None:
@@ -655,10 +642,12 @@ def main() -> int:
         final_output = WORKSPACE / "final-report.txt"
         process = subprocess.Popen(
             ["codex", "exec", "--json", "--output-last-message", str(final_output), "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-m", model, "-"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, start_new_session=True, cwd=WORKSPACE,
         )
         assert process.stdin is not None and process.stdout is not None
+        debug_output = WORKSPACE / "codex-debug.jsonl"
+        _activity({"type": "runner.started", "pid": process.pid}, debug_output)
         process.stdin.write(_prompt(job))
         process.stdin.close()
         deadline = started + int(os.environ.get("ROBOT_RUN_TIMEOUT_SECONDS", "600"))
@@ -666,9 +655,11 @@ def main() -> int:
         usage: dict[str, int] | None = None
         observed_children: set[str] = set()
         output: queue.Queue[str | None] = queue.Queue(maxsize=256)
+        children_output = ChildOutput(WORKSPACE / ".codex", debug_output, observed_children)
+        next_children_poll = 0.0
 
         def read_output() -> None:
-            while line := process.stdout.readline(65537):
+            while line := process.stdout.readline():
                 output.put(line)
             output.put(None)
 
@@ -682,14 +673,21 @@ def main() -> int:
             if line:
                 try:
                     event = json.loads(line)
-                    agent, thread_id = _activity(event, WORKSPACE / "activity.jsonl", observed_children)
+                except json.JSONDecodeError:
+                    event = {"type": "stderr_or_stdout", "text": line}
+                try:
+                    agent, thread_id = _activity(event, debug_output, observed_children)
                     if agent in {"log_investigator", "telemetry_investigator", "evidence_reviewer"} and thread_id:
                         observed_children.add(thread_id)
-                    usage = _usage(event) or usage
+                    usage = (_usage(event) if isinstance(event, dict) else None) or usage
                 except json.JSONDecodeError:
                     pass
             elif line is None:
+                children_output.poll(drain=True)
                 break
+            if time.monotonic() >= next_children_poll:
+                children_output.poll()
+                next_children_poll = time.monotonic() + 1
             if time.monotonic() >= deadline:
                 try:
                     os.killpg(process.pid, signal.SIGTERM)
@@ -701,6 +699,7 @@ def main() -> int:
                     os.killpg(process.pid, signal.SIGKILL)
                 return _finish("failed", "Codex exceeded the sandbox time limit.", started, peak_rss, usage, observed_children)
         process.wait(timeout=5)
+        process.stdout.close()
         if process.returncode != 0:
             return _finish("failed", "Codex did not complete successfully.", started, peak_rss, usage, observed_children)
         try:

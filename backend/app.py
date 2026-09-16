@@ -11,7 +11,7 @@ from typing import Any, Literal
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, StrictInt
 
@@ -42,6 +42,10 @@ class WorkerEvent(BaseModel):
     agent: str = Field(default="worker", max_length=80)
     message: str = Field(max_length=2000)
     subagent: dict[str, Any] | None = None
+
+
+class WorkerEvents(BaseModel):
+    events: list[WorkerEvent] = Field(min_length=1, max_length=100)
 
 
 class SanitizeJob(BaseModel):
@@ -215,6 +219,23 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None) -> 
         items, next_after = store.events(job_id, after, latest=latest, before=before)
         return {"events": items, "next": next_after}
 
+    @app.get("/api/jobs/{job_id}/events.jsonl")
+    async def download_events(job_id: str):
+        job_or_404(job_id)
+        last, _ = store.events(job_id, 0, limit=1, latest=True)
+        stop = last[-1]["seq"] if last else 0
+        def lines():
+            cursor = 0
+            while cursor < stop:
+                rows, next_cursor = store.events(job_id, cursor)
+                for row in rows:
+                    if row["seq"] > stop: return
+                    yield json.dumps(row, ensure_ascii=False) + "\n"
+                if next_cursor is None: return
+                cursor = next_cursor
+        return StreamingResponse(lines(), media_type="application/x-ndjson",
+            headers={"Content-Disposition": f'attachment; filename="{job_id}-events.jsonl"'})
+
     @app.get("/api/budget")
     async def budget(): return store.budget()
 
@@ -273,6 +294,14 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None) -> 
     @app.post("/api/worker/jobs/{job_id}/events", status_code=201)
     async def worker_event(job_id: str, body: WorkerEvent, authorization: str | None = Header(default=None), x_worker_id: str | None = Header(default=None)):
         try: return store.worker_event(job_id, owned_worker_identity(job_id, authorization, x_worker_id), body.kind, body.agent, body.message, body.subagent)
+        except KeyError: raise HTTPException(404, "job not found")
+        except ValueError as exc: raise HTTPException(422, str(exc))
+
+    @app.post("/api/worker/jobs/{job_id}/events/batch", status_code=201)
+    async def worker_events(job_id: str, body: WorkerEvents, authorization: str | None = Header(default=None), x_worker_id: str | None = Header(default=None)):
+        try:
+            records = store.worker_events(job_id, owned_worker_identity(job_id, authorization, x_worker_id), [event.model_dump() for event in body.events])
+            return {"accepted": len(records)}
         except KeyError: raise HTTPException(404, "job not found")
         except ValueError as exc: raise HTTPException(422, str(exc))
 

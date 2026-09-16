@@ -286,17 +286,37 @@ class ApiTest(unittest.TestCase):
             self.assertEqual(response.status_code, 201)
 
         worker = DockerWorker.__new__(DockerWorker)
-        worker.runtime = SimpleNamespace(copy_out_text=lambda *_args: target.read_text())
-        worker.api = SimpleNamespace(event=event)
+        worker.runtime = SimpleNamespace(read_activity=lambda _job, offset: (target.read_text(), len(target.read_bytes())))
+        worker.api = SimpleNamespace(events_batch=lambda job, records: [event(job, **record) for record in records])
         worker._secrets = ()
-        self.assertEqual(worker._activity(DockerJob("fixture", "volume"), jid, 0), 1)
+        self.assertEqual(worker._activity(DockerJob("fixture", "volume"), jid, 0), len(target.read_bytes()))
         detail = self.client.get(f"/api/jobs/{jid}").json()
         self.assertEqual(observed, {"child"})
         self.assertEqual(detail["subagents"][0]["thread_id"], "child")
         self.assertEqual(detail["subagents"][0]["status"], "running")
         public_events = self.client.get(f"/api/jobs/{jid}/events").json()
-        self.assertNotIn("private child task", json.dumps(public_events))
-        self.assertNotIn("private result", json.dumps(public_events))
+        self.assertIn("private child task", json.dumps(public_events))
+        self.assertIn("private result", json.dumps(public_events))
+
+    def test_debug_batch_is_atomic_and_download_preserves_complete_output(self):
+        jid = self.submit(self.job()); self.claim_worker()
+        self.assertFalse(self.client.get(f"/api/jobs/{jid}").json()["codex_started"])
+        url = f"/api/worker/jobs/{jid}/events/batch"
+        debug = {"kind": "debug", "agent": "codex", "message": "  untouched formatting  "}
+        invalid = {"kind": "subagent", "agent": "subagent", "message": "invalid", "subagent": {"thread_id": "bad"}}
+        self.assertEqual(self.client.post(url, headers=self.worker, json={"events": [debug, invalid]}).status_code, 422)
+        self.assertFalse(self.client.get(f"/api/jobs/{jid}").json()["codex_started"])
+        self.assertEqual(self.client.post(url, headers={**self.worker, "X-Worker-ID": "another-worker"}, json={"events": [debug]}).status_code, 403)
+        for _ in range(6):
+            response = self.client.post(url, headers=self.worker, json={"events": [debug] * 100})
+            self.assertEqual(response.status_code, 201)
+        self.assertTrue(self.client.get(f"/api/jobs/{jid}").json()["codex_started"])
+        response = self.client.get(f"/api/jobs/{jid}/events.jsonl")
+        rows = [json.loads(line) for line in response.text.splitlines()]
+        outputs = [row for row in rows if row["kind"] == "debug"]
+        self.assertEqual(len(outputs), 600)
+        self.assertTrue(all(row["message"] == debug["message"] for row in outputs))
+        self.assertEqual([row["seq"] for row in rows], sorted(row["seq"] for row in rows))
 
     def test_subagent_event_roundtrip_validation_and_full_history_summary(self):
         jid = self.submit(self.job()); self.claim_worker()

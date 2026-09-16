@@ -12,7 +12,10 @@ export function subagentStates(summary: SubagentSummary[] = [], events: { seq: n
   const children = new Map<string, SubagentSummary>();
   for (const state of [...summary, ...events.flatMap(event => event.subagent ? [{ ...event.subagent, seq: event.seq }] : [])]) {
     const previous = children.get(state.thread_id);
-    if (!previous || state.seq > previous.seq) children.set(state.thread_id, state);
+    if (!previous || state.seq > previous.seq) children.set(state.thread_id, {
+      ...previous, ...state,
+      status: state.status === 'unknown' && previous ? previous.status : state.status,
+    });
   }
   return [...children.values()].sort((a, b) => a.thread_id.localeCompare(b.thread_id));
 }
@@ -32,4 +35,10 @@ export function subagentBadge(state: SubagentState, jobEnded: boolean): { en: st
   const [en, zh, cls] = labels[state.status] ?? labels.unknown;
   const stale = jobEnded && ['pending_init', 'running'].includes(state.status);
   return { en: stale ? `Last observed: ${en.toLowerCase()}` : en, zh: stale ? `最后记录：${zh}` : zh, cls: stale ? 'idle' : cls };
+}
+
+export function observedAgents(job: { codex_started?: boolean; subagents?: SubagentSummary[] } | undefined,
+  events: { seq: number; agent: string; subagent?: SubagentState | null }[]) {
+  const children = subagentStates(job?.subagents, events);
+  return { parent: !!job?.codex_started || events.some(event => event.agent === 'codex') || children.length > 0, children };
 }

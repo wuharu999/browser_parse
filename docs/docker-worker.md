@@ -108,3 +108,26 @@ on the worker using the image-build procedure above, update `ROBOT_DOCKER_IMAGE`
 to the new immutable image ID/digest, and restart `backend.worker` after active
 jobs finish. A source pull alone does not update the runner baked into an existing
 image. No Worker SSH from the development machine is needed.
+
+### Full Codex debug output
+
+The runner writes credential-redacted output to `/workspace/codex-debug.jsonl`
+and tails child rollouts in `/workspace/.codex/sessions/`. It captures emitted
+CLI JSON (including intermediate output and errors) and stderr. Child session
+metadata identifies the actual child ID, parent and role; role templates remain
+optional choices for the orchestrator. A spawn is a JSONL event, not a separate
+per-task JSON file. No child container is created.
+
+The worker reads complete records with a byte cursor and sends batches to ECS
+every polling cycle (up to two seconds between cycles). The append-only log
+replaces the 64 KiB ring, so verbose tools do not evict unseen spawn events.
+Existing job disk/time limits still apply. ECS retains the event history after
+container removal; the UI's JSONL download includes records outside its 500-event
+page. Only recorded agents appear, and selected-job output refreshes as events
+arrive. Credentials remain redacted; tool output and evidence excerpts are now
+visible in the shared debug view.
+
+Deploy the ECS API/frontend first (including `/events/batch`), then update and
+restart the worker and rebuild its immutable job image. A worker running an older
+image uses the legacy filtered stream until that image is replaced. This does not
+recover previously discarded output or force the orchestrator to use every role.

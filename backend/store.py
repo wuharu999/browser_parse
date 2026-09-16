@@ -18,7 +18,7 @@ from .resources import estimate_resources
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 TERMINAL = {"completed", "failed", "cancelled"}
-EVENT_KINDS = {"progress", "notice", "warning", "error", "analysis", "artifact", "system", "heartbeat", "subagent"}
+EVENT_KINDS = {"progress", "notice", "warning", "error", "analysis", "artifact", "system", "heartbeat", "subagent", "debug", "agent_started"}
 WORKER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}\Z")
 RESOURCE_KEYS = ("cpu_milli", "memory_mb", "disk_mb")
 
@@ -166,9 +166,10 @@ class Store:
 
     def _event(self, job_id: str, kind: str, agent: str, message: str, subagent: dict | None = None) -> dict:
         created = stamp()
+        message = message[:2000] if kind in {"debug", "agent_started"} else clean(message, 2000)
         payload = json.dumps(subagent, separators=(",", ":")) if subagent else None
-        cur = self.db.execute("INSERT INTO events(job_id,created_at,kind,agent,message,subagent) VALUES(?,?,?,?,?,?)", (job_id, created, kind, clean(agent, 80) or "system", clean(message, 2000), payload))
-        return {"seq": cur.lastrowid, "created_at": created, "kind": kind, "agent": clean(agent, 80) or "system", "message": clean(message, 2000), "subagent": subagent}
+        cur = self.db.execute("INSERT INTO events(job_id,created_at,kind,agent,message,subagent) VALUES(?,?,?,?,?,?)", (job_id, created, kind, clean(agent, 80) or "system", message, payload))
+        return {"seq": cur.lastrowid, "created_at": created, "kind": kind, "agent": clean(agent, 80) or "system", "message": message, "subagent": subagent}
 
     def _files(self, job_id: str) -> list[dict]:
         return [dict(row) for row in self.db.execute("SELECT id,name,size,sha256,created_at FROM files WHERE job_id=? ORDER BY rowid", (job_id,))]
@@ -178,7 +179,11 @@ class Store:
         for row in self.db.execute("SELECT seq,subagent FROM events WHERE job_id=? AND subagent IS NOT NULL ORDER BY seq", (job_id,)):
             try: child = json.loads(row["subagent"])
             except (TypeError, json.JSONDecodeError): continue
-            if isinstance(child, dict) and isinstance(child.get("thread_id"), str): latest[child["thread_id"]] = {**child, "seq": row["seq"]}
+            if isinstance(child, dict) and isinstance(child.get("thread_id"), str):
+                previous = latest.get(child["thread_id"], {})
+                latest[child["thread_id"]] = {**previous, **child, "seq": row["seq"]}
+                if child.get("status") == "unknown" and previous.get("status"):
+                    latest[child["thread_id"]]["status"] = previous["status"]
         return sorted(latest.values(), key=lambda child: (child["seq"], child["thread_id"]))
 
     def _public(self, row: sqlite3.Row | None) -> dict | None:
@@ -188,6 +193,7 @@ class Store:
         for key in ("token_hash", "evidence", "lease_until", "run_deadline", "reservation_day", "finished_day", "upload_reserved", "worker_id"):
             item.pop(key, None)
         item["cancel_requested"] = bool(item["cancel_requested"])
+        item["codex_started"] = self.db.execute("SELECT 1 FROM events WHERE job_id=? AND agent='codex' LIMIT 1", (item["id"],)).fetchone() is not None
         item["resource_plan"] = json.loads(item["resource_plan"]) if item.get("resource_plan") else None
         claim = self.db.execute("SELECT name,expires_at FROM claims WHERE job_id=? AND expires_at>?", (item["id"], stamp())).fetchone()
         item["review_claim"] = dict(claim) if claim else None
@@ -408,21 +414,40 @@ class Store:
             return (path, row["name"]) if path.is_file() else None
 
     def worker_event(self, job_id: str, worker_id: str, kind: str, agent: str, message: str, subagent: dict | None = None) -> dict:
+        return self.worker_events(job_id, worker_id, [{"kind": kind, "agent": agent, "message": message, "subagent": subagent}])[0]
+
+    def worker_events(self, job_id: str, worker_id: str, records: list[dict]) -> list[dict]:
         worker_id = self._worker_identity(worker_id)
-        if kind not in EVENT_KINDS - {"system"}: raise ValueError("event kind is not allowed")
-        if not clean(message, 2000): raise ValueError("message is required")
-        if subagent is not None:
-            if kind != "subagent":
-                raise ValueError("subagent lifecycle requires subagent event kind")
-            subagent = validate_subagent(subagent)
+        if not 1 <= len(records) <= 100:
+            raise ValueError("expected 1 to 100 events")
+        validated = []
+        for record in records:
+            kind, message = record["kind"], record["message"]
+            if kind not in EVENT_KINDS - {"system"}: raise ValueError("event kind is not allowed")
+            if not message or len(message) > 2000 or (kind not in {"debug", "agent_started"} and not clean(message, 2000)): raise ValueError("event message is empty or too long")
+            child = record.get("subagent")
+            if child is not None:
+                if kind not in {"subagent", "debug"}: raise ValueError("invalid child event kind")
+                child = validate_subagent(child)
+            validated.append((kind, record.get("agent") or "worker", message, child))
         with self.lock:
-            self._tx(); self._expire_leases()
-            row = self._owned_job(job_id, worker_id)
-            if not row: self.db.rollback(); raise KeyError(job_id)
-            if row["status"] != "running": self.db.commit(); raise ValueError("job is not running")
-            event = self._event(job_id, kind, agent or "worker", message, subagent)
-            self.db.execute("UPDATE jobs SET lease_until=?,updated_at=? WHERE id=?", (stamp(now() + timedelta(seconds=self.lease_seconds)), stamp(), job_id))
-            self.db.commit(); return event
+            self._tx()
+            try:
+                self._expire_leases()
+                row = self._owned_job(job_id, worker_id)
+                if not row:
+                    self.db.commit()
+                    raise KeyError(job_id)
+                if row["status"] != "running":
+                    self.db.commit()
+                    raise ValueError("job is not running")
+                events = [self._event(job_id, *values) for values in validated]
+                self.db.execute("UPDATE jobs SET lease_until=?,updated_at=? WHERE id=?", (stamp(now() + timedelta(seconds=self.lease_seconds)), stamp(), job_id))
+                self.db.commit()
+                return events
+            except Exception:
+                self.db.rollback()
+                raise
 
     def sanitize(self, job_id: str, worker_id: str, original_description: str, sanitized_description: str) -> dict:
         worker_id = self._worker_identity(worker_id)

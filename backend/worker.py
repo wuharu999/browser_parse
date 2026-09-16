@@ -63,7 +63,7 @@ def _env(name: str, default: str | None = None, *, required: bool = False) -> st
     return value or ""
 
 
-def _safe_text(value: object, secrets: tuple[str, ...] = ()) -> str:
+def _safe_text(value: object, secrets: tuple[str, ...] = (), *, preserve: bool = False) -> str:
     """Bound public event/report text and remove known credential values."""
     text = str(value).replace("\r\n", "\n").replace("\r", "\n").replace("\x00", " ")
     for secret in secrets:
@@ -72,6 +72,8 @@ def _safe_text(value: object, secrets: tuple[str, ...] = ()) -> str:
     text = re.sub(r"(?i)(bearer\s+)[^\s]+", r"\1[redacted]", text)
     text = re.sub(r"(?i)\b(api[_-]?key|token|secret|password)\s*[:=]\s*[^\s,;\"'{}\[\]]+", r"\1=[redacted]", text)
     text = re.sub(r"\b(?:sk|pk|rk|AKIA)[-_A-Za-z0-9]{12,}\b", "[redacted]", text)
+    if preserve:
+        return text[:12000]
     # Keep Markdown paragraphs/lists readable; only normalize horizontal space.
     return "\n".join(re.sub(r"[ \t]+", " ", line).strip() for line in text.split("\n")).strip()[:12_000]
 
@@ -273,6 +275,9 @@ class WorkerApi:
             "kind": kind, "agent": agent, "message": message, "subagent": subagent,
         })
 
+    def events_batch(self, job_id: str, records: list[dict]) -> None:
+        self._request("POST", f"/api/worker/jobs/{job_id}/events/batch", {"events": records})
+
     def sanitize(self, job_id: str, original_description: str, sanitized_description: str) -> dict[str, Any]:
         return self._request("POST", f"/api/worker/jobs/{job_id}/sanitize", {
             "original_description": original_description,
@@ -401,6 +406,26 @@ class DockerWorker:
         return max(1, min(requested, max_allowed))
 
     def _activity(self, container: DockerJob, job_id: str, seen: int) -> int:
+        reader = getattr(self.runtime, "read_activity", None)
+        if callable(reader):
+            page = reader(container, seen)
+            if page is not None:
+                text, next_offset = page
+                records = []
+                for line in text.splitlines():
+                    event = json.loads(line)
+                    kind = event.get("kind")
+                    if kind not in {"debug", "agent_started", "subagent"}:
+                        continue
+                    record = {"kind": kind, "agent": "subagent" if event.get("agent") == "subagent" else "codex",
+                              "message": _safe_text(event.get("message", ""), self._secrets, preserve=True)}
+                    if event.get("subagent") is not None:
+                        record["subagent"] = validate_subagent(event["subagent"])
+                    records.append(record)
+                for start in range(0, len(records), 100):
+                    self.api.events_batch(job_id, records[start:start + 100])
+                return next_offset
+        # Compatibility with workers still using the older, filtered image.
         try:
             text = self.runtime.copy_out_text(container, "/workspace/activity.jsonl") or ""
         except Exception:
@@ -569,9 +594,11 @@ class DockerWorker:
                 if not self.runtime.disk_healthy(container, plan["disk_mb"]): raise WorkerError("Docker workspace or host disk limit reached")
                 seen_activity = self._activity(container, job_id, seen_activity)
                 self._event(job_id, "heartbeat", "Docker execution remains active.")
-                time.sleep(min(15, self.config.poll_seconds))
+                time.sleep(min(2, self.config.poll_seconds))
             # The runner can flush lifecycle records immediately before exit.
-            seen_activity = self._activity(container, job_id, seen_activity)
+            while (next_activity := self._activity(container, job_id, seen_activity)) != seen_activity:
+                seen_activity = next_activity
+                self._checkpoint(job_id, deadline)
             if command.returncode: raise WorkerError("Docker runner did not complete successfully")
             self._checkpoint(job_id, deadline)
             if not self.runtime.disk_healthy(container, plan["disk_mb"]): raise WorkerError("Docker workspace or host disk limit reached")

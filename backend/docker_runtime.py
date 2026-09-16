@@ -262,6 +262,18 @@ class DockerRuntime:
         result = self._run(["exec", job.container, PYTHON, "-I", "-c", program, path, str(maximum)], check=False)
         return result.stdout if result.returncode == 0 else None
 
+    def read_activity(self, job: DockerJob, offset: int, maximum: int = 128 * 1024) -> tuple[str, int] | None:
+        """Read complete debug JSONL records after a byte cursor, without copying history."""
+        if not isinstance(offset, int) or offset < 0 or not 16384 <= maximum <= 1024 * 1024:
+            raise DockerError("invalid activity cursor or limit")
+        program = ("import os,stat,sys; f=os.open('/workspace/codex-debug.jsonl',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK); "
+                   "assert stat.S_ISREG(os.fstat(f).st_mode); os.lseek(f,int(sys.argv[1]),0); "
+                   "data=os.read(f,int(sys.argv[2])); end=data.rfind(b'\\n')+1; sys.stdout.buffer.write(data[:end])")
+        result = self._run(["exec", job.container, PYTHON, "-I", "-c", program, str(offset), str(maximum)], check=False)
+        if result.returncode:
+            return None
+        return result.stdout, offset + len(result.stdout.encode("utf-8"))
+
     def workspace_bytes(self, job: DockerJob) -> int:
         result = self._run(["exec", job.container, "/usr/bin/du", "-sb", "/workspace", "/tmp", "/dev/shm"])
         try:
