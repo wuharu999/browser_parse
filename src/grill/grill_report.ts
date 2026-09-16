@@ -1,0 +1,433 @@
+import { GrillReport, GrillSession, BehaviorTreeNode } from './types';
+
+export type GrillReportTab = 'scenario' | 'capabilities' | 'architecture' | 'risk' | 'tree';
+
+export class GrillReportView {
+  private report: GrillReport;
+  private session: GrillSession;
+  private container: HTMLElement;
+  private activeTab: GrillReportTab = 'scenario';
+
+  constructor(report: GrillReport, session: GrillSession, container: HTMLElement) {
+    this.report = report;
+    this.session = session;
+    this.container = container;
+  }
+
+  public render(): void {
+    this.container.replaceChildren();
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'grill-report-wrapper';
+
+    // Top report header
+    const header = document.createElement('div');
+    header.className = 'grill-report-header';
+    header.innerHTML = `
+      <div class="report-header-top">
+        <div>
+          <span class="grill-badge status-badge completed">Report Ready</span>
+          <h1 class="report-title">${this.escape(this.session.task_intent || 'Robot Scenario Analysis')}</h1>
+        </div>
+        <div class="report-export-actions">
+          <button type="button" class="grill-btn grill-btn-secondary" id="btn-export-json">Export JSON</button>
+          <button type="button" class="grill-btn grill-btn-secondary" id="btn-export-md">Export Markdown</button>
+        </div>
+      </div>
+      <div class="report-meta">
+        <span><strong>Robot:</strong> ${this.escape(this.session.referenced_robot || 'Generic / Undefined')}</span>
+        <span><strong>Questions Answered:</strong> ${this.session.question_count} / 30</span>
+        <span><strong>Completed:</strong> ${new Date(this.session.finished_at || Date.now()).toLocaleString()}</span>
+      </div>
+    `;
+    wrapper.appendChild(header);
+
+    // Tab navigation
+    const tabNav = document.createElement('nav');
+    tabNav.className = 'grill-tabs';
+
+    const tabs: Array<{ id: GrillReportTab; label: string; icon: string }> = [
+      { id: 'scenario', label: 'Scenario & Goal', icon: '🎯' },
+      { id: 'capabilities', label: 'Robot Capabilities', icon: '🤖' },
+      { id: 'architecture', label: 'System Architecture', icon: '⚙️' },
+      { id: 'risk', label: 'Risk & Evidence Matrix', icon: '🛡️' },
+      { id: 'tree', label: 'Behavior Tree Visualizer', icon: '🌲' },
+    ];
+
+    for (const tab of tabs) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = `grill-tab-btn ${this.activeTab === tab.id ? 'active' : ''}`;
+      btn.innerHTML = `<span class="tab-icon">${tab.icon}</span> ${tab.label}`;
+      btn.addEventListener('click', () => {
+        this.activeTab = tab.id;
+        this.render();
+      });
+      tabNav.appendChild(btn);
+    }
+    wrapper.appendChild(tabNav);
+
+    // Tab content container
+    const contentEl = document.createElement('div');
+    contentEl.className = 'grill-tab-content';
+
+    switch (this.activeTab) {
+      case 'scenario':
+        contentEl.appendChild(this.renderScenarioTab());
+        break;
+      case 'capabilities':
+        contentEl.appendChild(this.renderCapabilitiesTab());
+        break;
+      case 'architecture':
+        contentEl.appendChild(this.renderArchitectureTab());
+        break;
+      case 'risk':
+        contentEl.appendChild(this.renderRiskTab());
+        break;
+      case 'tree':
+        contentEl.appendChild(this.renderTreeTab());
+        break;
+    }
+
+    wrapper.appendChild(contentEl);
+    this.container.appendChild(wrapper);
+
+    // Bind export buttons
+    const btnJson = wrapper.querySelector('#btn-export-json');
+    btnJson?.addEventListener('click', () => this.downloadJson());
+    const btnMd = wrapper.querySelector('#btn-export-md');
+    btnMd?.addEventListener('click', () => this.downloadMarkdown());
+  }
+
+  private renderScenarioTab(): HTMLElement {
+    const card = document.createElement('div');
+    card.className = 'grill-card report-panel';
+
+    const summaryText = this.report.scenario_summary || this.session.readback_summary || this.session.task_intent;
+    const tree = this.report.behavior_tree || this.session.scenario_state;
+    const nodeCount = tree?.nodes?.length || 0;
+
+    card.innerHTML = `
+      <h2 class="panel-heading">🎯 Confirmed Scenario & Objectives</h2>
+      <div class="scenario-summary-box">
+        <p class="summary-paragraph">${this.escape(summaryText)}</p>
+      </div>
+
+      <div class="metrics-grid">
+        <div class="metric-card">
+          <div class="metric-value">${this.escape(this.session.referenced_robot || 'Not specified')}</div>
+          <div class="metric-label">Target Hardware</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-value">${this.session.question_count}</div>
+          <div class="metric-label">Interview Turns / Questions</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-value">${nodeCount}</div>
+          <div class="metric-label">Modeled BT Nodes</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-value">${this.report.risk_matrix?.risks?.length || 0}</div>
+          <div class="metric-label">Assessed Risks</div>
+        </div>
+      </div>
+
+      <h3 class="panel-subheading">Operational Context</h3>
+      <ul class="context-list">
+        <li><strong>Task Intent:</strong> ${this.escape(this.session.task_intent)}</li>
+        <li><strong>Behavior Tree Root:</strong> <code>${this.escape(tree?.root_id || 'root')}</code></li>
+        <li><strong>Revision Index:</strong> Rev ${this.session.current_revision}</li>
+      </ul>
+    `;
+    return card;
+  }
+
+  private renderCapabilitiesTab(): HTMLElement {
+    const card = document.createElement('div');
+    card.className = 'grill-card report-panel';
+
+    const caps = this.report.capabilities;
+    const claims = caps?.claims || [];
+
+    let html = `
+      <h2 class="panel-heading">🤖 Robot Hardware & Capabilities Assessment</h2>
+      <p class="panel-intro">${this.escape(caps?.summary || 'Analysis of robot physical capabilities, payload limits, reach, and perception suitability.')}</p>
+    `;
+
+    if (claims.length === 0) {
+      html += `<div class="empty-state">No specific hardware claims recorded.</div>`;
+    } else {
+      html += `
+        <div class="claims-table-wrapper">
+          <table class="grill-table">
+            <thead>
+              <tr>
+                <th>Status</th>
+                <th>Category</th>
+                <th>Claim / Capability</th>
+                <th>Assessment Statement</th>
+                <th>Citations</th>
+              </tr>
+            </thead>
+            <tbody>
+      `;
+
+      for (const claim of claims) {
+        const statusClass = `claim-badge-${claim.status}`;
+        const citations = (claim.citations || []).map(c => `<span class="citation-tag">${this.escape(c)}</span>`).join(' ');
+        html += `
+          <tr>
+            <td><span class="claim-badge ${statusClass}">${this.escape(claim.status)}</span></td>
+            <td><strong>${this.escape(claim.category)}</strong></td>
+            <td>${this.escape(claim.title)}</td>
+            <td>${this.escape(claim.statement)}</td>
+            <td>${citations || '<span class="text-muted">—</span>'}</td>
+          </tr>
+        `;
+      }
+
+      html += `
+            </tbody>
+          </table>
+        </div>
+      `;
+    }
+
+    card.innerHTML = html;
+    return card;
+  }
+
+  private renderArchitectureTab(): HTMLElement {
+    const card = document.createElement('div');
+    card.className = 'grill-card report-panel';
+
+    const arch = this.report.system_architecture;
+    const nodes = arch?.nodes || [];
+
+    let html = `
+      <h2 class="panel-heading">⚙️ Proposed Integration Architecture</h2>
+      <p class="panel-intro">${this.escape(arch?.summary || 'ROS 2 software architecture, node topology, and communication graph.')}</p>
+      <div class="arch-meta-box">
+        <span><strong>Middleware:</strong> <code>${this.escape(arch?.middleware || 'ROS 2 Humble / CycloneDDS')}</code></span>
+      </div>
+    `;
+
+    if (nodes.length === 0) {
+      html += `<div class="empty-state">No ROS 2 nodes defined.</div>`;
+    } else {
+      html += `
+        <h3 class="panel-subheading">ROS 2 Nodes & Interfaces</h3>
+        <div class="arch-nodes-grid">
+      `;
+
+      for (const node of nodes) {
+        const subTopics = (node.topics_sub || []).map(t => `<code>${this.escape(t)}</code>`).join(', ');
+        const pubTopics = (node.topics_pub || []).map(t => `<code>${this.escape(t)}</code>`).join(', ');
+
+        html += `
+          <div class="arch-node-card">
+            <div class="node-header">
+              <span class="node-package">${this.escape(node.package)}</span>
+              <strong class="node-name">${this.escape(node.name)}</strong>
+              <span class="node-type">${this.escape(node.type)}</span>
+            </div>
+            <div class="node-topics">
+              ${subTopics ? `<div class="topic-row"><span>Sub:</span> ${subTopics}</div>` : ''}
+              ${pubTopics ? `<div class="topic-row"><span>Pub:</span> ${pubTopics}</div>` : ''}
+            </div>
+          </div>
+        `;
+      }
+
+      html += `</div>`;
+    }
+
+    if (arch?.recommendations && arch.recommendations.length > 0) {
+      html += `
+        <h3 class="panel-subheading">Integration Recommendations</h3>
+        <ul class="recommendations-list">
+          ${arch.recommendations.map(r => `<li>${this.escape(r)}</li>`).join('')}
+        </ul>
+      `;
+    }
+
+    card.innerHTML = html;
+    return card;
+  }
+
+  private renderRiskTab(): HTMLElement {
+    const card = document.createElement('div');
+    card.className = 'grill-card report-panel';
+
+    const rm = this.report.risk_matrix;
+    const risks = rm?.risks || [];
+
+    let html = `
+      <h2 class="panel-heading">🛡️ Operational Risk & Evidence Matrix</h2>
+      <p class="panel-intro">${this.escape(rm?.summary || 'Identified failure modes, safety boundaries, and recommended mitigations.')}</p>
+    `;
+
+    if (risks.length === 0) {
+      html += `<div class="empty-state">No risk items cataloged.</div>`;
+    } else {
+      html += `
+        <div class="risks-table-wrapper">
+          <table class="grill-table">
+            <thead>
+              <tr>
+                <th>Severity</th>
+                <th>Likelihood</th>
+                <th>Hazard / Risk Title</th>
+                <th>Mitigation Strategy</th>
+                <th>Evidence / Citations</th>
+              </tr>
+            </thead>
+            <tbody>
+      `;
+
+      for (const risk of risks) {
+        const sevClass = `risk-sev-${risk.severity}`;
+        const likeClass = `risk-like-${risk.likelihood}`;
+        const citations = (risk.citations || []).map(c => `<span class="citation-tag">${this.escape(c)}</span>`).join(' ');
+
+        html += `
+          <tr>
+            <td><span class="risk-badge ${sevClass}">${this.escape(risk.severity)}</span></td>
+            <td><span class="risk-badge ${likeClass}">${this.escape(risk.likelihood)}</span></td>
+            <td><strong>${this.escape(risk.title)}</strong></td>
+            <td>${this.escape(risk.mitigation)}</td>
+            <td>${citations || '<span class="text-muted">—</span>'}</td>
+          </tr>
+        `;
+      }
+
+      html += `
+            </tbody>
+          </table>
+        </div>
+      `;
+    }
+
+    card.innerHTML = html;
+    return card;
+  }
+
+  private renderTreeTab(): HTMLElement {
+    const card = document.createElement('div');
+    card.className = 'grill-card report-panel';
+
+    const treeData = this.report.behavior_tree || this.session.scenario_state;
+    const nodes = treeData?.nodes || [];
+    const rootId = treeData?.root_id || (nodes[0] ? nodes[0].id : 'root');
+
+    let html = `
+      <h2 class="panel-heading">🌲 Behavior Tree Visualizer</h2>
+      <p class="panel-intro">Formal control flow model synthesized during the interview turns.</p>
+    `;
+
+    if (nodes.length === 0) {
+      html += `<div class="empty-state">No Behavior Tree nodes recorded.</div>`;
+    } else {
+      const nodeMap = new Map<string, BehaviorTreeNode>();
+      for (const n of nodes) nodeMap.set(n.id, n);
+
+      html += `<div class="bt-tree-container">`;
+      html += this.renderTreeNode(rootId, nodeMap, 0);
+      html += `</div>`;
+    }
+
+    card.innerHTML = html;
+    return card;
+  }
+
+  private renderTreeNode(nodeId: string, nodeMap: Map<string, BehaviorTreeNode>, depth: number): string {
+    const node = nodeMap.get(nodeId);
+    if (!node) return '';
+
+    const iconMap: Record<string, string> = {
+      sequence: '➡️ Sequence',
+      fallback: '❓ Fallback',
+      action: '⚡ Action',
+      condition: '🔍 Condition',
+      decorator: '🔄 Decorator',
+    };
+
+    const typeLabel = iconMap[node.type] || node.type;
+    const typeClass = `bt-node-${node.type}`;
+
+    let html = `
+      <div class="bt-node-item" style="margin-left: ${depth * 24}px">
+        <div class="bt-node-box ${typeClass}">
+          <span class="bt-node-type-pill">${this.escape(typeLabel)}</span>
+          <strong class="bt-node-name">${this.escape(node.name || node.id)}</strong>
+          ${node.description ? `<span class="bt-node-desc">${this.escape(node.description)}</span>` : ''}
+        </div>
+      </div>
+    `;
+
+    if (node.children && node.children.length > 0) {
+      for (const childId of node.children) {
+        html += this.renderTreeNode(childId, nodeMap, depth + 1);
+      }
+    }
+
+    return html;
+  }
+
+  private downloadJson(): void {
+    const blob = new Blob([JSON.stringify(this.report, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `grill-report-${this.session.id}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  private downloadMarkdown(): void {
+    const md = generateGrillMarkdown(this.report, this.session);
+    const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `grill-report-${this.session.id}.md`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  private escape(str: string): string {
+    const p = document.createElement('p');
+    p.textContent = str;
+    return p.innerHTML;
+  }
+}
+
+export function generateGrillMarkdown(report: GrillReport, session: GrillSession): string {
+  const lines: string[] = [];
+  lines.push(`# Robot Scenario Assessment: ${session.task_intent}`);
+  lines.push(`**Target Robot:** ${session.referenced_robot || 'Not specified'}`);
+  lines.push(`**Date:** ${new Date(session.finished_at || Date.now()).toISOString()}`);
+  lines.push(`**Questions Answered:** ${session.question_count} / 30\n`);
+
+  lines.push(`## 1. Scenario Summary\n${report.scenario_summary || session.readback_summary || ''}\n`);
+
+  lines.push(`## 2. Capabilities Assessment\n${report.capabilities?.summary || ''}\n`);
+  for (const c of report.capabilities?.claims || []) {
+    lines.push(`- **[${c.status.toUpperCase()}]** ${c.title} (${c.category}): ${c.statement}`);
+  }
+  lines.push('');
+
+  lines.push(`## 3. Integration Architecture\n${report.system_architecture?.summary || ''}\n`);
+  for (const n of report.system_architecture?.nodes || []) {
+    lines.push(`- **Node \`${n.name}\`** (\`${n.package}\`): Type \`${n.type}\``);
+  }
+  lines.push('');
+
+  lines.push(`## 4. Operational Risk Matrix\n${report.risk_matrix?.summary || ''}\n`);
+  for (const r of report.risk_matrix?.risks || []) {
+    lines.push(`- **${r.title}** (Severity: ${r.severity}, Likelihood: ${r.likelihood}): ${r.mitigation}`);
+  }
+  lines.push('');
+
+  return lines.join('\n');
+}

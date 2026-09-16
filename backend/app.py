@@ -7,11 +7,13 @@ import os
 import re
 import secrets
 import shutil
+import base64
+import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
-from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi import FastAPI, Header, HTTPException, Request, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -20,6 +22,14 @@ from starlette.background import BackgroundTask
 
 from .store import Store
 from .chat import ChatService
+from .grill_store import GrillStore
+from .grill_intake import (
+    validate_upload_filename,
+    extract_file_content,
+    normalize_intake,
+    normalize_customer_answers,
+    SecurityError,
+)
 
 
 GIB = 1024 ** 3
@@ -85,15 +95,37 @@ class WorkerClaim(BaseModel):
     capacity: WorkerCapacity
 
 
+class CreateGrillSession(BaseModel):
+    task_intent: str = Field(min_length=1, max_length=12000)
+    referenced_robot: str | None = Field(default=None, max_length=100)
+    files: list[dict[str, Any]] | None = None
+
+
+class GrillAnswerItem(BaseModel):
+    question_id: str
+    selected_option: str | None = None
+    free_text: str | None = None
+    unknown: bool = False
+
+
+class GrillTurnSubmission(BaseModel):
+    answers: list[GrillAnswerItem]
+
+
+class GrillConfirmation(BaseModel):
+    confirmation_note: str | None = None
+
+
 def bearer(value: str | None) -> str:
     if not value or not value.startswith("Bearer ") or not value[7:].strip():
         raise HTTPException(401, "Bearer token required")
     return value[7:].strip()
 
 
-def create_app(*, db_path: str | None = None, upload_dir: str | None = None) -> FastAPI:
+def create_app(*, db_path: str | None = None, upload_dir: str | None = None, grill_db_path: str | None = None, grill_upload_dir: str | None = None) -> FastAPI:
     daily_shots = int(os.getenv("JOB_DAILY_LIMIT_SHOTS", os.getenv("JOB_DAILY_LIMIT_USD", "20")))
     store = Store(db_path or os.getenv("JOB_DB", "data/jobs.sqlite3"), upload_dir or os.getenv("JOB_UPLOAD_DIR", "data/uploads"), daily_limit_shots=daily_shots, max_running=int(os.getenv("JOB_MAX_RUNNING", "2")), max_pending=int(os.getenv("JOB_MAX_PENDING", "20")), lease_seconds=int(os.getenv("JOB_CLAIM_TTL_SECONDS", "1800")), runtime_seconds=int(os.getenv("JOB_MAX_RUNTIME_SECONDS", "1800")), pool_cpu_milli=int(os.getenv("JOB_POOL_CPU_MILLI", "4000")), pool_memory_mb=int(os.getenv("JOB_POOL_MEMORY_MB", "8192")), pool_disk_mb=int(os.getenv("JOB_POOL_DISK_MB", "32768")))
+    grill_store = GrillStore(grill_db_path or os.getenv("GRILL_DB", "data/grill.sqlite3"), grill_upload_dir or os.getenv("GRILL_UPLOADS", "data/grill_uploads"))
     @asynccontextmanager
     async def lifespan(app):
         store.interrupt_questions()
@@ -102,6 +134,7 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None) -> 
 
     app = FastAPI(title="Robot Log Workbench API", docs_url=None, redoc_url=None, lifespan=lifespan)
     app.state.store = store
+    app.state.grill_store = grill_store
     app.state.chat = ChatService()
     configured_origins = {x.strip() for x in os.getenv("JOB_ALLOWED_ORIGINS", "").split(",") if x.strip()}
 
@@ -113,6 +146,7 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None) -> 
             return JSONResponse({"detail": "origin not allowed"}, 403)
         if request.url.path.endswith("/files") and request.method == "PUT": limit = 2 * GIB
         elif request.url.path == "/api/jobs" and request.method == "POST": limit = 16 * 1024 * 1024
+        elif request.url.path == "/api/grill/sessions" and request.method == "POST": limit = 32 * 1024 * 1024
         else: limit = 262144
         length = request.headers.get("content-length")
         try:
@@ -123,7 +157,8 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None) -> 
             return JSONResponse({"detail": "invalid content-length"}, 400)
         if declared is not None and declared > limit:
             return JSONResponse({"detail": "request body too large"}, 413)
-        if not (request.url.path.endswith("/files") and request.method == "PUT"):
+        is_multipart = (request.url.path == "/api/grill/sessions" and request.method == "POST")
+        if not (request.url.path.endswith("/files") and request.method == "PUT") and not is_multipart:
             # Enforce the same cap for chunked JSON without first buffering an unbounded body.
             parts, received = [], 0
             async for part in request.stream():
@@ -343,35 +378,245 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None) -> 
         except PermissionError as exc: raise HTTPException(403, str(exc))
         return Response(status_code=204)
 
+    # --- Grill Bot Endpoints ---
+    @app.post("/api/grill/sessions", status_code=201)
+    async def grill_create_session(body: CreateGrillSession):
+        clean_intent = body.task_intent.strip()
+        if not clean_intent:
+            raise HTTPException(422, "task_intent is required")
+
+        staged_files = []
+        attachments_text = []
+        images = []
+        with tempfile.TemporaryDirectory(prefix="grill-intake-") as temp_dir:
+            if body.files:
+                for item in body.files:
+                    fname = validate_upload_filename(str(item.get("name", "")))
+                    b64 = str(item.get("content_base64", ""))
+                    raw_bytes = base64.b64decode(b64)
+                    temp_path = Path(temp_dir) / fname
+                    temp_path.write_bytes(raw_bytes)
+                    text_part, img_part = extract_file_content(temp_path, fname)
+                    if text_part:
+                        attachments_text.append(text_part)
+                    images.extend(img_part)
+                    staged_files.append((fname, raw_bytes))
+
+            try:
+                norm = normalize_intake(
+                    task_intent=clean_intent,
+                    attachments_text="\n".join(attachments_text),
+                    images=images,
+                )
+            except SecurityError as exc:
+                raise HTTPException(400, f"Security check rejected input: {exc}")
+            except ValueError as exc:
+                raise HTTPException(422, str(exc))
+
+        session, token = grill_store.create_session(
+            task_intent=norm.task_intent,
+            referenced_robot=norm.referenced_robot or body.referenced_robot,
+        )
+
+        for fname, raw_bytes in staged_files:
+            stored_name = f"{session['id']}_{secrets.token_hex(6)}_{fname}"
+            target_path = grill_store.upload_dir / stored_name
+            target_path.write_bytes(raw_bytes)
+            sha = hashlib.sha256(raw_bytes).hexdigest()
+            ext = Path(fname).suffix.lower()
+            mime = "application/pdf" if ext == ".pdf" else ("text/plain" if ext in {".txt", ".md"} else f"image/{ext.lstrip('.')}")
+            grill_store.add_file(
+                session_id=session["id"],
+                name=fname,
+                stored_name=stored_name,
+                size=len(raw_bytes),
+                sha256=sha,
+                mime_type=mime,
+            )
+
+        fresh_session = grill_store.get_session(session["id"])
+        if fresh_session:
+            fresh_session["turns"] = grill_store.get_turns(session["id"])
+        return {
+            "session": fresh_session,
+            "token": token,
+            "session_url": f"/grill/s/{token}",
+        }
+
+    @app.put("/api/grill/sessions/{session_id}/files", status_code=201)
+    async def grill_upload_file(
+        session_id: str,
+        request: Request,
+        name: str,
+        authorization: str | None = Header(default=None),
+        token: str | None = Query(default=None),
+    ):
+        raw_token = token or (authorization[7:].strip() if authorization and authorization.startswith("Bearer ") else "")
+        if not grill_store.verify_token(session_id, raw_token):
+            raise HTTPException(403, "Invalid or missing session token")
+        sess = grill_store.get_session(session_id)
+        if not sess:
+            raise HTTPException(404, "Session not found")
+        try:
+            fname = validate_upload_filename(name)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))
+
+        stored_name = f"{session_id}_{secrets.token_hex(6)}_{fname}"
+        target_path = grill_store.upload_dir / stored_name
+        digest, size = hashlib.sha256(), 0
+        with target_path.open("wb") as out:
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > 32 * 1024 * 1024:
+                    target_path.unlink(missing_ok=True)
+                    raise HTTPException(413, "file exceeds 32 MiB limit")
+                digest.update(chunk)
+                out.write(chunk)
+
+        text_part, img_part = extract_file_content(target_path, fname)
+        if text_part:
+            try:
+                normalize_intake("Verify attachment", attachments_text=text_part, images=img_part)
+            except SecurityError as exc:
+                target_path.unlink(missing_ok=True)
+                raise HTTPException(400, f"Security check rejected file: {exc}")
+
+        ext = Path(fname).suffix.lower()
+        mime = "application/pdf" if ext == ".pdf" else ("text/plain" if ext in {".txt", ".md"} else f"image/{ext.lstrip('.')}")
+        record = grill_store.add_file(
+            session_id=session_id,
+            name=fname,
+            stored_name=stored_name,
+            size=size,
+            sha256=digest.hexdigest(),
+            mime_type=mime,
+        )
+        return record
+
+    @app.get("/api/grill/session-by-token")
+    async def grill_get_session_by_token(
+        token: str = Query(...),
+    ):
+        sess = grill_store.get_session_by_token(token)
+        if not sess:
+            raise HTTPException(404, "Session not found or invalid token")
+        sess["turns"] = grill_store.get_turns(sess["id"])
+        return sess
+
+    @app.get("/api/grill/sessions/{session_id}")
+    async def grill_get_session(
+        session_id: str,
+        authorization: str | None = Header(default=None),
+        token: str | None = Query(default=None),
+    ):
+        raw_token = token or (authorization[7:].strip() if authorization and authorization.startswith("Bearer ") else "")
+        if not grill_store.verify_token(session_id, raw_token):
+            raise HTTPException(403, "Invalid or missing session token")
+        sess = grill_store.get_session(session_id)
+        if not sess:
+            raise HTTPException(404, "Session not found")
+        sess["turns"] = grill_store.get_turns(session_id)
+        return sess
+
+    @app.post("/api/grill/sessions/{session_id}/turns")
+    async def grill_submit_answers(
+        session_id: str,
+        body: GrillTurnSubmission,
+        authorization: str | None = Header(default=None),
+        token: str | None = Query(default=None),
+    ):
+        raw_token = token or (authorization[7:].strip() if authorization and authorization.startswith("Bearer ") else "")
+        if not grill_store.verify_token(session_id, raw_token):
+            raise HTTPException(403, "Invalid or missing session token")
+        sess = grill_store.get_session(session_id)
+        if not sess:
+            raise HTTPException(404, "Session not found")
+        try:
+            active_q = sess.get("active_questions") or []
+            normalized_updates = normalize_customer_answers([a.model_dump() for a in body.answers], active_q)
+            updated = grill_store.submit_answers(
+                session_id=session_id,
+                raw_token=raw_token,
+                answers=[a.model_dump() for a in body.answers],
+                normalized_updates=normalized_updates,
+            )
+            updated["turns"] = grill_store.get_turns(session_id)
+            return updated
+        except SecurityError as exc:
+            raise HTTPException(400, str(exc))
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))
+
+    @app.post("/api/grill/sessions/{session_id}/confirm")
+    async def grill_confirm_scenario(
+        session_id: str,
+        body: GrillConfirmation = GrillConfirmation(),
+        authorization: str | None = Header(default=None),
+        token: str | None = Query(default=None),
+    ):
+        raw_token = token or (authorization[7:].strip() if authorization and authorization.startswith("Bearer ") else "")
+        if not grill_store.verify_token(session_id, raw_token):
+            raise HTTPException(403, "Invalid or missing session token")
+        try:
+            confirmed = grill_store.confirm_scenario(
+                session_id=session_id,
+                raw_token=raw_token,
+                confirmation_note=body.confirmation_note,
+            )
+            confirmed["turns"] = grill_store.get_turns(session_id)
+            return confirmed
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))
+
+    # --- Worker Endpoints ---
     @app.post("/api/worker/claim")
     async def worker_claim(body: WorkerClaim, authorization: str | None = Header(default=None), x_worker_id: str | None = Header(default=None)):
         identity = worker_identity(authorization, x_worker_id)
         if body.worker_id != identity: raise HTTPException(422, "worker_id must match X-Worker-ID")
         try:
             job, budget_state = store.worker_claim(identity, body.capacity.model_dump())
+            if job is None and grill_store is not None:
+                grill_job = grill_store.worker_claim_grill(identity, body.capacity.model_dump())
+                if grill_job:
+                    return {"job": grill_job, "budget": budget_state}
         except ValueError as exc: raise HTTPException(422, str(exc))
         return {"job": job, "budget": budget_state}
 
     @app.get("/api/worker/jobs/{job_id}")
     async def worker_get(job_id: str, authorization: str | None = Header(default=None), x_worker_id: str | None = Header(default=None)):
+        if job_id.startswith("gtask_") and grill_store is not None:
+            worker_identity(authorization, x_worker_id)
+            return {"id": job_id, "status": "running", "cancel_requested": 0}
         item = store.worker_job(job_id, owned_worker_identity(job_id, authorization, x_worker_id))
         if not item: raise HTTPException(404, "job not found")
         return item
 
     @app.get("/api/worker/jobs/{job_id}/files/{artifact_id}")
     async def worker_file(job_id: str, artifact_id: str, authorization: str | None = Header(default=None), x_worker_id: str | None = Header(default=None)):
+        if job_id.startswith("gtask_") and grill_store is not None:
+            worker_identity(authorization, x_worker_id)
+            item = grill_store.get_file_by_id(artifact_id)
+            if not item: raise HTTPException(404, "file not available")
+            path, name = item; return FileResponse(path, filename=name, media_type="application/octet-stream")
         item = store.worker_file(job_id, artifact_id, owned_worker_identity(job_id, authorization, x_worker_id))
         if not item: raise HTTPException(404, "file not available")
         path, name = item; return FileResponse(path, filename=name, media_type="application/octet-stream")
 
     @app.post("/api/worker/jobs/{job_id}/events", status_code=201)
     async def worker_event(job_id: str, body: WorkerEvent, authorization: str | None = Header(default=None), x_worker_id: str | None = Header(default=None)):
+        if job_id.startswith("gtask_"):
+            worker_identity(authorization, x_worker_id)
+            return {"id": 1, "status": "accepted"}
         try: return store.worker_event(job_id, owned_worker_identity(job_id, authorization, x_worker_id), body.kind, body.agent, body.message, body.subagent)
         except KeyError: raise HTTPException(404, "job not found")
         except ValueError as exc: raise HTTPException(422, str(exc))
 
     @app.post("/api/worker/jobs/{job_id}/events/batch", status_code=201)
     async def worker_events(job_id: str, body: WorkerEvents, authorization: str | None = Header(default=None), x_worker_id: str | None = Header(default=None)):
+        if job_id.startswith("gtask_"):
+            worker_identity(authorization, x_worker_id)
+            return {"accepted": len(body.events)}
         try:
             records = store.worker_events(job_id, owned_worker_identity(job_id, authorization, x_worker_id), [event.model_dump() for event in body.events])
             return {"accepted": len(records)}
@@ -393,12 +638,32 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None) -> 
 
     @app.post("/api/worker/jobs/{job_id}/finish")
     async def worker_finish(job_id: str, body: Finish, authorization: str | None = Header(default=None), x_worker_id: str | None = Header(default=None)):
+        if job_id.startswith("gtask_") and grill_store is not None:
+            identity = worker_identity(authorization, x_worker_id)
+            out = {}
+            try:
+                out = json.loads(body.report)
+            except Exception:
+                out = {"report": body.report}
+            grill_store.worker_finish_grill(job_id, identity, body.status, out)
+            return {"id": job_id, "status": body.status}
         try: return store.finish(job_id, owned_worker_identity(job_id, authorization, x_worker_id), body.status, body.report, body.cost_usd, body.metrics, body.analysis_context)
         except KeyError: raise HTTPException(404, "job not found")
         except ValueError as exc: raise HTTPException(409, str(exc))
 
     dist = Path(os.getenv("JOB_DIST", "dist"))
-    if dist.is_dir(): app.mount("/", StaticFiles(directory=dist, html=True), name="ui")
+    if dist.is_dir():
+        index_file = dist / "index.html"
+        @app.get("/grill")
+        @app.get("/grill/{full_path:path}")
+        @app.get("/log")
+        @app.get("/log/{full_path:path}")
+        async def serve_spa_page(full_path: str = ""):
+            if index_file.is_file():
+                return FileResponse(index_file)
+            raise HTTPException(404, "Frontend build index.html not found")
+
+        app.mount("/", StaticFiles(directory=dist, html=True), name="ui")
     return app
 
 

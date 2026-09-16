@@ -1,0 +1,63 @@
+{
+  "schema_version": "1.0",
+  "scenario_id": "example_carry_box",
+  "revision": 1,
+  "summary": "教学样例：客户希望把A点的箱子搬到B点。搬运方法、物品规格、现场条件、验收和异常边界尚未明确，以下工程拆解均为待确认草稿。",
+  "sources": [
+    {"id":"src_001","kind":"user","locator":"教学样例中的模拟客户输入，非真实现场资料","excerpt":"让机器人把A点的箱子搬到B点。"}
+  ],
+  "fields": [
+    {"id":"f_goal","domain":"boundary","role":"requirement","label":"任务结果","value":"将A点箱子搬到B点","unit":null,"status":"known","source_ids":["src_001"],"rationale":"客户直接表达","confirmed":false,"blocking":false},
+    {"id":"f_a","domain":"fact_state","role":"initial_fact","label":"源点标签","value":"A","unit":null,"status":"known","source_ids":["src_001"],"rationale":"仅是位置标签，不是实际坐标","confirmed":false,"blocking":false},
+    {"id":"f_b","domain":"fact_state","role":"initial_fact","label":"目标点标签","value":"B","unit":null,"status":"known","source_ids":["src_001"],"rationale":"仅是位置标签，不是实际坐标","confirmed":false,"blocking":false},
+    {"id":"f_mass","domain":"constraints","role":"requirement","label":"箱重范围","value":null,"unit":"kg","status":"unknown","source_ids":[],"rationale":"影响抓持抬升及运输","confirmed":false,"blocking":true},
+    {"id":"f_geometry","domain":"constraints","role":"initial_fact","label":"箱体、承托面与操作空间条件","value":null,"unit":null,"status":"unknown","source_ids":[],"rationale":"初期占位，收到信息后拆分尺寸、高度、重心与干涉等相关字段","confirmed":false,"blocking":true},
+    {"id":"f_route","domain":"fact_state","role":"initial_fact","label":"A/B位置及空载、负载适用路线","value":null,"unit":null,"status":"unknown","source_ids":[],"rationale":"标签不证明空间可达性","confirmed":false,"blocking":true},
+    {"id":"f_accept","domain":"acceptance_value","role":"requirement","label":"放置位置、精度和完成标准","value":null,"unit":null,"status":"unknown","source_ids":[],"rationale":"B点到位不等于完成放置","confirmed":false,"blocking":true},
+    {"id":"f_fault","domain":"disturbances","role":"requirement","label":"异常处置及人工边界","value":null,"unit":null,"status":"unknown","source_ids":[],"rationale":"脱手、定位失效等处置尚需明确","confirmed":false,"blocking":true},
+    {"id":"f_time","domain":"constraints","role":"requirement","label":"整次任务允许时长","value":null,"unit":"s","status":"unknown","source_ids":[],"rationale":"需覆盖操作、行走及允许的恢复","confirmed":false,"blocking":true},
+    {"id":"f_pose","domain":"fact_state","role":"runtime","label":"箱体与机器人相对位姿","value":null,"unit":null,"status":"unknown","source_ids":[],"rationale":"未来由观察动作产生","confirmed":false,"blocking":false},
+    {"id":"f_held","domain":"fact_state","role":"runtime","label":"箱体已被可靠持有","value":null,"unit":null,"status":"unknown","source_ids":[],"rationale":"未来由抓持结果复核产生","confirmed":false,"blocking":false},
+    {"id":"f_loaded_view","domain":"fact_state","role":"runtime","label":"负载时外形、感知及通行条件的检查结果","value":null,"unit":null,"status":"unknown","source_ids":[],"rationale":"未来由持物状态观察产生","confirmed":false,"blocking":false},
+    {"id":"f_result","domain":"acceptance_value","role":"runtime","label":"任务结果及未完成原因","value":null,"unit":null,"status":"unknown","source_ids":[],"rationale":"未来由验收或异常处置记录","confirmed":false,"blocking":false}
+  ],
+  "root_id": "n_root",
+  "nodes": [
+    {"id":"n_root","type":"Fallback","label":"搬箱任务及异常处理","children":["n_main","n_fault"],"subtree_id":null,"alternative_group":null,"read_fields":[],"write_fields":[],"constraint_fields":[],"location_fields":[],"preconditions":[],"success_criteria":[],"failure_cases":[],"parameters":{},"basis":{"status":"candidate","source_ids":["src_001"],"rationale":"提议正常作业失败后进入待确认的处置动作"},"required_capabilities":[]},
+    {"id":"n_main","type":"Sequence","label":"正常搬运流程草稿","children":["n_nav_a","n_observe","n_grasp_ready","n_lift","n_loaded_observe","n_loaded_ready","n_nav_b","n_place","n_verify"],"subtree_id":null,"alternative_group":null,"read_fields":[],"write_fields":[],"constraint_fields":["f_time"],"location_fields":[],"preconditions":[],"success_criteria":[],"failure_cases":[],"parameters":{},"basis":{"status":"candidate","source_ids":["src_001"],"rationale":"从到达、取物、运输和放置反推待确认流程"},"required_capabilities":[]},
+    {"id":"n_nav_a","type":"Action","label":"空载到达A点准备位置","children":[],"subtree_id":null,"alternative_group":null,"read_fields":["f_route"],"write_fields":[],"constraint_fields":["f_time"],"location_fields":["f_a"],"preconditions":["f_route对应的空载条件已核实"],"success_criteria":["到位后进入后续观察及纠偏的有效范围；范围待明确"],"failure_cases":["定位失效或路线不可用时向上返回原因"],"parameters":{},"basis":{"status":"candidate","source_ids":["src_001"],"rationale":"直接抓取方案前需要到达作业位置"},"required_capabilities":["空载导航到位"]},
+    {"id":"n_observe","type":"Action","label":"观察箱体及相对作业位姿","children":[],"subtree_id":null,"alternative_group":null,"read_fields":["f_geometry"],"write_fields":["f_pose"],"constraint_fields":["f_geometry"],"location_fields":["f_a"],"preconditions":["目标处于可观测范围"],"success_criteria":["产生满足后续要求的f_pose及其有效性信息"],"failure_cases":["无法观测、精度或时效不满足时返回失败原因"],"parameters":{},"basis":{"status":"candidate","source_ids":[],"rationale":"到位与抓取之间需要相对定位"},"required_capabilities":["箱体相对定位"]},
+    {"id":"n_grasp_ready","type":"Condition","label":"当前条件是否允许抓取","children":[],"subtree_id":null,"alternative_group":null,"read_fields":["f_pose","f_mass","f_geometry"],"write_fields":[],"constraint_fields":["f_mass","f_geometry"],"location_fields":["f_a"],"preconditions":["输入有效且限制有依据"],"success_criteria":["相对位姿、负载和空间均在已评审操作范围内"],"failure_cases":["任何关键输入未知、过期或超限则失败，不默认满足"],"parameters":{},"basis":{"status":"candidate","source_ids":[],"rationale":"防止导航到位即开始抓取"},"required_capabilities":["抓取条件判定"]},
+    {"id":"n_lift","type":"Action","label":"抓持抬升并复核","children":[],"subtree_id":null,"alternative_group":null,"read_fields":["f_pose","f_mass","f_geometry"],"write_fields":["f_held"],"constraint_fields":["f_mass","f_geometry","f_time"],"location_fields":["f_a"],"preconditions":["抓取前置检查通过"],"success_criteria":["复核后f_held为真，保持姿态适于运输"],"failure_cases":["抓持或抬升失败，保留是否仍持物等现场信息再返回原因"],"parameters":{},"basis":{"status":"candidate","source_ids":[],"rationale":"暂以直接抓持为待确认候选；方法尚需核实"},"required_capabilities":["抓持抬升及持物复核"]},
+    {"id":"n_loaded_observe","type":"Action","label":"检查持物后的外形和感知条件","children":[],"subtree_id":null,"alternative_group":null,"read_fields":["f_held","f_route"],"write_fields":["f_loaded_view"],"constraint_fields":["f_geometry"],"location_fields":["f_a"],"preconditions":["物品保持受控"],"success_criteria":["更新f_loaded_view，能区分可用、不可用和无法判断"],"failure_cases":["数据不足或观察失败时返回原因"],"parameters":{},"basis":{"status":"candidate","source_ids":[],"rationale":"负载改变外形和可能的传感器遮挡"},"required_capabilities":["负载外形与感知可用性检查"]},
+    {"id":"n_loaded_ready","type":"Condition","label":"负载运输条件是否满足","children":[],"subtree_id":null,"alternative_group":null,"read_fields":["f_held","f_loaded_view","f_route","f_mass"],"write_fields":[],"constraint_fields":["f_mass","f_time"],"location_fields":[],"preconditions":["检查结果有效"],"success_criteria":["抓持、外形、感知与路线同时满足负载运输要求"],"failure_cases":["未知或不满足时不得开始运输"],"parameters":{},"basis":{"status":"candidate","source_ids":[],"rationale":"空载可行不能覆盖持物情况"},"required_capabilities":["负载通行条件判定"]},
+    {"id":"n_nav_b","type":"Action","label":"持物到B点并局部对准","children":[],"subtree_id":null,"alternative_group":null,"read_fields":["f_held","f_loaded_view","f_route","f_accept"],"write_fields":["f_pose"],"constraint_fields":["f_mass","f_time","f_fault"],"location_fields":["f_a","f_b"],"preconditions":["负载条件满足"],"success_criteria":["B点相对位姿进入放置范围并更新f_pose"],"failure_cases":["持续持物或感知条件失效时中断并返回原因；具体恢复待定"],"parameters":{},"basis":{"status":"candidate","source_ids":["src_001"],"rationale":"运输与末端放置需要衔接"},"required_capabilities":["负载导航","放置前局部对准","持续抓持监测"]},
+    {"id":"n_place","type":"Action","label":"放置箱体并确认承托后释放","children":[],"subtree_id":null,"alternative_group":null,"read_fields":["f_pose","f_held","f_accept"],"write_fields":["f_held"],"constraint_fields":["f_geometry","f_mass","f_accept"],"location_fields":["f_b"],"preconditions":["相对位姿有效且承托面条件满足"],"success_criteria":["箱体稳定承托后释放，更新f_held为假"],"failure_cases":["不能确认承托或释放失败则返回原因，不认定已完成"],"parameters":{},"basis":{"status":"candidate","source_ids":[],"rationale":"到达B点后仍须完成放置"},"required_capabilities":["放置及承托复核"]},
+    {"id":"n_verify","type":"Action","label":"复核最终结果","children":[],"subtree_id":null,"alternative_group":null,"read_fields":["f_accept","f_goal"],"write_fields":["f_result"],"constraint_fields":["f_accept","f_time"],"location_fields":["f_b"],"preconditions":["验收规则已明确"],"success_criteria":["实际观察满足f_goal和f_accept后记录全部完成"],"failure_cases":["结果不满足或无法确认则记录未完成原因并返回失败"],"parameters":{},"basis":{"status":"candidate","source_ids":[],"rationale":"需要确认结果而非只统计动作"},"required_capabilities":["搬运结果验收"]},
+    {"id":"n_fault","type":"Action","label":"按原因处置并记录未完成","children":[],"subtree_id":null,"alternative_group":null,"read_fields":["f_fault","f_held"],"write_fields":["f_result"],"constraint_fields":["f_fault"],"location_fields":[],"preconditions":["只能执行已明确允许且适用于当前状态的处置；不能假设仍持物"],"success_criteria":["处置结果可记录，但原任务未完成时不得向根节点返回任务成功"],"failure_cases":["未恢复原目标时返回FAILURE并保留原因；人工等待需另行明确上限，当前是阻塞缺口"],"parameters":{},"basis":{"status":"candidate","source_ids":[],"rationale":"异常处理尚未获客户确认，保留占位及缺口"},"required_capabilities":["异常检测与处置","人工交接"]}
+  ],
+  "alternatives": [],
+  "issues": [
+    {"id":"issue_method","kind":"choice","target_ids":["n_lift","f_geometry"],"owner":"customer","blocking":true,"description":"直接抓持仅为候选，是否允许或需要工具／托盘尚未明确","resolve_by":"确认实际搬运方式及现场配置后修改对应子树"},
+    {"id":"issue_mass","kind":"missing","target_ids":["f_mass","n_lift","n_nav_b"],"owner":"customer","blocking":true,"description":"箱重未知","resolve_by":"客户提供实测或明确估计来源，未知则安排称重"},
+    {"id":"issue_route","kind":"missing","target_ids":["f_route","n_nav_a","n_nav_b"],"owner":"customer","blocking":true,"description":"只有A/B标签，实际位置与路线未知","resolve_by":"补充现场布局和可通行条件"},
+    {"id":"issue_accept","kind":"missing","target_ids":["f_accept","f_time","n_verify"],"owner":"customer","blocking":true,"description":"结果精度及整次时限未知","resolve_by":"确认放置标准与允许时长"},
+    {"id":"issue_fault","kind":"missing","target_ids":["f_fault","n_fault"],"owner":"customer","blocking":true,"description":"异常和人工边界未定义，异常动作未展开","resolve_by":"确认处置范围、等待界限及恢复要求"},
+    {"id":"issue_robot","kind":"evidence","target_ids":["n_lift","n_nav_b","n_place"],"owner":"engineering","blocking":true,"description":"机器人配置、执行器负载及实测能力资料缺失","resolve_by":"工程人员提供对应配置及场景条件下的能力证据"}
+  ],
+  "questions": [
+    {"id":"q_method","text":"现场希望机器人怎样接触和搬运箱子？","target_ids":["n_lift","f_geometry"],"why":"决定直接抓持是否保留，以及应补充哪些结构和操作条件","options":[{"label":"直接抓持箱体","interpretation":"确认候选方法，继续明确箱体和承托条件"},{"label":"借助现场工具或承载装置","interpretation":"保留工具类型未知并调整搬运子树"},{"label":"目前没有限定方法","interpretation":"方法保持待选，后续由场景和能力资料筛选"}],"free_text":true,"allow_unknown":true},
+    {"id":"q_mass","text":"箱子的重量范围目前有什么依据？","target_ids":["f_mass"],"why":"影响抓持抬升和负载行走要求","options":[{"label":"有实测值，我来提供","interpretation":"收到具体值前仍保持null"},{"label":"只有估计范围","interpretation":"记录候选估计并保留验证缺口"},{"label":"暂时不清楚","interpretation":"保持unknown并记录称重事项"}],"free_text":true,"allow_unknown":true},
+    {"id":"q_fault","text":"异常时允许人工怎样参与？","target_ids":["f_fault"],"why":"决定停止、交接和恢复边界","options":[{"label":"允许现场人员处理","interpretation":"继续明确呼叫方式和等待要求"},{"label":"只允许远程人员处理","interpretation":"继续明确可操作范围及远程无法处理时的边界"},{"label":"暂时没有确定","interpretation":"保留阻塞未知，不默认自动恢复"}],"free_text":true,"allow_unknown":true}
+  ],
+  "changes": {
+    "added_ids": ["f_goal","f_a","f_b","f_mass","f_geometry","f_route","f_accept","f_fault","f_time","f_pose","f_held","f_loaded_view","f_result","n_root","n_main","n_nav_a","n_observe","n_grasp_ready","n_lift","n_loaded_observe","n_loaded_ready","n_nav_b","n_place","n_verify","n_fault"],
+    "updated_ids": [], "removed_ids": [], "affected_node_ids": []
+  },
+  "checks": {
+    "validation": "not_run",
+    "blocking_issue_ids": ["issue_method","issue_mass","issue_route","issue_accept","issue_fault","issue_robot"],
+    "ready_for_readback": false,
+    "notes": ["模拟输入的教学草稿，所有工程拆解待确认；未提供地图、机器人能力或真实实测数据。"]
+  }
+}

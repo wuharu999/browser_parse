@@ -6,6 +6,20 @@ import { parseReport } from './report';
 import { availability, type Budget } from './budget';
 import { uploadFile, protectUpload, type UploadProgress, type WakeState } from './upload';
 import { onUiLanguage, setUiLanguage, t, uiLanguage } from './i18n';
+import { GrillIntakeView } from './grill/grill_intake';
+import { GrillSessionView } from './grill/grill_session';
+import { parseRoute, type RouteState } from './grill/router';
+export { parseRoute, type RouteState };
+
+let currentRoute = parseRoute(typeof window !== 'undefined' ? window.location.pathname : '/');
+let grillSessionView: GrillSessionView | null = null;
+
+export function navigate(path: string): void {
+  if (window.location.pathname !== path) {
+    window.history.pushState(null, '', path);
+  }
+  renderApp();
+}
 
 type Job = { codex_started?: boolean; subagents?: SubagentSummary[]; id: string; description: string; status: string; created_at: string; cancel_requested: boolean; report?: string; resource_plan?: { profile: string; cpu_milli: number; memory_mb: number; disk_mb: number } | null; review_claim?: { name: string; expires_at: string } | null; sanitized_description?: string };
 type Version = { id: number; reviewer_name: string; success: boolean; note: string; procedure: string; created_at: string };
@@ -70,8 +84,12 @@ function buildShell(): void {
   const main = el('main', 'main'), topbar = el('header', 'topbar');
   topbar.append(el('span', 'workspace-title', t('Shared workspace', '共享工作台')));
   const tools = el('div', 'top-actions'); activityCount = el('span', 'activity-count');
+  const modeNav = el('div', 'mode-nav');
+  const logTab = button(t('📋 Log Analyzer', '📋 日志分析'), 'mode-tab active', () => navigate('/log'));
+  const grillTab = button(t('🤖 Scenario Grill Bot', '🤖 场景推演'), 'mode-tab', () => navigate('/grill'));
+  modeNav.append(logTab, grillTab);
   const languageButton = button(uiLanguage() === 'en' ? '中文' : 'English', 'button text-button language-toggle', () => setUiLanguage(uiLanguage() === 'en' ? 'zh' : 'en'));
-  languageButton.setAttribute('aria-label', 'Switch interface language / 切换界面语言'); tools.append(activityCount, languageButton); topbar.append(tools);
+  languageButton.setAttribute('aria-label', 'Switch interface language / 切换界面语言'); tools.append(modeNav, activityCount, languageButton); topbar.append(tools);
   banner = el('div', 'notice'); banner.hidden = true; banner.setAttribute('role', 'status');
   activity = el('section', 'live-panel'); activity.setAttribute('aria-label', t('Shared processes', '共享进程'));
   usage = el('section', 'usage-panel'); usage.setAttribute('aria-label', t('Daily analysis allowance', '每日分析额度'));
@@ -79,6 +97,59 @@ function buildShell(): void {
   content = el('div', 'content'); main.append(topbar, banner, usage, activity, uploadPanel, content); shell.append(sidebar, main); app.append(shell);
   renderHistory(); renderActivity(); updateConnection(); renderBudget(); renderUpload();
   if (selected && selectedJob) renderResult(); else renderNew();
+}
+
+function buildGrillShell(token?: string): void {
+  if (grillSessionView) {
+    grillSessionView.destroy();
+    grillSessionView = null;
+  }
+  document.documentElement.lang = uiLanguage();
+  app.replaceChildren();
+
+  const shell = el('div', 'grill-shell');
+  const topbar = el('header', 'grill-topbar');
+
+  const brand = el('div', 'grill-brand');
+  brand.append(el('span', 'grill-brand-mark', '🤖'), el('span', '', t('Robot Scenario Grill', '机器人场景推演')));
+  brand.addEventListener('click', () => navigate('/grill'));
+
+  const modeNav = el('div', 'mode-nav');
+  const logTab = button(t('📋 Log Analyzer', '📋 日志分析'), 'mode-tab', () => navigate('/log'));
+  const grillTab = button(t('🤖 Scenario Grill Bot', '🤖 场景推演'), 'mode-tab active', () => navigate('/grill'));
+  modeNav.append(logTab, grillTab);
+
+  const tools = el('div', 'top-actions');
+  const languageButton = button(uiLanguage() === 'en' ? '中文' : 'English', 'button text-button language-toggle', () => setUiLanguage(uiLanguage() === 'en' ? 'zh' : 'en'));
+  languageButton.setAttribute('aria-label', 'Switch interface language / 切换界面语言');
+  tools.append(modeNav, languageButton);
+
+  topbar.append(brand, tools);
+
+  const main = el('main', 'grill-main');
+  shell.append(topbar, main);
+  app.append(shell);
+
+  if (token) {
+    grillSessionView = new GrillSessionView(token, main, navigate);
+    void grillSessionView.start();
+  } else {
+    const intakeView = new GrillIntakeView(main, navigate);
+    intakeView.render();
+  }
+}
+
+function renderApp(): void {
+  currentRoute = parseRoute(window.location.pathname);
+  if (currentRoute.mode === 'grill') {
+    buildGrillShell(currentRoute.token);
+  } else {
+    if (grillSessionView) {
+      grillSessionView.destroy();
+      grillSessionView = null;
+    }
+    buildShell();
+  }
 }
 function submissionLabel(): string {
   const state = availability(budget).state;
@@ -761,5 +832,15 @@ async function refresh(): Promise<void> {
   } catch { online = false; budget = null; renderBudget(); updateConnection(); notice(t('The server is unavailable. Your selected files are still here; please retry when it reconnects.', '服务器暂不可用。所选文件仍保留在此处，请在恢复连接后重试。'), true); }
   finally { refreshing = false; }
 }
-onUiLanguage(() => { if (!outputChosen) outputLanguage = uiLanguage(); buildShell(); });
-buildShell(); void refresh(); window.setInterval(() => { void refresh(); if (selected) void questionPanels.get(selected)?.poll(); }, 3000);
+onUiLanguage(() => { if (!outputChosen) outputLanguage = uiLanguage(); renderApp(); });
+window.addEventListener('popstate', () => renderApp());
+renderApp();
+if (currentRoute.mode === 'log') {
+  void refresh();
+}
+window.setInterval(() => {
+  if (currentRoute.mode === 'log') {
+    void refresh();
+    if (selected) void questionPanels.get(selected)?.poll();
+  }
+}, 3000);

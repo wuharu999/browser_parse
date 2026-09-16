@@ -373,6 +373,10 @@ class DockerWorker:
                     self._checkpoint(str(job["id"]), deadline); relative = f".upload/{file_id}/{index:06d}"; (root / relative).write_bytes(chunk); chunks.append(relative)
             staged.unlink(); item["local_path"], item["staging_chunks"] = _input_path(file_id, name), chunks
         (root / "job.json").write_text(json.dumps(job, separators=(",", ":")))
+        if job.get("scenario_state"):
+            (root / "scenario_state.json").write_text(json.dumps(job["scenario_state"], ensure_ascii=False, separators=(",", ":")))
+        if job.get("customer_answers"):
+            (root / "customer_answers.json").write_text(json.dumps(job["customer_answers"], ensure_ascii=False, separators=(",", ":")))
 
     def _write_local_tree(self, source: Path, destination: Path, job_id: str, deadline: float, maximum: int | None = None) -> None:
         if not source.is_dir(): raise WorkerError(f"runtime directory is unavailable: {source}")
@@ -499,7 +503,7 @@ class DockerWorker:
 
         # R1: Pre-execution security inspection pipeline
         # Inspect user prompt and non-log attachments (up to 32 KiB) before creating sandbox or calling Codex.
-        if self.guard is not None:
+        if self.guard is not None and job.get("job_type") != "grill":
             with tempfile.TemporaryDirectory(prefix="robot-guard-") as guard_temp:
                 non_log_staged: list[tuple[str, Path]] = []
                 for index, item in enumerate(job.get("files", [])):
@@ -622,7 +626,10 @@ class DockerWorker:
             })
             metrics["docker_workspace_bytes"] = self.runtime.workspace_bytes(container)
             status = "completed" if result.get("status") == "completed" else "failed"
-            report = _safe_report(result.get("report") or "Docker run produced no final report.", self._secrets)
+            if job.get("job_type") == "grill":
+                report = json.dumps(result, ensure_ascii=False) if isinstance(result.get("scenario_state"), dict) or isinstance(result.get("report"), dict) else (result.get("report") or "Grill run completed")
+            else:
+                report = _safe_report(result.get("report") or "Docker run produced no final report.", self._secrets)
             if analysis_context:
                 self.api.save_analysis_context(job_id, analysis_context)
             if not self.runtime.remove(container):

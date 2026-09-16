@@ -653,6 +653,12 @@ def main() -> int:
         job = json.loads(Path(sys.argv[1]).read_text())
         if not isinstance(job, dict):
             raise ValueError("job JSON must be an object")
+        if job.get("job_type") == "grill":
+            try:
+                import run_grill
+            except ImportError:
+                from sandbox import run_grill
+            return run_grill.run_grill(job, started)
         model = os.environ.get("CODEX_MODEL", "gpt-5.6-luna")
         _assemble_inputs(job)
         if (WORKSPACE / "wiki").is_dir():
