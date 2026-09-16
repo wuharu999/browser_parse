@@ -39,6 +39,7 @@ let selectedEvents: Event[] = [], detailSignature = '', activitySignature = '', 
 const drafts = new Map<string, Draft>(), events = new Map<string, Event[]>();
 const sessionViews = new Map<string, { open: boolean; top: number; following: boolean }>();
 const processDrawers = new Map<string, boolean>();
+const retainedAgentEvents = new Map<string, Event[]>();
 const pausedSessions = new Set<string>();
 const isHeartbeat = (event: Event): boolean => event.kind === 'heartbeat' || event.message.includes('Sandbox execution remains active');
 const findJob = (id: string): Job | undefined => (selectedJob?.id === id ? selectedJob : active.find(j => j.id === id) ?? jobs.find(j => j.id === id));
@@ -287,7 +288,7 @@ function sandboxAbstractionPanel(id: string, records: Event[]): HTMLElement {
   const { parent, children } = observedAgents(job, records);
   const roleNames: Record<string, string> = { log_investigator: 'Log Investigator', telemetry_investigator: 'Telemetry Investigator', evidence_reviewer: 'Evidence Reviewer' };
   const agentDefs: Array<{ id: string; name: string; role: string; icon: string; child?: SubagentSummary }> = [
-    ...(parent ? [{ id: 'codex', name: 'Codex Orchestrator', role: t('Parent Process', '主分析进程'), icon: '⚡' }] : []),
+    ...(parent ? [{ id: 'codex', name: 'Orchestrator', role: t('Parent Process', '主分析进程'), icon: '⚡' }] : []),
     ...children.map(child => ({ id: child.thread_id,
       name: child.role ? roleNames[child.role] ?? child.role : 'Subagent',
       role: child.thread_id, icon: '⚙️', child })),
@@ -295,9 +296,20 @@ function sandboxAbstractionPanel(id: string, records: Event[]): HTMLElement {
   if (!agentDefs.length) processGrid.append(el('p', 'muted-note', t('No agent has started yet.', '尚无代理启动。')));
 
   for (const def of agentDefs) {
-    const agentEvents = records.filter(e => !isHeartbeat(e) && (def.child
+    const agentKey = `${id}:${def.id}`;
+    const currentEvents = records.filter(e => !isHeartbeat(e) && (def.child
       ? e.subagent?.thread_id === def.id
       : !e.subagent && e.agent === def.id));
+
+    // Retain worker outputs across sliding-window roll-offs (hard limit of 50 to protect memory, while always ensuring at least the last 5 outputs are shown)
+    const prevRetained = retainedAgentEvents.get(agentKey) ?? [];
+    const eventMap = new Map<number, Event>();
+    for (const ev of prevRetained) eventMap.set(ev.seq, ev);
+    for (const ev of currentEvents) eventMap.set(ev.seq, ev);
+    const allAgentEvents = [...eventMap.values()].sort((a, b) => a.seq - b.seq);
+    const agentEvents = allAgentEvents.slice(-50);
+    retainedAgentEvents.set(agentKey, agentEvents);
+
     const card = el('div', `sandbox-process-card ${def.child ? 'subagent' : def.id}`);
 
     const cardHeader = el('div', 'process-card-header');
@@ -353,7 +365,8 @@ function sandboxAbstractionPanel(id: string, records: Event[]): HTMLElement {
     if (!agentEvents.length) {
       drawerBody.append(el('p', 'muted-note', t('No intermediate outputs from this process yet.', '此进程暂未产生中间输出。')));
     } else {
-      for (const ev of agentEvents) {
+      // Newest outputs show on top
+      for (const ev of [...agentEvents].reverse()) {
         const item = el('div', 'output-item');
         const itemMeta = el('div', 'output-meta');
         itemMeta.append(
@@ -369,6 +382,14 @@ function sandboxAbstractionPanel(id: string, records: Event[]): HTMLElement {
     card.append(drawer);
 
     processGrid.append(card);
+  }
+  if (retainedAgentEvents.size > 100) {
+    const activePrefixes = new Set([...active.map(j => `${j.id}:`), ...(selected ? [`${selected}:`] : [])]);
+    for (const key of retainedAgentEvents.keys()) {
+      if (![...activePrefixes].some(prefix => key.startsWith(prefix))) {
+        retainedAgentEvents.delete(key);
+      }
+    }
   }
   container.append(processGrid);
 
@@ -397,7 +418,7 @@ function sandboxAbstractionPanel(id: string, records: Event[]): HTMLElement {
 
 function sessionPanel(id: string, records: Event[]): HTMLDetailsElement {
   const panel = el('details', 'session-panel'); panel.dataset.job = id; panel.open = sessionViews.get(id)?.open ?? true;
-  panel.append(el('summary', '', t('Session activity & output', '会话活动与输出')), el('p', 'session-hint', t('Codex debug output, tool calls, results and child activity. Credentials are redacted. Large outputs continue across entries.', '显示 Codex 调试输出、工具调用、结果与子代理活动；凭据已脱敏。较长输出会分成连续记录。')));
+  panel.append(el('summary', '', t('Session activity & output', '会话活动与输出')), el('p', 'session-hint', t('Orchestrator debug output, tool calls, results and child activity. Credentials are redacted. Large outputs continue across entries.', '显示调度器调试输出、工具调用、结果与活动；凭据已脱敏。较长输出会分成连续记录。')));
 
   // Keep observed lifecycle history visible after the container is removed.
   panel.append(sandboxAbstractionPanel(id, records));
