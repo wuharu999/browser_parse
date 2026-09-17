@@ -99,6 +99,7 @@ class CreateGrillSession(BaseModel):
     task_intent: str = Field(min_length=1, max_length=12000)
     referenced_robot: str | None = Field(default=None, max_length=100)
     files: list[dict[str, Any]] | None = None
+    defer_turn: bool = False
 
 
 class GrillAnswerItem(BaseModel):
@@ -416,6 +417,7 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None, gri
         session, token = grill_store.create_session(
             task_intent=norm.task_intent,
             referenced_robot=norm.referenced_robot or body.referenced_robot,
+            defer_turn=body.defer_turn,
         )
 
         for fname, raw_bytes in staged_files:
@@ -569,6 +571,21 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None, gri
         except ValueError as exc:
             raise HTTPException(422, str(exc))
 
+    @app.post("/api/grill/sessions/{session_id}/start")
+    async def grill_start_session(
+        session_id: str,
+        authorization: str | None = Header(default=None),
+        token: str | None = Query(default=None),
+    ):
+        raw_token = token or (authorization[7:].strip() if authorization and authorization.startswith("Bearer ") else "")
+        if not grill_store.verify_token(session_id, raw_token):
+            raise HTTPException(403, "Invalid or missing session token")
+        sess = grill_store.get_session(session_id)
+        if not sess:
+            raise HTTPException(404, "Session not found")
+        task_id = grill_store.enqueue_turn(session_id, 1)
+        return {"session_id": session_id, "task_id": task_id, "status": "queued"}
+
     # --- Worker Endpoints ---
     @app.post("/api/worker/claim")
     async def worker_claim(body: WorkerClaim, authorization: str | None = Header(default=None), x_worker_id: str | None = Header(default=None)):
@@ -645,7 +662,8 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None, gri
                 out = json.loads(body.report)
             except Exception:
                 out = {"report": body.report}
-            grill_store.worker_finish_grill(job_id, identity, body.status, out)
+            err_msg = body.report if body.status != "completed" else None
+            grill_store.worker_finish_grill(job_id, identity, body.status, out, error_message=err_msg)
             return {"id": job_id, "status": body.status}
         try: return store.finish(job_id, owned_worker_identity(job_id, authorization, x_worker_id), body.status, body.report, body.cost_usd, body.metrics, body.analysis_context)
         except KeyError: raise HTTPException(404, "job not found")

@@ -79,6 +79,10 @@ def build_turn_prompt(
         "   - `options`: EXACTLY 3 suggested options, each with `label` and `interpretation`",
         "   - `free_text`: true",
         "   - `allow_unknown`: true",
+        "",
+        "Language & Robot Platform Constraints:",
+        "- Language Match: Detect the language of Customer Task Intent. If Chinese characters are present, ALL questions (`text`, `why`), option labels & interpretations, and summary MUST be in Chinese. If English, use English.",
+        "- Supported Robot Platforms: The 4 supported platforms are Walker_Tienkung_DEX (天工行者DEX), Walker_C1_EDU (Walker_C1_EDU共创者), TienKung (天工行者无界&无疆), and Walker_S2_EDU (Walker_S2_EDU探索者). When asking the customer about robot hardware, strictly present choices among these 4 platforms.",
     ]
 
     if turn_index == 1:
@@ -91,7 +95,7 @@ def build_turn_prompt(
         ]
         if not referenced_robot:
             lines.append(
-                "- CRITICAL: Target robot hardware was NOT specified. Question #1 MUST ask the customer what robot model/type is intended for this operation."
+                "- CRITICAL: Target robot hardware was NOT specified. Question #1 MUST ask the customer which of the 4 supported robot platforms (Walker_Tienkung_DEX, Walker_C1_EDU, TienKung, Walker_S2_EDU) is intended for this operation."
             )
     else:
         lines += [
@@ -120,7 +124,7 @@ def generate_fallback_draft(
     if customer_answers:
         for ans in customer_answers:
             val = ans.get("selected_option") or ans.get("free_text")
-            if val and any(r in str(val) for r in ["Unitree", "Spot", "UR", "Panda", "Quad", "Arm"]):
+            if val and any(r in str(val) for r in ["Walker", "Tienkung", "TienKung", "C1", "S2", "DEX", "天工"]):
                 robot_name = str(val)
 
     src_id = f"src_{turn_index:03d}"
@@ -296,13 +300,13 @@ def generate_fallback_draft(
         })
         questions.append({
             "id": "q_robot",
-            "text": "本任务计划使用哪种形态或型号的机器人？",
+            "text": "本任务计划使用哪款支持的机器人平台？",
             "target_ids": ["f_robot"],
-            "why": "机器人构型直接决定移动底盘通过性、臂展工作空间与额定负载",
+            "why": "机器人平台构型直接决定移动通过性、臂展工作空间与额定作业负载",
             "options": [
-                {"label": "四足机器人（如 Unitree B2 / Spot）", "interpretation": "适应复杂非平整地形、台阶巡检"},
-                {"label": "轮式移动底盘 + 机械臂（复合协作机器人）", "interpretation": "平整室内地面、移动抓取作业"},
-                {"label": "固定底座机械臂（工业/桌面协作臂）", "interpretation": "固定工位精准装配或分拣"},
+                {"label": "Walker_Tienkung_DEX (天工行者DEX)", "interpretation": "具备灵巧手的高动态仿人双足/轮足作业平台"},
+                {"label": "Walker_C1 / Walker_S2 (共创者/探索者)", "interpretation": "通用仿人机器人教学科研与任务评估平台"},
+                {"label": "TienKung (天工行者无界&无疆)", "interpretation": "多模态地形适应与具身智能作业底盘"},
             ],
             "free_text": True,
             "allow_unknown": True,

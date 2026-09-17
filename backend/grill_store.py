@@ -18,15 +18,15 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from backend.resources import PROFILES
+
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 DEFAULT_GRILL_DB = "data/grill.sqlite3"
 DEFAULT_GRILL_UPLOADS = "data/grill_uploads"
 MAX_QUESTION_BUDGET = 30
 SMALL_PROFILE = {
     "profile": "small",
-    "cpu_milli": 1000,
-    "memory_mb": 2048,
-    "disk_mb": 10240,
+    **PROFILES["small"],
 }
 
 
@@ -86,6 +86,7 @@ class GrillStore:
                     active_questions TEXT,
                     readback_summary TEXT,
                     final_report TEXT,
+                    error_message TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     finished_at TEXT
@@ -131,12 +132,17 @@ class GrillStore:
                     FOREIGN KEY(session_id) REFERENCES grill_sessions(id) ON DELETE CASCADE
                 );
             """)
+            try:
+                self.db.execute("ALTER TABLE grill_sessions ADD COLUMN error_message TEXT")
+            except sqlite3.OperationalError:
+                pass
 
     def create_session(
         self,
         task_intent: str,
         referenced_robot: str | None = None,
         initial_state: dict | None = None,
+        defer_turn: bool = False,
     ) -> tuple[dict, str]:
         raw_token = secrets.token_urlsafe(32)
         thash = token_hash(raw_token)
@@ -169,7 +175,32 @@ class GrillStore:
                 ),
             )
 
-            # Queue Turn 1 task for the worker
+            if not defer_turn:
+                # Queue Turn 1 task for the worker
+                task_id = f"gtask_{secrets.token_hex(12)}"
+                self.db.execute(
+                    """
+                    INSERT INTO grill_tasks (
+                        id, session_id, action, turn_index, status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (task_id, session_id, "turn", 1, "queued", now_stamp, now_stamp),
+                )
+            self.db.commit()
+
+        session = self.get_session(session_id)
+        assert session is not None
+        return session, raw_token
+
+    def enqueue_turn(self, session_id: str, turn_index: int = 1) -> str:
+        now_stamp = stamp()
+        with self.lock:
+            existing = self.db.execute(
+                "SELECT id FROM grill_tasks WHERE session_id = ? AND turn_index = ? AND status IN ('queued', 'running', 'leased')",
+                (session_id, turn_index),
+            ).fetchone()
+            if existing:
+                return existing["id"]
             task_id = f"gtask_{secrets.token_hex(12)}"
             self.db.execute(
                 """
@@ -177,13 +208,10 @@ class GrillStore:
                     id, session_id, action, turn_index, status, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (task_id, session_id, "turn", 1, "queued", now_stamp, now_stamp),
+                (task_id, session_id, "turn", turn_index, "queued", now_stamp, now_stamp),
             )
             self.db.commit()
-
-        session = self.get_session(session_id)
-        assert session is not None
-        return session, raw_token
+            return task_id
 
     def verify_token(self, session_id: str, raw_token: str) -> bool:
         if not raw_token or not session_id:
@@ -537,13 +565,14 @@ class GrillStore:
 
             session_id = task["session_id"]
             if status != "completed":
+                err = error_message or (output.get("report") if isinstance(output, dict) else str(output))
                 self.db.execute(
                     """
                     UPDATE grill_sessions
-                    SET status = 'failed', updated_at = ?
+                    SET status = 'failed', error_message = ?, updated_at = ?
                     WHERE id = ?
                     """,
-                    (now_stamp, session_id),
+                    (err, now_stamp, session_id),
                 )
                 self.db.commit()
                 return

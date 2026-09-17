@@ -210,3 +210,58 @@ def test_grill_api_full_flow(client):
     assert final_obj["status"] == "completed"
     assert final_obj["final_report"]["scenario_summary"]["target_robot"] == "Unitree B2"
     assert len(final_obj["turns"]) >= 2
+
+
+def test_grill_api_defer_turn_and_start(client):
+    # 1. Create session with defer_turn=True
+    create_resp = client.post(
+        "/api/grill/sessions",
+        json={
+            "task_intent": "Warehouse transport",
+            "referenced_robot": "Walker_C1",
+            "defer_turn": True,
+        },
+    )
+    assert create_resp.status_code == 201
+    data = create_resp.json()
+    token = data["token"]
+    session_id = data["session"]["id"]
+
+    # Verify no worker task is claimed yet
+    worker_headers = {"Authorization": "Bearer worker-test-token", "X-Worker-ID": "worker-1"}
+    claim_resp = client.post(
+        "/api/worker/claim",
+        headers=worker_headers,
+        json={"worker_id": "worker-1", "capacity": {"cpu_milli": 2000, "memory_mb": 4096, "disk_mb": 20000}},
+    )
+    assert claim_resp.json()["job"] is None
+
+    # Upload file
+    upload_resp = client.put(
+        f"/api/grill/sessions/{session_id}/files?name=notes.txt",
+        headers={"Authorization": f"Bearer {token}"},
+        content=b"Speed limit: 1.2 m/s",
+    )
+    assert upload_resp.status_code == 201
+
+    # Start session
+    start_resp = client.post(
+        f"/api/grill/sessions/{session_id}/start",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert start_resp.status_code == 200
+    assert start_resp.json()["status"] == "queued"
+
+    # Now worker claims the turn task
+    claim_resp2 = client.post(
+        "/api/worker/claim",
+        headers=worker_headers,
+        json={"worker_id": "worker-1", "capacity": {"cpu_milli": 2000, "memory_mb": 4096, "disk_mb": 20000}},
+    )
+    job = claim_resp2.json()["job"]
+    assert job is not None
+    assert job["session_id"] == session_id
+    assert len(job["files"]) == 1
+    assert job["files"][0]["name"] == "notes.txt"
+    # Ensure SMALL_PROFILE has disk_mb matching resources.py (8192)
+    assert job["resource_plan"]["disk_mb"] == 8192

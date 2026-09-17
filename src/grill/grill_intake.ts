@@ -88,10 +88,10 @@ export class GrillIntakeView {
     const robotGroup = document.createElement('div');
     robotGroup.className = 'grill-form-group';
     robotGroup.innerHTML = `
-      <label class="grill-label" for="grill-robot">${t('Target Robot Hardware (Optional)', '目标机器人硬件（可选）')}</label>
+      <label class="grill-label" for="grill-robot">${t('Target Robot Model', '目标机器人型号')}</label>
       <div class="grill-hint">${t(
-        'Select the target robot platform from the 4 supported models, or leave blank if undecided.',
-        '从4款支持的机器人平台中选择目标硬件，尚未确定可留空。'
+        'Please choose from the 4 supported robot models below (or leave blank if undecided):',
+        '请从以下4款支持的机器人型号中进行选择（若尚未确定可留空）：'
       )}</div>
     `;
 
@@ -111,30 +111,7 @@ export class GrillIntakeView {
       robotSelect.appendChild(opt);
     }
 
-    const otherOption = document.createElement('option');
-    otherOption.value = '__custom__';
-    otherOption.textContent = t('Other custom model...', '其他自定义型号...');
-    robotSelect.appendChild(otherOption);
-
-    const customRobotInput = document.createElement('input');
-    customRobotInput.type = 'text';
-    customRobotInput.className = 'grill-input';
-    customRobotInput.style.display = 'none';
-    customRobotInput.style.marginTop = '8px';
-    customRobotInput.placeholder = t('Enter custom robot model name...', '输入自定义机器人型号名称...');
-
-    robotSelect.addEventListener('change', () => {
-      if (robotSelect.value === '__custom__') {
-        customRobotInput.style.display = 'block';
-        customRobotInput.focus();
-      } else {
-        customRobotInput.style.display = 'none';
-        customRobotInput.value = '';
-      }
-    });
-
     robotGroup.appendChild(robotSelect);
-    robotGroup.appendChild(customRobotInput);
     formCard.appendChild(robotGroup);
 
     // File attachments
@@ -197,12 +174,7 @@ export class GrillIntakeView {
     submitBtn.textContent = t('Start Scenario Interview  →', '开始场景访谈  →');
     submitBtn.addEventListener('click', () => {
       const intent = intentInput.value.trim();
-      let robot: string | null = null;
-      if (robotSelect.value === '__custom__') {
-        robot = customRobotInput.value.trim() || null;
-      } else if (robotSelect.value) {
-        robot = robotSelect.value;
-      }
+      const robot = robotSelect.value || null;
       if (!intent) {
         this.showNotice(noticeEl, t('Please enter a task scenario intent before starting.', '请在开始前填写任务场景意图。'), true);
         intentInput.focus();
@@ -277,12 +249,14 @@ export class GrillIntakeView {
     submitBtn.disabled = true;
     submitBtn.textContent = t('Creating private session...', '正在创建私密会话...');
 
+    const hasFiles = this.selectedFiles.length > 0;
+
     try {
       this.showNotice(noticeEl, t('Initializing secure scenario session...', '正在初始化场景私密会话...'), false);
       const res = await fetch('/api/grill/sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ task_intent: intent, referenced_robot: robot }),
+        body: JSON.stringify({ task_intent: intent, referenced_robot: robot, defer_turn: hasFiles }),
       });
 
       if (!res.ok) {
@@ -295,7 +269,7 @@ export class GrillIntakeView {
       const sessionId = data.session.id;
 
       // Upload attached files if any
-      if (this.selectedFiles.length > 0) {
+      if (hasFiles) {
         for (let i = 0; i < this.selectedFiles.length; i++) {
           const file = this.selectedFiles[i];
           submitBtn.textContent = t(`Uploading file ${i + 1} of ${this.selectedFiles.length}...`, `正在上传第 ${i + 1} / ${this.selectedFiles.length} 个文件...`);
@@ -314,6 +288,15 @@ export class GrillIntakeView {
             console.warn(`File upload warning for ${file.name}: HTTP ${uploadRes.status}`);
           }
         }
+
+        // Now start the turn after all files are safely uploaded and indexed!
+        submitBtn.textContent = t('Starting interview turn...', '正在启动访谈轮次...');
+        await fetch(`/api/grill/sessions/${sessionId}/start`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${token}`,
+          },
+        });
       }
 
       this.showNotice(noticeEl, t('Session ready! Launching interview...', '会话已就绪！正在启动访谈...'), false);

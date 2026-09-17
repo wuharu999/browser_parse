@@ -1,6 +1,17 @@
 export type UiLanguage = 'en' | 'zh';
 const storageKey = 'robot-log-ui-language';
-let language: UiLanguage = (typeof localStorage !== 'undefined' && localStorage.getItem(storageKey) === 'zh') ? 'zh' : 'en';
+function detectInitialLanguage(): UiLanguage {
+  if (typeof localStorage !== 'undefined') {
+    const saved = localStorage.getItem(storageKey);
+    if (saved === 'zh' || saved === 'en') return saved;
+  }
+  if (typeof navigator !== 'undefined' && navigator.language && navigator.language.toLowerCase().startsWith('zh')) {
+    return 'zh';
+  }
+  return 'en';
+}
+
+let language: UiLanguage = detectInitialLanguage();
 const listeners = new Set<() => void>();
 export const uiLanguage = (): UiLanguage => language;
 export const t = (english: string, chinese: string): string => language === 'zh' ? chinese : english;
