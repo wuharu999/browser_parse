@@ -265,3 +265,156 @@ def test_grill_api_defer_turn_and_start(client):
     assert job["files"][0]["name"] == "notes.txt"
     # Ensure SMALL_PROFILE has disk_mb matching resources.py (8192)
     assert job["resource_plan"]["disk_mb"] == 8192
+
+
+def test_grill_list_sessions_endpoint(client):
+    # 1. Initially empty
+    empty_resp = client.get("/api/grill/sessions")
+    assert empty_resp.status_code == 200
+    assert empty_resp.json() == {"items": [], "next_cursor": None}
+
+    # 2. Create 3 sessions
+    sess1_resp = client.post(
+        "/api/grill/sessions",
+        json={"task_intent": "Carry 5kg parts across assembly floor", "referenced_robot": "Walker_C1_EDU"},
+    )
+    assert sess1_resp.status_code == 201
+    s1_data = sess1_resp.json()
+
+    sess2_resp = client.post(
+        "/api/grill/sessions",
+        json={"task_intent": "Precision manipulation in cleanroom", "referenced_robot": "Walker_Tienkung_DEX"},
+    )
+    assert sess2_resp.status_code == 201
+    s2_data = sess2_resp.json()
+
+    sess3_resp = client.post(
+        "/api/grill/sessions",
+        json={"task_intent": "Outdoor patrol on rough terrain", "referenced_robot": "TienKung"},
+    )
+    assert sess3_resp.status_code == 201
+    s3_data = sess3_resp.json()
+
+    # 3. Query GET /api/grill/sessions
+    list_resp = client.get("/api/grill/sessions")
+    assert list_resp.status_code == 200
+    list_data = list_resp.json()
+    items = list_data["items"]
+    assert len(items) == 3
+
+    # Verify ordering created_at DESC
+    assert items[0]["id"] == s3_data["session"]["id"]
+    assert items[1]["id"] == s2_data["session"]["id"]
+    assert items[2]["id"] == s1_data["session"]["id"]
+
+    # Verify all required metadata fields and tokens
+    expected_tokens = {
+        s1_data["session"]["id"]: s1_data["token"],
+        s2_data["session"]["id"]: s2_data["token"],
+        s3_data["session"]["id"]: s3_data["token"],
+    }
+    for item in items:
+        assert item["token"] == expected_tokens[item["id"]]
+        assert "id" in item
+        assert "status" in item
+        assert "question_count" in item
+        assert "task_intent" in item
+        assert "referenced_robot" in item
+        assert "created_at" in item
+        assert "updated_at" in item
+        assert "finished_at" in item
+
+    # 4. Pagination with limit and cursor
+    page1_resp = client.get("/api/grill/sessions?limit=2")
+    assert page1_resp.status_code == 200
+    page1 = page1_resp.json()
+    assert len(page1["items"]) == 2
+    cursor = page1["next_cursor"]
+    assert cursor is not None
+
+    page2_resp = client.get(f"/api/grill/sessions?limit=2&cursor={cursor}")
+    assert page2_resp.status_code == 200
+    page2 = page2_resp.json()
+    assert len(page2["items"]) == 1
+    assert page2["items"][0]["id"] == s1_data["session"]["id"]
+    assert page2["next_cursor"] is None
+
+    # 5. Invalid query parameters
+    assert client.get("/api/grill/sessions?limit=0").status_code == 422
+    assert client.get("/api/grill/sessions?limit=101").status_code == 422
+    assert client.get("/api/grill/sessions?cursor=not_an_int").status_code == 422
+    assert client.get("/api/grill/sessions?cursor=-1").status_code == 422
+
+    # 6. Verify unauthenticated 403 is preserved on /api/grill/sessions/{id}
+    detail_unauth = client.get(f"/api/grill/sessions/{items[0]['id']}")
+    assert detail_unauth.status_code == 403
+
+    # Authenticated detail with token works
+    detail_auth = client.get(
+        f"/api/grill/sessions/{items[0]['id']}",
+        headers={"Authorization": f"Bearer {items[0]['token']}"},
+    )
+    assert detail_auth.status_code == 200
+    assert detail_auth.json()["id"] == items[0]["id"]
+
+
+def test_phased_wind_down_prompts():
+    from sandbox.run_grill import build_turn_prompt
+
+    # Normal turn under 15 questions
+    p_norm = build_turn_prompt("Carry boxes", turn_index=2, question_count=5)
+    assert "There are at most 10 more questions" not in p_norm
+    assert "There are at most 5 questions" not in p_norm
+    assert "Maximum question budget reached" not in p_norm
+
+    # 15 questions: soft wind-down prompt injected
+    p_15 = build_turn_prompt("Carry boxes", turn_index=5, question_count=15)
+    assert "There are at most 10 more questions you could ask, but you don't have to hit 10 if you don't need it. If information is sufficient, proceed to summarize and finalize." in p_15
+
+    # 20 questions: 5 questions left warning injected
+    p_20 = build_turn_prompt("Carry boxes", turn_index=7, question_count=20)
+    assert "There are at most 5 questions left to ask. Focus exclusively on critical unresolved decisions and prepare the final readback." in p_20
+
+    # 25 questions: hard ceiling enforced with ready_for_readback and 0 questions
+    p_25 = build_turn_prompt("Carry boxes", turn_index=9, question_count=25)
+    assert "checks.ready_for_readback: true" in p_25
+    assert "0 questions" in p_25
+
+    # Confined to 4 supported robot models
+    for prompt in [p_norm, p_15, p_20, p_25]:
+        assert "Walker_Tienkung_DEX" in prompt
+        assert "Walker_C1_EDU" in prompt
+        assert "TienKung" in prompt
+        assert "Walker_S2_EDU" in prompt
+        assert "Codex must not recommend or assume any external or unsupported robot hardware." in prompt
+
+
+def test_question_budget_ceiling_runner(tmp_path):
+    from sandbox import run_grill
+
+    workspace = tmp_path / "workspace_budget"
+    workspace.mkdir()
+
+    job = {
+        "job_type": "grill",
+        "action": "turn",
+        "session_id": "grill_ceiling_test",
+        "turn_index": 10,
+        "task_intent": "Move pallet with Walker_S2_EDU",
+        "referenced_robot": "Walker_S2_EDU",
+        "scenario_state": None,
+        "customer_answers": [],
+        "question_count": 25,
+    }
+
+    orig_ws = run_grill.WORKSPACE
+    try:
+        run_grill.WORKSPACE = workspace
+        ret = run_grill.run_grill(job)
+        assert ret == 0
+        res = json.loads((workspace / "result.json").read_text())
+        assert res["status"] == "completed"
+        assert res["ready_for_readback"] is True
+        assert res["questions"] == []
+    finally:
+        run_grill.WORKSPACE = orig_ws

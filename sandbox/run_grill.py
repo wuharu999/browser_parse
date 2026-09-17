@@ -58,6 +58,7 @@ def build_turn_prompt(
     customer_answers: list[dict[str, Any]] | None = None,
     normalized_updates: dict[str, Any] | None = None,
     existing_state: dict[str, Any] | None = None,
+    question_count: int = 0,
 ) -> str:
     lines = [
         "You are the Robot Scenario Grill Bot Orchestrator.",
@@ -82,8 +83,33 @@ def build_turn_prompt(
         "",
         "Language & Robot Platform Constraints:",
         "- Language Match: Detect the language of Customer Task Intent. If Chinese characters are present, ALL questions (`text`, `why`), option labels & interpretations, and summary MUST be in Chinese. If English, use English.",
-        "- Supported Robot Platforms: The 4 supported platforms are Walker_Tienkung_DEX (天工行者DEX), Walker_C1_EDU (Walker_C1_EDU共创者), TienKung (天工行者无界&无疆), and Walker_S2_EDU (Walker_S2_EDU探索者). When asking the customer about robot hardware, strictly present choices among these 4 platforms.",
+        "- Supported Robot Platforms: Strictly confine robot platform modeling to the 4 supported robot models:",
+        "  1. Walker_Tienkung_DEX (天工行者DEX)",
+        "  2. Walker_C1_EDU (Walker_C1_EDU共创者)",
+        "  3. TienKung (天工行者无界&无疆)",
+        "  4. Walker_S2_EDU (Walker_S2_EDU探索者)",
+        "  Codex must not recommend or assume any external or unsupported robot hardware.",
     ]
+
+    if question_count >= 25:
+        lines += [
+            "",
+            "Question Budget Hard Ceiling Directives:",
+            "- Maximum question budget reached (25 questions). Enforce hard stop with `checks.ready_for_readback: true` and 0 questions (set `questions: []`).",
+            "- Do not ask any new questions. Proceed immediately to finalize findings, resolve remaining items, and produce the final executive `summary` for customer confirmation.",
+        ]
+    elif question_count >= 20:
+        lines += [
+            "",
+            "Question Budget Wind-Down Directives:",
+            "- There are at most 5 questions left to ask. Focus exclusively on critical unresolved decisions and prepare the final readback.",
+        ]
+    elif question_count >= 15:
+        lines += [
+            "",
+            "Question Budget Wind-Down Directives:",
+            "- There are at most 10 more questions you could ask, but you don't have to hit 10 if you don't need it. If information is sufficient, proceed to summarize and finalize.",
+        ]
 
     if turn_index == 1:
         lines += [
@@ -95,7 +121,11 @@ def build_turn_prompt(
         ]
         if not referenced_robot:
             lines.append(
-                "- CRITICAL: Target robot hardware was NOT specified. Question #1 MUST ask the customer which of the 4 supported robot platforms (Walker_Tienkung_DEX, Walker_C1_EDU, TienKung, Walker_S2_EDU) is intended for this operation."
+                "- CRITICAL: Target robot hardware was NOT specified. Question #1 MUST ask the customer which of the 4 supported robot platforms (Walker_Tienkung_DEX, Walker_C1_EDU, TienKung, Walker_S2_EDU) is intended for this operation. Codex must not recommend or assume any external or unsupported robot hardware."
+            )
+        else:
+            lines.append(
+                "- CRITICAL: Confine all modeling and analysis strictly to the 4 supported robot models (Walker_Tienkung_DEX, Walker_C1_EDU, TienKung, Walker_S2_EDU). Codex must not recommend or assume any external or unsupported robot hardware."
             )
     else:
         lines += [
@@ -104,6 +134,7 @@ def build_turn_prompt(
             f"- Previous Customer Answers: {json.dumps(customer_answers or [], ensure_ascii=False)}",
             f"- Normalized Updates: {json.dumps(normalized_updates or {}, ensure_ascii=False)}",
             "- Incorporate customer answers to update corresponding fields, resolve issues, and refine behavior tree nodes.",
+            "- Confine all modeling and analysis strictly to the 4 supported robot models: Walker_Tienkung_DEX, Walker_C1_EDU, TienKung, Walker_S2_EDU. Codex must not recommend or assume any external or unsupported robot hardware.",
             "- If all critical blocking items are clarified or question budget is reached, set `checks.ready_for_readback: true` and write an executive `summary` for customer confirmation.",
         ]
 
@@ -117,6 +148,7 @@ def generate_fallback_draft(
     referenced_robot: str | None = None,
     customer_answers: list[dict[str, Any]] | None = None,
     previous_state: dict[str, Any] | None = None,
+    question_count: int = 0,
 ) -> dict[str, Any]:
     """Deterministic fallback generator that produces 100% valid ScenarioState v1 JSON."""
     robot_name = referenced_robot or "Pending Robot Selection"
@@ -124,7 +156,7 @@ def generate_fallback_draft(
     if customer_answers:
         for ans in customer_answers:
             val = ans.get("selected_option") or ans.get("free_text")
-            if val and any(r in str(val) for r in ["Walker", "Tienkung", "TienKung", "C1", "S2", "DEX", "天工"]):
+            if val and any(r in str(val) for r in ["Walker_Tienkung_DEX", "Walker_C1_EDU", "TienKung", "Walker_S2_EDU", "Walker", "Tienkung", "C1", "S2", "DEX", "天工"]):
                 robot_name = str(val)
 
     src_id = f"src_{turn_index:03d}"
@@ -296,7 +328,7 @@ def generate_fallback_draft(
             "owner": "customer",
             "blocking": True,
             "description": "现场规划使用的机器人硬件型号尚未指定",
-            "resolve_by": "客户确认目标机器人平台（四足狗、轮式底盘、协作臂等）",
+            "resolve_by": "客户确认目标机器人平台（Walker_Tienkung_DEX、Walker_C1_EDU、TienKung、Walker_S2_EDU）",
         })
         questions.append({
             "id": "q_robot",
@@ -305,7 +337,7 @@ def generate_fallback_draft(
             "why": "机器人平台构型直接决定移动通过性、臂展工作空间与额定作业负载",
             "options": [
                 {"label": "Walker_Tienkung_DEX (天工行者DEX)", "interpretation": "具备灵巧手的高动态仿人双足/轮足作业平台"},
-                {"label": "Walker_C1 / Walker_S2 (共创者/探索者)", "interpretation": "通用仿人机器人教学科研与任务评估平台"},
+                {"label": "Walker_C1_EDU / Walker_S2_EDU (共创者/探索者)", "interpretation": "通用仿人双足科研教学、场景验证与具身作业平台"},
                 {"label": "TienKung (天工行者无界&无疆)", "interpretation": "多模态地形适应与具身智能作业底盘"},
             ],
             "free_text": True,
@@ -336,8 +368,10 @@ def generate_fallback_draft(
         "allow_unknown": True,
     })
 
-    # If turn > 1 and we have answers, determine if ready for readback
-    ready_for_readback = turn_index >= 2 and len(customer_answers or []) > 0
+    # If turn > 1 and we have answers, or question budget reaches 25, determine if ready for readback
+    ready_for_readback = (turn_index >= 2 and len(customer_answers or []) > 0) or (question_count >= 25)
+    if question_count >= 25:
+        questions = []
 
     current_map = {item["id"]: item for item in fields + nodes}
     if previous_state:
@@ -372,7 +406,7 @@ def generate_fallback_draft(
         "changes": changes,
         "checks": {
             "validation": "passed",
-            "blocking_issue_ids": [i["id"] for i in issues if i["blocking"]],
+            "blocking_issue_ids": [] if ready_for_readback else [i["id"] for i in issues if i["blocking"]],
             "ready_for_readback": ready_for_readback,
             "notes": ["Fallback generator initialized structure"],
         },
@@ -510,6 +544,7 @@ def run_grill(job: dict[str, Any], started: float | None = None) -> int:
     referenced_robot = job.get("referenced_robot")
     customer_answers = job.get("customer_answers") or []
     previous_state = job.get("scenario_state")
+    question_count = int(job.get("question_count", 0))
 
     try:
         # Index wiki if present
@@ -539,6 +574,7 @@ def run_grill(job: dict[str, Any], started: float | None = None) -> int:
                     customer_answers=customer_answers,
                     normalized_updates=job.get("normalized_updates"),
                     existing_state=previous_state,
+                    question_count=question_count,
                 )
                 final_out = WORKSPACE / "codex_turn_output.json"
                 model = os.environ.get("CODEX_MODEL", "gpt-5.6-luna")
@@ -573,7 +609,16 @@ def run_grill(job: dict[str, Any], started: float | None = None) -> int:
                     referenced_robot=referenced_robot,
                     customer_answers=customer_answers,
                     previous_state=previous_state,
+                    question_count=question_count,
                 )
+
+            # Enforce 25-question hard ceiling: 0 questions and ready_for_readback: true
+            if state is not None and question_count >= 25:
+                state["questions"] = []
+                if "checks" not in state or not isinstance(state["checks"], dict):
+                    state["checks"] = {}
+                state["checks"]["ready_for_readback"] = True
+                state["checks"]["blocking_issue_ids"] = []
 
             # Validate structural correctness
             if validate_draft is not None:

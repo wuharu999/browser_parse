@@ -1,7 +1,7 @@
 import { t } from './i18n';
 
-export type Question = { id: number; request_id: string; question: string; answer: string; status: 'generating' | 'completed' | 'interrupted'; error: string | null };
-type History = { items: Question[]; next_before: number | null; active: Question | null; available: boolean; context_mode: 'report_only' | 'report_and_notes' };
+export type Question = { id: number | string; request_id?: string; question: string; answer: string; status: 'generating' | 'completed' | 'interrupted'; error?: string | null };
+type History = { items: Question[]; next_before?: number | null; active?: Question | null; available: boolean; context_mode?: string };
 export type ChatEvent = { type: 'started' | 'answer' | 'done' | 'interrupted'; item: Question };
 
 export async function readAnswer(response: Response, receive: (event: ChatEvent) => void): Promise<void> {
@@ -37,9 +37,9 @@ export class QuestionsPanel {
   private context = node('p', 'muted question-context');
   private transcript = node('div', 'question-transcript');
   private status = node('p', 'question-status');
-  private send = node('button', 'button primary');
+  private send = node('button', 'button primary send-btn');
   private older = node('button', 'button text-button');
-  private items = new Map<number, Question>();
+  private items = new Map<number | string, Question>();
   private available = false;
   private contextMode = 'report_only';
   private active: Question | null = null;
@@ -50,7 +50,15 @@ export class QuestionsPanel {
   private error = '';
   private pending: { question: string; request_id: string } | undefined;
 
-  constructor(private jobId: string) {
+  constructor(
+    private jobId: string,
+    private basePath: string = '/api/jobs',
+    private token?: string,
+  ) {
+    if (this.basePath.includes('grill')) {
+      this.element.classList.add('grill-qa-panel');
+      this.element.setAttribute('data-session-id', this.jobId);
+    }
     const form = node('form', 'question-form');
     this.input.rows = 2; this.input.maxLength = 4000; this.input.required = true;
     this.input.addEventListener('input', () => this.controls());
@@ -65,10 +73,17 @@ export class QuestionsPanel {
   }
 
   labels(): void {
-    this.heading.textContent = t('Ask about this analysis', '询问此分析');
+    const isGrill = this.basePath.includes('grill');
+    this.heading.textContent = isGrill
+      ? t('Ask about this scenario report', '询问此场景推演报告')
+      : t('Ask about this analysis', '询问此分析');
     this.element.setAttribute('aria-label', this.heading.textContent);
-    this.input.setAttribute('aria-label', t('Question about this analysis', '关于此分析的问题'));
-    this.input.placeholder = t('Ask about a finding or the suggested workflow…', '询问分析发现或建议流程…');
+    this.input.setAttribute('aria-label', isGrill
+      ? t('Question about this scenario report', '关于此推演报告的问题')
+      : t('Question about this analysis', '关于此分析的问题'));
+    this.input.placeholder = isGrill
+      ? t('Ask about robot capabilities, ROS 2 architecture, or risk mitigations…', '询问机器人能力匹配、ROS 2 架构或风险缓解策略…')
+      : t('Ask about a finding or the suggested workflow…', '询问分析发现或建议流程…');
     this.transcript.setAttribute('aria-label', t('Shared questions and answers', '共享问答'));
     this.older.textContent = t('Load earlier questions', '加载更早的问题');
     this.send.textContent = t('Send', '发送');
@@ -79,12 +94,19 @@ export class QuestionsPanel {
     if (this.loading || this.streaming || !this.element.isConnected) return;
     this.loading = true; this.controls();
     try {
-      const response = await fetch(`/api/jobs/${this.jobId}/questions${older && this.before ? `?before=${this.before}` : ''}`);
+      const url = `${this.basePath}/${this.jobId}/questions${older && this.before ? `?before=${this.before}` : ''}`;
+      const headers: Record<string, string> = {};
+      if (this.token) {
+        headers['Authorization'] = `Bearer ${this.token}`;
+      }
+      const response = await fetch(url, { headers });
       if (!response.ok) throw new Error('history unavailable');
       const page = await response.json() as History;
-      this.available = page.available; this.contextMode = page.context_mode; this.active = page.active;
-      if (!this.loaded || older) this.before = page.next_before;
-      for (const item of page.items) this.items.set(item.id, item);
+      this.available = page.available !== false;
+      if (page.context_mode) this.contextMode = page.context_mode;
+      this.active = page.active || null;
+      if (!this.loaded || older) this.before = page.next_before ?? null;
+      for (const item of page.items || []) this.items.set(item.id, item);
       if (page.active) this.items.set(page.active.id, page.active);
       this.loaded = true; this.error = ''; this.render(older);
     } catch {
@@ -96,7 +118,15 @@ export class QuestionsPanel {
     this.input.disabled = this.loaded && !this.available;
     this.send.disabled = !this.loaded || !this.available || this.loading || this.streaming || !!this.active || !this.input.value.trim();
     this.older.hidden = this.before === null;
-    this.context.textContent = `${this.contextMode === 'report_only' ? t('Report-only context', '仅报告上下文') : t('Report + investigation notes', '报告 + 调查笔记')} · ${t('Shared conversation · saved findings only', '共享对话 · 仅依据已保存的分析')}`;
+    const isGrill = this.basePath.includes('grill');
+    if (isGrill) {
+      this.context.textContent = t(
+        'Context: Scenario synthesis, robot selection rationale, constraints matrix, and decision context.',
+        '上下文：场景推演合成、机器人选型论证、约束矩阵与决策上下文。'
+      );
+    } else {
+      this.context.textContent = `${this.contextMode === 'report_only' ? t('Report-only context', '仅报告上下文') : t('Report + investigation notes', '报告 + 调查笔记')} · ${t('Shared conversation · saved findings only', '共享对话 · 仅依据已保存的分析')}`;
+    }
     this.status.textContent = this.error || (!this.loaded ? t('Loading questions…', '正在加载问答…') : !this.available ? t('Q&A is unavailable until the server is configured.', '服务端配置完成后即可使用问答。') : this.streaming || this.active ? t('An answer is being written…', '正在生成回答…') : t('No daily question limit. Questions do not use analysis slots.', '提问次数不限，不消耗分析额度。'));
     for (const retry of this.transcript.querySelectorAll<HTMLButtonElement>('button')) retry.disabled = !this.available || this.loading || this.streaming || !!this.active;
   }
@@ -108,7 +138,7 @@ export class QuestionsPanel {
     if (!this.items.size) {
       const empty = node('p', 'muted'); empty.textContent = t('Ask a question to start the shared conversation.', '提出问题，开始共享对话。'); this.transcript.append(empty);
     }
-    for (const item of [...this.items.values()].sort((a, b) => a.id - b.id)) {
+    for (const item of [...this.items.values()].sort((a, b) => String(a.id).localeCompare(String(b.id), undefined, { numeric: true }))) {
       const exchange = node('article', 'question-exchange'); exchange.dataset.questionId = String(item.id);
       const question = node('p', 'question-text'), answer = node('p', 'question-answer');
       question.textContent = item.question;
@@ -141,7 +171,12 @@ export class QuestionsPanel {
       this.render();
     };
     try {
-      const response = await fetch(`/api/jobs/${this.jobId}/questions`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(pending) });
+      const url = `${this.basePath}/${this.jobId}/questions`;
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (this.token) {
+        headers['Authorization'] = `Bearer ${this.token}`;
+      }
+      const response = await fetch(url, { method: 'POST', headers, body: JSON.stringify(pending) });
       if (!response.ok) {
         if (response.status === 409) this.pending = undefined;
         throw new Error('request failed');

@@ -179,3 +179,161 @@ class DockerRuntimePreflightTests(unittest.TestCase):
         runtime = self.runtime(Path("/tmp"))
         with self.assertRaisesRegex(DockerError, "invalid job output path"):
             runtime.copy_out_text(type("Job", (), {"container": "x"})(), "/etc/passwd")
+
+    def test_snapshot_workspace_creates_tar_gz(self) -> None:
+        import io
+        import tarfile
+        import gzip
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp = Path(temp_dir)
+            target = tmp / "snapshot.tar.gz"
+
+            # Create an uncompressed tar stream that docker cp would output
+            tar_buf = io.BytesIO()
+            with tarfile.open(fileobj=tar_buf, mode="w") as tar:
+                data = b'{"state": "ok"}'
+                ti = tarfile.TarInfo(name="scenario_state.json")
+                ti.size = len(data)
+                tar.addfile(ti, io.BytesIO(data))
+
+                cdx = b"codex-session"
+                ci = tarfile.TarInfo(name=".codex/history.log")
+                ci.size = len(cdx)
+                tar.addfile(ci, io.BytesIO(cdx))
+            uncompressed_tar_bytes = tar_buf.getvalue()
+
+            class FakePopen:
+                def __init__(self, *args, **kwargs):
+                    self.stdout = io.BytesIO(uncompressed_tar_bytes)
+                    self.returncode = 0
+                def communicate(self, timeout=None):
+                    return b"", b""
+                def poll(self):
+                    return self.returncode
+                def kill(self):
+                    pass
+                def wait(self):
+                    return 0
+
+            runtime = self.runtime(Path("/tmp"))
+            with patch("subprocess.Popen", side_effect=FakePopen):
+                result = runtime.snapshot_workspace(DockerJob("c1", "v1"), target)
+                self.assertEqual(result, target)
+                self.assertTrue(target.is_file())
+
+            # Verify target is a valid gzip tarball with expected members
+            with tarfile.open(target, mode="r:gz") as tar:
+                names = tar.getnames()
+                self.assertIn("scenario_state.json", names)
+                self.assertIn(".codex/history.log", names)
+                extracted = tar.extractfile("scenario_state.json").read()
+                self.assertEqual(extracted, b'{"state": "ok"}')
+
+    def test_snapshot_workspace_raises_on_docker_error(self) -> None:
+        import io
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp = Path(temp_dir)
+            target = tmp / "fail.tar.gz"
+
+            class FailPopen:
+                def __init__(self, *args, **kwargs):
+                    self.stdout = io.BytesIO(b"")
+                    self.returncode = 1
+                def communicate(self, timeout=None):
+                    return b"", b"Error: No such container: c1"
+                def poll(self):
+                    return self.returncode
+                def kill(self):
+                    pass
+                def wait(self):
+                    return 1
+
+            runtime = self.runtime(Path("/tmp"))
+            with patch("subprocess.Popen", side_effect=FailPopen):
+                with self.assertRaisesRegex(DockerError, "Docker snapshot copy failed"):
+                    runtime.snapshot_workspace(DockerJob("c1", "v1"), target)
+            self.assertFalse(target.exists())
+
+    def test_restore_workspace_streams_tar_to_docker_cp(self) -> None:
+        import io
+        import tarfile
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp = Path(temp_dir)
+            archive = tmp / "source.tar.gz"
+
+            # Create valid .tar.gz archive
+            with tarfile.open(archive, mode="w:gz") as tar:
+                data = b"print('hello')"
+                ti = tarfile.TarInfo(name="script.py")
+                ti.size = len(data)
+                tar.addfile(ti, io.BytesIO(data))
+
+            captured_input = io.BytesIO()
+
+            class FakeStdin:
+                def write(self, b):
+                    captured_input.write(b)
+                def close(self):
+                    pass
+                @property
+                def closed(self):
+                    return False
+
+            class FakeCpPopen:
+                def __init__(self, *args, **kwargs):
+                    self.stdin = FakeStdin()
+                    self.returncode = 0
+                def communicate(self, timeout=None):
+                    return b"", b""
+                def poll(self):
+                    return self.returncode
+                def kill(self):
+                    pass
+                def wait(self):
+                    return 0
+
+            runtime = self.runtime(Path("/tmp"))
+            with patch("subprocess.Popen", side_effect=FakeCpPopen):
+                runtime.restore_workspace(DockerJob("c1", "v1"), archive)
+
+            # Check that captured input on stdin is a valid tar with uid 10001
+            captured_input.seek(0)
+            with tarfile.open(fileobj=captured_input, mode="r:") as tar:
+                members = tar.getmembers()
+                self.assertEqual(len(members), 1)
+                self.assertEqual(members[0].name, "script.py")
+                self.assertEqual(members[0].uid, 10001)
+                self.assertEqual(members[0].gid, 10001)
+
+    def test_restore_workspace_rejects_missing_file(self) -> None:
+        runtime = self.runtime(Path("/tmp"))
+        with self.assertRaisesRegex(DockerError, "Snapshot archive not found"):
+            runtime.restore_workspace(DockerJob("c1", "v1"), Path("/nonexistent/snap.tar.gz"))
+
+    def test_restore_workspace_rejects_corrupted_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            corrupt = Path(temp_dir) / "corrupt.tar.gz"
+            corrupt.write_bytes(b"not-a-valid-tar-archive")
+
+            runtime = self.runtime(Path("/tmp"))
+            with self.assertRaisesRegex(DockerError, "Corrupted snapshot archive"):
+                runtime.restore_workspace(DockerJob("c1", "v1"), corrupt)
+
+    def test_restore_workspace_rejects_path_traversal(self) -> None:
+        import io
+        import tarfile
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            traversal = Path(temp_dir) / "traversal.tar.gz"
+            with tarfile.open(traversal, mode="w:gz") as tar:
+                data = b"malicious"
+                ti = tarfile.TarInfo(name="../../etc/passwd")
+                ti.size = len(data)
+                tar.addfile(ti, io.BytesIO(data))
+
+            runtime = self.runtime(Path("/tmp"))
+            with self.assertRaisesRegex(DockerError, "Unsafe path"):
+                runtime.restore_workspace(DockerJob("c1", "v1"), traversal)
+

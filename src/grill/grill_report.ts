@@ -1,6 +1,7 @@
 import { GrillReport, GrillSession, BehaviorTreeNode } from './types';
 import { formatRobotName } from './grill_intake';
 import { t } from '../i18n';
+import { QuestionsPanel } from '../questions';
 
 export type GrillReportTab = 'scenario' | 'capabilities' | 'architecture' | 'risk' | 'tree';
 
@@ -38,7 +39,7 @@ export class GrillReportView {
       </div>
       <div class="report-meta">
         <span><strong>${t('Robot:', '机器人：')}</strong> ${this.escape(formatRobotName(this.session.referenced_robot))}</span>
-        <span><strong>${t('Questions Answered:', '已回答问题数：')}</strong> ${this.session.question_count} / 30</span>
+        <span><strong>${t('Questions Answered:', '已回答问题数：')}</strong> ${this.session.question_count} / 25</span>
         <span><strong>${t('Completed:', '完成时间：')}</strong> ${new Date(this.session.finished_at || Date.now()).toLocaleString()}</span>
       </div>
     `;
@@ -92,6 +93,12 @@ export class GrillReportView {
     }
 
     wrapper.appendChild(contentEl);
+
+    // Attach post-interview streaming Q&A panel below the report
+    const qaPanel = new QuestionsPanel(this.session.id, '/api/grill/sessions', this.session.token);
+    wrapper.appendChild(qaPanel.element);
+    void qaPanel.poll();
+
     this.container.appendChild(wrapper);
 
     // Bind export buttons
@@ -141,6 +148,65 @@ export class GrillReportView {
         <li><strong>${t('Revision Index:', '迭代版本：')}</strong> Rev ${this.session.current_revision}</li>
       </ul>
     `;
+
+    if (this.session.files && this.session.files.length > 0) {
+      const filesCard = document.createElement('div');
+      filesCard.className = 'grill-card session-files-card';
+      filesCard.style.marginTop = '20px';
+      const h3 = document.createElement('h3');
+      h3.textContent = `${t('Uploaded Documents & Diagrams', '上传参考文档与图纸')} (${this.session.files.length})`;
+      filesCard.appendChild(h3);
+
+      for (const f of this.session.files) {
+        const fileRow = document.createElement('div');
+        fileRow.className = 'file-item';
+        const fileLink = document.createElement('a');
+        fileLink.href = `/api/grill/sessions/${this.session.id}/files/${f.id}?token=${encodeURIComponent(this.session.token || '')}`;
+        fileLink.target = '_blank';
+        fileLink.className = 'file-link';
+        fileLink.textContent = `📎 ${f.name} (${f.size} B)`;
+        fileRow.appendChild(fileLink);
+        filesCard.appendChild(fileRow);
+      }
+      card.appendChild(filesCard);
+    }
+
+    if (this.session.turns && this.session.turns.length > 0) {
+      const turnsCard = document.createElement('div');
+      turnsCard.className = 'grill-card turns-history-card';
+      turnsCard.style.marginTop = '20px';
+      const h3 = document.createElement('h3');
+      h3.textContent = t('Past Turn Transcript', '往轮问答推演记录');
+      turnsCard.appendChild(h3);
+
+      for (const turn of this.session.turns) {
+        const turnRow = document.createElement('div');
+        turnRow.className = 'turn-row';
+        turnRow.setAttribute('data-turn-index', String(turn.turn_index));
+
+        const turnHeader = document.createElement('div');
+        turnHeader.className = 'turn-row-header';
+        turnHeader.textContent = `${t('Turn', '第')} ${turn.turn_index} ${t('', '轮问答')}`;
+        turnRow.appendChild(turnHeader);
+
+        for (const q of turn.questions) {
+          const qBox = document.createElement('div');
+          qBox.className = 'past-question-box';
+          qBox.textContent = `Q: ${q.text} ${q.why ? `(💡 ${q.why})` : ''}`;
+          turnRow.appendChild(qBox);
+        }
+        for (const a of turn.answers) {
+          const aBox = document.createElement('div');
+          aBox.className = 'past-answer-box';
+          const ansText = a.selected_option || a.free_text_answer || (a.is_unknown ? 'Unknown' : '');
+          aBox.textContent = `A: ${ansText}`;
+          turnRow.appendChild(aBox);
+        }
+        turnsCard.appendChild(turnRow);
+      }
+      card.appendChild(turnsCard);
+    }
+
     return card;
   }
 

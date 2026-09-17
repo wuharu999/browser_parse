@@ -289,6 +289,12 @@ class WorkerApi:
     def save_analysis_context(self, job_id: str, context: dict) -> None:
         self._request("POST", f"/api/worker/jobs/{job_id}/analysis-context", {"analysis_context": context})
 
+    def hibernate_grill(self, session_id: str, snapshot_path: str) -> None:
+        try:
+            self._request("POST", f"/api/worker/grill/{session_id}/hibernate", {"snapshot_path": snapshot_path})
+        except Exception:
+            pass
+
     def finish(self, job_id: str, status: str, report: str, cost_usd: float | None, metrics: dict[str, Any], analysis_context: dict | None = None) -> None:
         self._request("POST", f"/api/worker/jobs/{job_id}/finish", {
             "status": status, "report": report, "cost_usd": cost_usd, "metrics": metrics, "analysis_context": analysis_context,
@@ -298,7 +304,16 @@ class WorkerApi:
 class DockerWorker:
     """Serial executor.  API queue admission is the global two-job limiter."""
 
-    def __init__(self, config: WorkerConfig, api: WorkerApi | None = None, runtime: DockerRuntime | None = None, guard: Any = None) -> None:
+    def __init__(
+        self,
+        config: WorkerConfig,
+        api: WorkerApi | None = None,
+        runtime: DockerRuntime | None = None,
+        guard: Any = None,
+        grill_store: Any = None,
+        snapshot_dir: Path | None = None,
+        idle_timeout_seconds: int = 300,
+    ) -> None:
         self.config = config
         self.api = api or WorkerApi(config.api_url, config.worker_token, config.worker_id)
         self.runtime = runtime or DockerRuntime(image=config.docker_image, network=config.docker_network, proxy_url=config.egress_proxy_url, worker_id=config.worker_id, data_dir=config.docker_data_dir, disk_reserve_mb=config.disk_reserve_mb)
@@ -308,6 +323,11 @@ class DockerWorker:
         self._secrets = tuple(s for s in secrets_list if s)
         self.guard = guard
         self._capacity_profiles: tuple[str, ...] | None = None
+        self.grill_containers: dict[str, dict[str, Any]] = {}
+        self.grill_store = grill_store
+        self.idle_timeout_seconds = idle_timeout_seconds
+        self.grill_snapshot_dir = Path(snapshot_dir or os.getenv("GRILL_SNAPSHOT_DIR", "data/grill_snapshots")).resolve()
+        self.grill_snapshot_dir.mkdir(parents=True, exist_ok=True)
         guard_disabled = os.environ.get("ROBOT_GUARD_ENABLED", "").lower() in {"0", "false", "no", "off"}
         if self.guard is None and not guard_disabled and (
             config.guard_enabled
@@ -569,6 +589,8 @@ class DockerWorker:
         container: DockerJob | None = None
         started = time.monotonic()
         deadline = started + timeout_seconds
+        is_grill = (job.get("job_type") == "grill")
+        session_id = str(job.get("session_id", ""))
         try:
             plan = job.get("resource_plan") or {"profile": "small", **PROFILES["small"]}
             profile = plan.get("profile") if isinstance(plan, dict) else None
@@ -580,11 +602,46 @@ class DockerWorker:
             if not isinstance(plan, dict): raise WorkerError("job resource plan is invalid")
             capacity = self.runtime.available_capacity({"cpu_milli": self.config.cpu_milli, "memory_mb": self.config.memory_mb, "disk_mb": self.config.disk_mb})
             if any(plan[key] > capacity.get(key, 0) for key in ("cpu_milli", "memory_mb", "disk_mb")): raise WorkerError("Docker capacity changed after claim")
-            container = self.runtime.create(job_id, plan, self._container_env(timeout_seconds, job.get("files") or []))
-            with tempfile.TemporaryDirectory(prefix="robot-docker-stage-") as directory:
-                self._stage_job(job, Path(directory), deadline); self.runtime.copy_in(container, Path(directory))
-            self._checkpoint(job_id, deadline); self.runtime.start(container)
-            self._event(job_id, "progress", "Docker container created; Codex execution started.")
+            snapshot_path_str = job.get("snapshot_path")
+            is_resumed = bool(job.get("is_resumed") or snapshot_path_str)
+
+            existing_warm = self.grill_containers.get(session_id) if is_grill else None
+
+            if existing_warm is not None and not is_resumed:
+                container = existing_warm["container"]
+                with tempfile.TemporaryDirectory(prefix="robot-docker-stage-") as directory:
+                    stage_dir = Path(directory)
+                    (stage_dir / "job.json").write_text(json.dumps(job, separators=(",", ":")))
+                    if job.get("scenario_state"):
+                        (stage_dir / "scenario_state.json").write_text(json.dumps(job["scenario_state"], ensure_ascii=False, separators=(",", ":")))
+                    if job.get("customer_answers"):
+                        (stage_dir / "customer_answers.json").write_text(json.dumps(job["customer_answers"], ensure_ascii=False, separators=(",", ":")))
+                    self.runtime.copy_in(container, stage_dir)
+                self._checkpoint(job_id, deadline)
+                self._event(job_id, "progress", "Warm container reused; execution continued.")
+            elif is_grill and is_resumed and snapshot_path_str and Path(snapshot_path_str).is_file():
+                container = self.runtime.create(job_id, plan, self._container_env(timeout_seconds, job.get("files") or []))
+                self.runtime.restore_workspace(container, Path(snapshot_path_str))
+                with tempfile.TemporaryDirectory(prefix="robot-docker-stage-") as directory:
+                    stage_dir = Path(directory)
+                    (stage_dir / "job.json").write_text(json.dumps(job, separators=(",", ":")))
+                    if job.get("scenario_state"):
+                        (stage_dir / "scenario_state.json").write_text(json.dumps(job["scenario_state"], ensure_ascii=False, separators=(",", ":")))
+                    if job.get("customer_answers"):
+                        (stage_dir / "customer_answers.json").write_text(json.dumps(job["customer_answers"], ensure_ascii=False, separators=(",", ":")))
+                    self.runtime.copy_in(container, stage_dir)
+                self._checkpoint(job_id, deadline)
+                self.runtime.start(container)
+                self._event(job_id, "progress", "Container created and workspace restored from snapshot; execution resumed.")
+            else:
+                container = self.runtime.create(job_id, plan, self._container_env(timeout_seconds, job.get("files") or []))
+                with tempfile.TemporaryDirectory(prefix="robot-docker-stage-") as directory:
+                    self._stage_job(job, Path(directory), deadline)
+                    self.runtime.copy_in(container, Path(directory))
+                self._checkpoint(job_id, deadline)
+                self.runtime.start(container)
+                self._event(job_id, "progress", "Docker container created; Codex execution started.")
+
             command = self.runtime.exec_runner(container)
             seen_activity = 0
             while command.poll() is None:
@@ -639,24 +696,50 @@ class DockerWorker:
                 report = _safe_report(result.get("report") or "Docker run produced no final report.", self._secrets)
             if analysis_context:
                 self.api.save_analysis_context(job_id, analysis_context)
-            if not self.runtime.remove(container):
-                self._unconfirmed_kill(job_id)
-                return
-            container = None
+
+            keep_warm = False
+            if is_grill and status == "completed" and job.get("action") == "turn":
+                keep_warm = True
+
+            if keep_warm:
+                self.grill_containers[session_id] = {
+                    "container": container,
+                    "job_id": job_id,
+                    "session_id": session_id,
+                    "last_activity": time.time(),
+                    "plan": plan,
+                }
+                container = None
+            else:
+                if is_grill and session_id in self.grill_containers:
+                    del self.grill_containers[session_id]
+                if not self.runtime.remove(container):
+                    self._unconfirmed_kill(job_id)
+                    return
+                container = None
+
             self.api.finish(job_id, status, report, 0.0, metrics, analysis_context)
         except JobCancelled:
+            if is_grill and session_id in self.grill_containers:
+                del self.grill_containers[session_id]
             if container is not None and not self.runtime.remove(container):
                 self._unconfirmed_kill(job_id)
                 return
             self.api.finish(job_id, "cancelled", "Cancelled during Docker preparation.", None, {"runtime_seconds": round(time.monotonic() - started, 3), "cost_source": "unknown"})
         except JobTimedOut:
+            if is_grill and session_id in self.grill_containers:
+                del self.grill_containers[session_id]
             if container is not None and not self.runtime.remove(container):
                 self._unconfirmed_kill(job_id)
                 return
             self.api.finish(job_id, "failed", "Docker time limit reached during preparation.", None, {"runtime_seconds": timeout_seconds, "cost_source": "unknown"})
         except CleanupUnconfirmed:
+            if is_grill and session_id in self.grill_containers:
+                del self.grill_containers[session_id]
             raise
         except Exception as exc:
+            if is_grill and session_id in self.grill_containers:
+                del self.grill_containers[session_id]
             if isinstance(exc, DockerCleanupError):
                 self._unconfirmed_kill(job_id)
                 return
@@ -675,7 +758,44 @@ class DockerWorker:
             if container is not None:
                 self.runtime.remove(container)
 
+    def check_idle_containers(self, current_time: float | None = None) -> list[str]:
+        """After 5 minutes of inactivity awaiting user answers, take tarball snapshot,
+
+        cleanly terminate container (docker rm -f) and volume, and mark session hibernated.
+        """
+        now = current_time if current_time is not None else time.time()
+        hibernated_sessions: list[str] = []
+
+        for session_id, info in list(self.grill_containers.items()):
+            idle_seconds = now - info["last_activity"]
+            if idle_seconds >= self.idle_timeout_seconds:
+                container = info["container"]
+                snapshot_path = self.grill_snapshot_dir / f"{session_id}.tar.gz"
+                try:
+                    self.runtime.snapshot_workspace(container, snapshot_path)
+                except Exception as exc:
+                    print(f"Warning: failed to snapshot workspace for session {session_id}: {exc}", file=sys.stderr)
+                finally:
+                    self.runtime.remove(container)
+
+                if self.grill_store is not None:
+                    try:
+                        self.grill_store.hibernate_session(session_id, snapshot_path)
+                    except Exception as exc:
+                        print(f"Warning: failed to update grill_store hibernation: {exc}", file=sys.stderr)
+                elif hasattr(self.api, "hibernate_grill"):
+                    try:
+                        self.api.hibernate_grill(session_id, str(snapshot_path))
+                    except Exception:
+                        pass
+
+                del self.grill_containers[session_id]
+                hibernated_sessions.append(session_id)
+
+        return hibernated_sessions
+
     def run_once(self) -> bool:
+        self.check_idle_containers()
         capacity = self.runtime.available_capacity({"cpu_milli": self.config.cpu_milli, "memory_mb": self.config.memory_mb, "disk_mb": self.config.disk_mb})
         fitting = tuple(name for name, plan in PROFILES.items()
                         if all(capacity.get(key, 0) >= needed for key, needed in plan.items()))

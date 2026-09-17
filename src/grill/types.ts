@@ -134,6 +134,8 @@ export interface GrillSession {
   error_message: string | null;
   files?: GrillSessionFile[];
   turns?: GrillTurn[];
+  token?: string;
+  container_state?: string;
 }
 
 export interface SessionCreateResponse {

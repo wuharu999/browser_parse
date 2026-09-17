@@ -1,7 +1,7 @@
 """SQLite storage layer for Grill Bot sessions, turns, files, and worker tasks.
 
 Provides private sessions via unguessable token hashes, turn history,
-question budget tracking (hard stop at 30), and worker task dispatching.
+question budget tracking (hard stop at 25), and worker task dispatching.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import sqlite3
 import threading
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from backend.resources import PROFILES
@@ -23,7 +23,7 @@ from backend.resources import PROFILES
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 DEFAULT_GRILL_DB = "data/grill.sqlite3"
 DEFAULT_GRILL_UPLOADS = "data/grill_uploads"
-MAX_QUESTION_BUDGET = 30
+MAX_QUESTION_BUDGET = 25
 SMALL_PROFILE = {
     "profile": "small",
     **PROFILES["small"],
@@ -77,7 +77,12 @@ class GrillStore:
                 CREATE TABLE IF NOT EXISTS grill_sessions (
                     id TEXT PRIMARY KEY,
                     token_hash TEXT NOT NULL,
+                    token TEXT,
                     status TEXT NOT NULL DEFAULT 'intake_pending',
+                    container_state TEXT NOT NULL DEFAULT 'warm',
+                    snapshot_path TEXT,
+                    hibernated_at TEXT,
+                    last_activity_at TEXT,
                     question_count INTEGER NOT NULL DEFAULT 0,
                     current_revision INTEGER NOT NULL DEFAULT 1,
                     task_intent TEXT,
@@ -123,6 +128,7 @@ class GrillStore:
                     action TEXT NOT NULL,
                     turn_index INTEGER NOT NULL,
                     status TEXT NOT NULL DEFAULT 'queued',
+                    snapshot_path TEXT,
                     worker_id TEXT,
                     lease_until TEXT,
                     run_deadline TEXT,
@@ -131,9 +137,33 @@ class GrillStore:
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(session_id) REFERENCES grill_sessions(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS grill_followup_questions (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    question TEXT NOT NULL,
+                    answer TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'generating',
+                    failure_reason TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(session_id) REFERENCES grill_sessions(id) ON DELETE CASCADE
+                );
             """)
+            for col, col_def in [
+                ("error_message", "TEXT"),
+                ("token", "TEXT"),
+                ("container_state", "TEXT DEFAULT 'warm'"),
+                ("snapshot_path", "TEXT DEFAULT NULL"),
+                ("hibernated_at", "TEXT DEFAULT NULL"),
+                ("last_activity_at", "TEXT DEFAULT NULL"),
+                ("summary_context", "TEXT DEFAULT NULL"),
+            ]:
+                try:
+                    self.db.execute(f"ALTER TABLE grill_sessions ADD COLUMN {col} {col_def}")
+                except sqlite3.OperationalError:
+                    pass
             try:
-                self.db.execute("ALTER TABLE grill_sessions ADD COLUMN error_message TEXT")
+                self.db.execute("ALTER TABLE grill_tasks ADD COLUMN snapshot_path TEXT DEFAULT NULL")
             except sqlite3.OperationalError:
                 pass
 
@@ -153,15 +183,21 @@ class GrillStore:
             self.db.execute(
                 """
                 INSERT INTO grill_sessions (
-                    id, token_hash, status, question_count, current_revision,
+                    id, token_hash, token, status, container_state, snapshot_path,
+                    hibernated_at, last_activity_at, question_count, current_revision,
                     task_intent, referenced_robot, scenario_state, active_questions,
                     readback_summary, final_report, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
                     thash,
+                    raw_token,
                     "intake_pending",
+                    "warm",
+                    None,
+                    None,
+                    now_stamp,
                     0,
                     1,
                     task_intent,
@@ -256,6 +292,32 @@ class GrillStore:
                 return None
             return self.get_session(row["id"])
 
+    def list_sessions(self, limit: int = 100, cursor: int | None = None) -> tuple[list[dict], str | None]:
+        with self.lock:
+            query = """
+                SELECT rowid AS _cursor, id, status, container_state, snapshot_path,
+                       hibernated_at, last_activity_at, question_count, current_revision,
+                       task_intent, referenced_robot, created_at, updated_at, finished_at,
+                       token
+                FROM grill_sessions
+            """
+            args: list[Any] = []
+            if cursor is not None:
+                query += " WHERE rowid < ?"
+                args.append(cursor)
+            query += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
+            args.append(limit + 1)
+            rows = self.db.execute(query, args).fetchall()
+            more = len(rows) > limit
+            rows = rows[:limit]
+            items = []
+            for row in rows:
+                item = dict(row)
+                item.pop("_cursor", None)
+                items.append(item)
+            next_cursor = str(rows[-1]["_cursor"]) if more and rows else None
+            return items, next_cursor
+
     def get_files(self, session_id: str) -> list[dict]:
         with self.lock:
             rows = self.db.execute(
@@ -332,6 +394,109 @@ class GrillStore:
                 turns.append(item)
             return turns
 
+    def save_summary_context(self, session_id: str, context: dict) -> None:
+        with self.lock:
+            self.db.execute(
+                "UPDATE grill_sessions SET summary_context = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(context, ensure_ascii=False), stamp(), session_id),
+            )
+            self.db.commit()
+
+    def add_followup_question(self, session_id: str, question: str) -> dict:
+        q_id = f"gq_{secrets.token_hex(8)}"
+        now = stamp()
+        with self.lock:
+            self.db.execute(
+                """
+                INSERT INTO grill_followup_questions (
+                    id, session_id, question, answer, status, created_at, updated_at
+                ) VALUES (?, ?, ?, '', 'generating', ?, ?)
+                """,
+                (q_id, session_id, question, now, now),
+            )
+            self.db.commit()
+            return {
+                "id": q_id,
+                "session_id": session_id,
+                "question": question,
+                "answer": "",
+                "status": "generating",
+                "created_at": now,
+                "updated_at": now,
+            }
+
+    def update_followup_question(
+        self,
+        question_id: str,
+        answer: str,
+        status: str = "generating",
+        failure_reason: str | None = None,
+    ) -> dict | None:
+        now = stamp()
+        with self.lock:
+            self.db.execute(
+                """
+                UPDATE grill_followup_questions
+                SET answer = ?, status = ?, failure_reason = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (answer, status, failure_reason, now, question_id),
+            )
+            self.db.commit()
+            row = self.db.execute(
+                "SELECT * FROM grill_followup_questions WHERE id = ?",
+                (question_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_followup_questions(
+        self,
+        session_id: str,
+        limit: int = 50,
+        before: str | None = None,
+    ) -> dict:
+        with self.lock:
+            query = "SELECT * FROM grill_followup_questions WHERE session_id = ?"
+            args: list[Any] = [session_id]
+            if before:
+                query += " AND created_at < ?"
+                args.append(before)
+            query += " ORDER BY created_at ASC LIMIT ?"
+            args.append(limit)
+            rows = self.db.execute(query, args).fetchall()
+            items = [dict(r) for r in rows]
+            return {"items": items}
+
+    def get_followup_chat_context(self, session_id: str) -> tuple[dict, list[dict]]:
+        with self.lock:
+            sess = self.get_session(session_id)
+            if not sess:
+                return {}, []
+            raw_summary = sess.get("summary_context")
+            if raw_summary:
+                try:
+                    context = json.loads(raw_summary) if isinstance(raw_summary, str) else raw_summary
+                except Exception:
+                    context = {"summary": sess.get("readback_summary") or sess.get("task_intent")}
+            else:
+                context = {
+                    "session_id": session_id,
+                    "task_intent": sess.get("task_intent"),
+                    "referenced_robot": sess.get("referenced_robot"),
+                    "summary": sess.get("readback_summary") or sess.get("final_report"),
+                    "status": sess.get("status"),
+                }
+            q_rows = self.db.execute(
+                """
+                SELECT question, answer FROM grill_followup_questions
+                WHERE session_id = ? AND status = 'completed' AND answer != ''
+                ORDER BY created_at ASC
+                """,
+                (session_id,),
+            ).fetchall()
+            history = [{"question": r["question"], "answer": r["answer"]} for r in q_rows]
+            return context, history
+
     def submit_answers(
         self,
         session_id: str,
@@ -340,18 +505,21 @@ class GrillStore:
         normalized_updates: dict | None = None,
     ) -> dict:
         if not self.verify_token(session_id, raw_token):
-            raise PermissionError("Invalid session token")
+            raise ValueError("Session token invalid or unauthorized")
 
         now_stamp = stamp()
         with self.lock:
             row = self.db.execute(
-                "SELECT status, question_count, active_questions FROM grill_sessions WHERE id = ?",
+                "SELECT status, question_count, active_questions, container_state, snapshot_path FROM grill_sessions WHERE id = ?",
                 (session_id,),
             ).fetchone()
             if not row:
                 raise ValueError("Session not found")
             if row["status"] not in ("interviewing", "ready_for_confirmation"):
                 raise ValueError(f"Session is in status '{row['status']}', cannot submit answers")
+
+            was_hibernated = row["container_state"] == "hibernated"
+            snapshot_path = row["snapshot_path"]
 
             active_q = json.loads(row["active_questions"]) if row["active_questions"] else []
             new_count = row["question_count"] + len(active_q)
@@ -389,21 +557,22 @@ class GrillStore:
             self.db.execute(
                 """
                 UPDATE grill_sessions
-                SET question_count = ?, status = ?, updated_at = ?
+                SET question_count = ?, status = ?, container_state = 'warm',
+                    last_activity_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (new_count, new_status, now_stamp, session_id),
+                (new_count, new_status, now_stamp, now_stamp, session_id),
             )
 
-            # Queue next worker turn task
+            # Queue next worker turn task with snapshot_path if resumed from hibernation
             task_id = f"gtask_{secrets.token_hex(12)}"
             self.db.execute(
                 """
                 INSERT INTO grill_tasks (
-                    id, session_id, action, turn_index, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    id, session_id, action, turn_index, status, snapshot_path, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (task_id, session_id, "turn", next_turn_index, "queued", now_stamp, now_stamp),
+                (task_id, session_id, "turn", next_turn_index, "queued", snapshot_path if was_hibernated else None, now_stamp, now_stamp),
             )
             self.db.commit()
 
@@ -450,6 +619,17 @@ class GrillStore:
             )
             self.db.commit()
 
+        return self.get_session(session_id) or {}
+
+    def confirm_and_finalize(self, session_id: str, raw_token: str, confirmation_note: str | None = None) -> dict:
+        self.confirm_scenario(session_id, raw_token, confirmation_note)
+        now_stamp = stamp()
+        with self.lock:
+            self.db.execute(
+                "UPDATE grill_sessions SET status = 'completed', container_state = 'completed', finished_at = ?, updated_at = ? WHERE id = ?",
+                (now_stamp, now_stamp, session_id),
+            )
+            self.db.commit()
         return self.get_session(session_id) or {}
 
     def _expire_leases(self) -> None:
@@ -519,12 +699,19 @@ class GrillStore:
 
             self.db.commit()
 
+            task_snap = dict(task).get("snapshot_path")
+            is_resumed = bool(task_snap)
+            snapshot_path = task_snap
+
             return {
                 "id": task["id"],
                 "job_type": "grill",
                 "session_id": task["session_id"],
                 "action": task["action"],
                 "turn_index": task["turn_index"],
+                "snapshot_path": snapshot_path,
+                "container_state": session["container_state"],
+                "is_resumed": is_resumed,
                 "resource_plan": SMALL_PROFILE.copy(),
                 "files": files,
                 "task_intent": session["task_intent"],
@@ -616,6 +803,7 @@ class GrillStore:
                     UPDATE grill_sessions
                     SET status = ?, scenario_state = ?, active_questions = ?,
                         readback_summary = COALESCE(?, readback_summary),
+                        container_state = 'warm', last_activity_at = ?,
                         current_revision = current_revision + 1, updated_at = ?
                     WHERE id = ?
                     """,
@@ -625,21 +813,31 @@ class GrillStore:
                         json.dumps(new_questions, ensure_ascii=False),
                         readback_summary,
                         now_stamp,
+                        now_stamp,
                         session_id,
                     ),
                 )
+                if output.get("summary_context"):
+                    self.db.execute(
+                        "UPDATE grill_sessions SET summary_context = ? WHERE id = ?",
+                        (json.dumps(output["summary_context"], ensure_ascii=False), session_id),
+                    )
 
             elif task["action"] == "report":
                 # Final report from 3 specialist subagents
                 final_report = output.get("report") or output
+                summary_ctx = output.get("summary_context")
+                summary_ctx_str = json.dumps(summary_ctx, ensure_ascii=False) if summary_ctx else None
                 self.db.execute(
                     """
                     UPDATE grill_sessions
-                    SET status = 'completed', final_report = ?, finished_at = ?, updated_at = ?
+                    SET status = 'completed', final_report = ?, summary_context = COALESCE(?, summary_context),
+                        container_state = 'completed', finished_at = ?, updated_at = ?
                     WHERE id = ?
                     """,
                     (
                         json.dumps(final_report, ensure_ascii=False),
+                        summary_ctx_str,
                         now_stamp,
                         now_stamp,
                         session_id,
@@ -647,3 +845,128 @@ class GrillStore:
                 )
 
             self.db.commit()
+
+    def hibernate_session(
+        self,
+        session_id: str,
+        snapshot_path: str | Path | None = None,
+    ) -> dict | None:
+        """Mark a session's container as hibernated with its durable snapshot path."""
+        now_stamp = stamp()
+        snap_str = str(snapshot_path) if snapshot_path is not None else None
+        with self.lock:
+            row = self.db.execute("SELECT id, status, container_state FROM grill_sessions WHERE id = ?", (session_id,)).fetchone()
+            if not row:
+                return None
+            self.db.execute(
+                """
+                UPDATE grill_sessions
+                SET container_state = 'hibernated',
+                    snapshot_path = COALESCE(?, snapshot_path),
+                    hibernated_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (snap_str, now_stamp, now_stamp, session_id),
+            )
+            self.db.commit()
+        return self.get_session(session_id)
+
+    def check_and_hibernate_idle_sessions(
+        self,
+        timeout_seconds: int = 300,
+        current_time: float | datetime | None = None,
+        snapshot_fn: Callable[[str], str | Path | None] | None = None,
+    ) -> list[str]:
+        """Scan active/warm sessions awaiting answers; if idle exceeds timeout, mark hibernated."""
+        if current_time is None:
+            now_dt = datetime.now(timezone.utc)
+        elif isinstance(current_time, (int, float)):
+            now_dt = datetime.fromtimestamp(current_time, tz=timezone.utc)
+        else:
+            now_dt = current_time
+        now_stamp = stamp(now_dt)
+
+        hibernated_ids: list[str] = []
+        with self.lock:
+            rows = self.db.execute(
+                """
+                SELECT id, status, container_state, snapshot_path, last_activity_at, updated_at, created_at
+                FROM grill_sessions
+                WHERE container_state != 'hibernated'
+                  AND status IN ('interviewing', 'ready_for_confirmation')
+                """
+            ).fetchall()
+
+            for r in rows:
+                ref_time_str = r["last_activity_at"] or r["updated_at"] or r["created_at"]
+                try:
+                    ref_dt = datetime.fromisoformat(ref_time_str.replace("Z", "+00:00"))
+                except Exception:
+                    continue
+                idle_seconds = (now_dt - ref_dt).total_seconds()
+                if idle_seconds >= timeout_seconds:
+                    sid = r["id"]
+                    snap = None
+                    if snapshot_fn is not None:
+                        snap = snapshot_fn(sid)
+                    snap_path = str(snap) if snap else (r["snapshot_path"] or f"data/grill_snapshots/{sid}.tar.gz")
+                    self.db.execute(
+                        """
+                        UPDATE grill_sessions
+                        SET container_state = 'hibernated',
+                            snapshot_path = ?,
+                            hibernated_at = ?,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (snap_path, now_stamp, now_stamp, sid),
+                    )
+                    hibernated_ids.append(sid)
+            if hibernated_ids:
+                self.db.commit()
+        return hibernated_ids
+
+    def resume_session(
+        self,
+        session_id: str,
+        raw_token: str | None = None,
+    ) -> dict:
+        """Resume a hibernated session, providing user-facing resuming status."""
+        if raw_token is not None and not self.verify_token(session_id, raw_token):
+            raise PermissionError("Invalid session token")
+
+        now_stamp = stamp()
+        with self.lock:
+            row = self.db.execute(
+                "SELECT id, status, container_state, snapshot_path FROM grill_sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError("Session not found")
+
+            snapshot_path = row["snapshot_path"]
+            if row["container_state"] == "hibernated" and not snapshot_path:
+                return {"status": "error", "message": "No snapshot found"}
+
+            self.db.execute(
+                """
+                UPDATE grill_sessions
+                SET container_state = 'warm',
+                    last_activity_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now_stamp, now_stamp, session_id),
+            )
+            self.db.commit()
+
+        return {
+            "status": "resumed",
+            "session_id": session_id,
+            "container_state": "warm",
+            "snapshot_path": snapshot_path,
+            "user_status_en": "Warming up container and resuming session...",
+            "user_status_zh": "正在唤醒计算容器并恢复推演会话...",
+        }
+

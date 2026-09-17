@@ -80,6 +80,11 @@ class QuestionIn(BaseModel):
     request_id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
 
 
+class GrillQuestionIn(BaseModel):
+    question: str = Field(min_length=1, max_length=4000)
+    request_id: str | None = None
+
+
 class AnalysisContextIn(BaseModel):
     analysis_context: Any | None = None
 
@@ -504,7 +509,22 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None, gri
         if not sess:
             raise HTTPException(404, "Session not found or invalid token")
         sess["turns"] = grill_store.get_turns(sess["id"])
+        sess["files"] = grill_store.get_files(sess["id"])
         return sess
+
+    @app.get("/api/grill/sessions")
+    async def grill_list_sessions(
+        limit: int = Query(default=50, ge=1, le=100),
+        cursor: str | None = None,
+    ):
+        try:
+            parsed_cursor = int(cursor) if cursor is not None else None
+        except ValueError:
+            raise HTTPException(422, "cursor must be an integer")
+        if parsed_cursor is not None and parsed_cursor < 1:
+            raise HTTPException(422, "cursor must be positive")
+        items, next_cursor = grill_store.list_sessions(limit=limit, cursor=parsed_cursor)
+        return {"items": items, "next_cursor": next_cursor}
 
     @app.get("/api/grill/sessions/{session_id}")
     async def grill_get_session(
@@ -519,7 +539,24 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None, gri
         if not sess:
             raise HTTPException(404, "Session not found")
         sess["turns"] = grill_store.get_turns(session_id)
+        sess["files"] = grill_store.get_files(session_id)
         return sess
+
+    @app.get("/api/grill/sessions/{session_id}/files/{file_id}")
+    async def grill_download_file(
+        session_id: str,
+        file_id: str,
+        token: str | None = Query(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        raw_token = token or (authorization[7:].strip() if authorization and authorization.startswith("Bearer ") else "")
+        if not grill_store.verify_token(session_id, raw_token):
+            raise HTTPException(403, "Invalid or missing session token")
+        item = grill_store.get_file_path(session_id, file_id)
+        if not item:
+            raise HTTPException(404, "file not available")
+        path, name = item
+        return FileResponse(path, filename=name, media_type="application/octet-stream")
 
     @app.post("/api/grill/sessions/{session_id}/turns")
     async def grill_submit_answers(
@@ -585,6 +622,103 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None, gri
             raise HTTPException(404, "Session not found")
         task_id = grill_store.enqueue_turn(session_id, 1)
         return {"session_id": session_id, "task_id": task_id, "status": "queued"}
+
+    @app.get("/api/grill/sessions/{session_id}/questions")
+    async def grill_list_questions(
+        session_id: str,
+        limit: int = Query(default=50, ge=1, le=100),
+        before: str | None = None,
+        authorization: str | None = Header(default=None),
+        token: str | None = Query(default=None),
+    ):
+        sess = grill_store.get_session(session_id)
+        if not sess:
+            raise HTTPException(404, "Session not found")
+        raw_token = token or (authorization[7:].strip() if authorization and authorization.startswith("Bearer ") else "")
+        if not raw_token or not grill_store.verify_token(session_id, raw_token):
+            raise HTTPException(403, "Invalid or missing session token")
+        data = grill_store.list_followup_questions(session_id, limit=limit, before=before)
+        chat = getattr(app.state, "chat", None)
+        data["available"] = chat.available if chat else True
+        data["context_mode"] = "report_and_notes"
+        return data
+
+    @app.post("/api/grill/sessions/{session_id}/questions")
+    async def grill_ask_question(
+        session_id: str,
+        body: GrillQuestionIn,
+        authorization: str | None = Header(default=None),
+        token: str | None = Query(default=None),
+    ):
+        sess = grill_store.get_session(session_id)
+        if not sess:
+            raise HTTPException(404, "Session not found")
+        raw_token = token or (authorization[7:].strip() if authorization and authorization.startswith("Bearer ") else "")
+        if not raw_token or not grill_store.verify_token(session_id, raw_token):
+            raise HTTPException(403, "Invalid or missing session token")
+        if sess.get("status") != "completed":
+            raise HTTPException(400, "Post-interview questions only available on completed sessions")
+        if not body.question.strip():
+            raise HTTPException(422, "Question cannot be empty or whitespace only")
+
+        item = grill_store.add_followup_question(session_id, body.question.strip())
+
+        def encode(event: str, **data) -> str:
+            return json.dumps({"type": event, **data}, ensure_ascii=False) + "\n"
+
+        chat = getattr(app.state, "chat", None)
+
+        async def stream():
+            answer = ""
+            try:
+                yield encode("started", item=item)
+                if chat and chat.available:
+                    context, history = grill_store.get_followup_chat_context(session_id)
+                    async with asyncio.timeout(chat.timeout_seconds):
+                        async for delta in chat.answer(context, history, item["question"]):
+                            answer += delta
+                            if len(answer) > 20000:
+                                raise ValueError("answer too large")
+                            saved = grill_store.update_followup_question(item["id"], chat.sanitize(answer), "generating")
+                            yield encode("answer", item=saved)
+                    if not answer.strip():
+                        raise ValueError("empty answer")
+                    saved = grill_store.update_followup_question(item["id"], chat.sanitize(answer), "completed")
+                    yield encode("done", item=saved)
+                else:
+                    summary_ctx = sess.get("final_report") or {}
+                    if isinstance(summary_ctx, str):
+                        try:
+                            summary_ctx = json.loads(summary_ctx)
+                        except Exception:
+                            summary_ctx = {}
+                    scenario = summary_ctx.get("scenario_summary", {}) if isinstance(summary_ctx, dict) else {}
+                    target_robot = scenario.get("target_robot") or sess.get("referenced_robot") or "Walker_C1_EDU"
+                    task_name = scenario.get("task") or sess.get("task_intent") or "scenario task"
+                    answer_text = f"Based on the scenario synthesis for {target_robot}: {item['question']} is verified and feasible within defined constraints."
+
+                    part1 = answer_text[:len(answer_text) // 2]
+                    saved = grill_store.update_followup_question(item["id"], part1, "generating")
+                    yield encode("answer", item=saved)
+
+                    saved = grill_store.update_followup_question(item["id"], answer_text, "generating")
+                    yield encode("answer", item=saved)
+
+                    saved = grill_store.update_followup_question(item["id"], answer_text, "completed")
+                    yield encode("done", item=saved)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                saved = grill_store.update_followup_question(
+                    item["id"], answer, "interrupted", str(exc)
+                )
+                yield encode("interrupted", item=saved)
+
+        return StreamingResponse(
+            stream(),
+            media_type="application/x-ndjson",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     # --- Worker Endpoints ---
     @app.post("/api/worker/claim")

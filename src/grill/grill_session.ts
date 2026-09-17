@@ -91,7 +91,7 @@ export class GrillSessionView {
     header.className = 'grill-session-header';
 
     const statusBadgeClass = `status-badge ${this.session.status}`;
-    const questionLimit = 30;
+    const questionLimit = 25;
     const progressPercent = Math.min(100, Math.round((this.session.question_count / questionLimit) * 100));
 
     const statusMap: Record<string, string> = {
@@ -122,6 +122,77 @@ export class GrillSessionView {
     `;
     wrapper.appendChild(header);
 
+    // Phased wind-down guidance hint
+    if (this.session.question_count >= 20) {
+      const hint = document.createElement('div');
+      hint.className = 'budget-hint urgent';
+      hint.textContent = t('Final turn budget (at most 5 questions remaining). Preparing final readback.', '推演已接近上限（剩余最多 5 题）。请聚焦未决关键决策并准备最终确认摘要。');
+      wrapper.appendChild(hint);
+    } else if (this.session.question_count >= 15) {
+      const hint = document.createElement('div');
+      hint.className = 'budget-hint warning';
+      hint.textContent = t('Approaching question limit (at most 10 questions remaining). Focusing on key constraints.', '推演提问已达 15 题（后续最多还可提问 10 题，如信息已充分无需问满）。请聚焦关键约束。');
+      wrapper.appendChild(hint);
+    }
+
+    // Uploaded Documents card
+    if (this.session.files && this.session.files.length > 0) {
+      const filesCard = document.createElement('div');
+      filesCard.className = 'grill-card session-files-card';
+      const h3 = document.createElement('h3');
+      h3.textContent = `${t('Uploaded Documents & Diagrams', '上传参考文档与图纸')} (${this.session.files.length})`;
+      filesCard.appendChild(h3);
+
+      for (const f of this.session.files) {
+        const fileRow = document.createElement('div');
+        fileRow.className = 'file-item';
+        const fileLink = document.createElement('a');
+        fileLink.href = `/api/grill/sessions/${this.session.id}/files/${f.id}?token=${encodeURIComponent(this.token)}`;
+        fileLink.target = '_blank';
+        fileLink.className = 'file-link';
+        fileLink.textContent = `📎 ${f.name} (${f.size} B)`;
+        fileRow.appendChild(fileLink);
+        filesCard.appendChild(fileRow);
+      }
+      wrapper.appendChild(filesCard);
+    }
+
+    // Past Turn Transcript
+    if (this.session.turns && this.session.turns.length > 0) {
+      const turnsCard = document.createElement('div');
+      turnsCard.className = 'grill-card turns-history-card';
+      const h3 = document.createElement('h3');
+      h3.textContent = t('Past Turn Transcript', '往轮问答推演记录');
+      turnsCard.appendChild(h3);
+
+      for (const turn of this.session.turns) {
+        const turnRow = document.createElement('div');
+        turnRow.className = 'turn-row';
+        turnRow.setAttribute('data-turn-index', String(turn.turn_index));
+
+        const turnHeader = document.createElement('div');
+        turnHeader.className = 'turn-row-header';
+        turnHeader.textContent = `${t('Turn', '第')} ${turn.turn_index} ${t('', '轮问答')}`;
+        turnRow.appendChild(turnHeader);
+
+        for (const q of turn.questions) {
+          const qBox = document.createElement('div');
+          qBox.className = 'past-question-box';
+          qBox.textContent = `Q: ${q.text} ${q.why ? `(💡 ${q.why})` : ''}`;
+          turnRow.appendChild(qBox);
+        }
+        for (const a of turn.answers) {
+          const aBox = document.createElement('div');
+          aBox.className = 'past-answer-box';
+          const ansText = a.selected_option || a.free_text_answer || (a.is_unknown ? 'Unknown' : '');
+          aBox.textContent = `A: ${ansText}`;
+          turnRow.appendChild(aBox);
+        }
+        turnsCard.appendChild(turnRow);
+      }
+      wrapper.appendChild(turnsCard);
+    }
+
     // Body based on state
     if (this.session.status === 'intake_pending' || (this.session.status === 'interviewing' && (!this.session.active_questions || this.session.active_questions.length === 0))) {
       wrapper.appendChild(this.renderWaitingState(
@@ -143,9 +214,12 @@ export class GrillSessionView {
   private renderWaitingState(title: string, message?: string): HTMLElement {
     const card = document.createElement('div');
     card.className = 'grill-card grill-loading-card';
+    const displayTitle = (this.session?.container_state === 'hibernated' || !title)
+      ? t('Warming up container and resuming session...', '正在唤醒计算容器并恢复推演会话...')
+      : title;
     card.innerHTML = `
       <div class="grill-spinner"></div>
-      <h3 class="loading-title">${this.escape(title)}</h3>
+      <h3 class="loading-title">${this.escape(displayTitle)}</h3>
       ${message ? `<p class="loading-desc">${this.escape(message)}</p>` : ''}
       <div class="loading-note">${t('Running in an isolated container. Resources will pause between questions.', '运行于隔离计算容器中。问题生成间隙资源将自动暂停以节省算力。')}</div>
     `;

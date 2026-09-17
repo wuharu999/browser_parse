@@ -138,21 +138,68 @@ def test_grill_store_lifecycle(tmp_path):
 
 
 def test_question_budget_hard_stop(tmp_path):
+    assert MAX_QUESTION_BUDGET == 25
     store = GrillStore(db_path=":memory:", upload_dir=tmp_path / "uploads")
     session, token = store.create_session("Long conversation task")
 
     # Claim turn 1
     claim = store.worker_claim_grill("worker-1", {"cpu_milli": 2000, "memory_mb": 4096})
-    # Set question_count right near max
+    # Set question_count right near max (24)
     with store.lock:
-        store.db.execute("UPDATE grill_sessions SET question_count = 29 WHERE id = ?", (session["id"],))
+        store.db.execute("UPDATE grill_sessions SET question_count = 24 WHERE id = ?", (session["id"],))
         store.db.commit()
 
     q = [{"id": "q_last", "text": "Final question?", "target_ids": [], "why": "", "options": [], "free_text": True, "allow_unknown": True}]
     store.worker_finish_grill(claim["id"], "worker-1", "completed", {"scenario_state": {}, "questions": q, "ready_for_readback": False})
 
-    # Submitting answer should hit hard stop at 30
+    # Submitting answer should hit hard stop at 25
     ans = [{"question_id": "q_last", "selected_option": "Yes", "free_text": None, "unknown": False}]
     updated = store.submit_answers(session["id"], token, ans)
-    assert updated["question_count"] == 30
+    assert updated["question_count"] == 25
     assert updated["status"] == "ready_for_confirmation"
+
+
+def test_list_sessions_store(tmp_path):
+    store = GrillStore(db_path=":memory:", upload_dir=tmp_path / "uploads")
+
+    # Initially empty
+    items, next_cursor = store.list_sessions()
+    assert items == []
+    assert next_cursor is None
+
+    # Create 3 sessions
+    sess1, tok1 = store.create_session("Task 1", referenced_robot="Walker_Tienkung_DEX")
+    sess2, tok2 = store.create_session("Task 2", referenced_robot="Walker_C1_EDU")
+    sess3, tok3 = store.create_session("Task 3", referenced_robot="TienKung")
+
+    # List all
+    items, next_cursor = store.list_sessions(limit=10)
+    assert len(items) == 3
+    assert next_cursor is None
+
+    # Verify fields
+    for it in items:
+        assert "id" in it
+        assert "token" in it
+        assert "status" in it
+        assert "question_count" in it
+        assert "task_intent" in it
+        assert "referenced_robot" in it
+        assert "created_at" in it
+        assert "updated_at" in it
+        assert "finished_at" in it
+
+    # Verify token matches raw token
+    id_to_token = {sess1["id"]: tok1, sess2["id"]: tok2, sess3["id"]: tok3}
+    for it in items:
+        assert it["token"] == id_to_token[it["id"]]
+
+    # Test pagination
+    p1, cur1 = store.list_sessions(limit=2)
+    assert len(p1) == 2
+    assert cur1 is not None
+
+    p2, cur2 = store.list_sessions(limit=2, cursor=int(cur1))
+    assert len(p2) == 1
+    assert cur2 is None
+    assert p2[0]["id"] == items[2]["id"]

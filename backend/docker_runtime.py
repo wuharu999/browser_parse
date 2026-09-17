@@ -5,6 +5,7 @@ workspace volume and an internal network; never the Docker socket or host paths.
 """
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import os
@@ -15,7 +16,7 @@ import tarfile
 import threading
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
 MIB = 1024**2
@@ -242,6 +243,109 @@ class DockerRuntime:
             if process.poll() is None:
                 process.kill()
             process.wait()
+            if process.stdin and not process.stdin.closed:
+                process.stdin.close()
+
+    def snapshot_workspace(self, job: DockerJob, target_path: Path) -> Path:
+        """Capture /workspace contents (including hidden files) as a .tar.gz archive."""
+        target = Path(target_path).resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp_target = target.with_suffix(f".tmp.{uuid.uuid4().hex[:8]}")
+        process = None
+        try:
+            process = subprocess.Popen(
+                ["docker", "cp", f"{job.container}:/workspace/.", "-"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            assert process.stdout is not None
+            with gzip.open(tmp_target, "wb") as gz_out:
+                while chunk := process.stdout.read(65536):
+                    gz_out.write(chunk)
+            _, stderr = process.communicate(timeout=60)
+            if process.returncode != 0:
+                err_msg = stderr.decode("utf-8", errors="replace").strip()
+                raise DockerError(f"Docker snapshot copy failed: {err_msg}")
+            tmp_target.replace(target)
+            return target
+        except Exception as exc:
+            if tmp_target.exists():
+                tmp_target.unlink(missing_ok=True)
+            if isinstance(exc, DockerError):
+                raise
+            raise DockerError(f"Failed to create workspace snapshot: {exc}") from exc
+        finally:
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait()
+
+    def restore_workspace(self, job: DockerJob, source_tarball: Path) -> None:
+        """Extract a snapshot tarball into the container's /workspace directory."""
+        source = Path(source_tarball).resolve()
+        if not source.is_file():
+            raise DockerError(f"Snapshot archive not found: {source}")
+
+        # Validate archive integrity and guard against path traversal (zip-slip)
+        try:
+            with tarfile.open(source, mode="r:*") as in_tar:
+                for member in in_tar.getmembers():
+                    name = member.name.replace("\\", "/")
+                    parts = PurePosixPath(name).parts
+                    if member.name.startswith("/") or ".." in parts:
+                        raise DockerError(f"Unsafe path in snapshot archive: {member.name}")
+        except Exception as exc:
+            if isinstance(exc, DockerError):
+                raise
+            raise DockerError(f"Corrupted snapshot archive: {exc}") from exc
+
+        process = subprocess.Popen(
+            ["docker", "cp", "-a", "-", f"{job.container}:/workspace"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        timer = threading.Timer(300, process.kill)
+        timer.start()
+        try:
+            with tarfile.open(source, mode="r:*") as in_tar:
+                with tarfile.open(fileobj=process.stdin, mode="w|") as out_tar:
+                    for member in in_tar.getmembers():
+                        name = member.name.lstrip("./")
+                        if not name:
+                            continue
+                        info = tarfile.TarInfo(name=name)
+                        info.size = member.size
+                        info.mtime = member.mtime
+                        info.mode = member.mode
+                        info.type = member.type
+                        info.linkname = member.linkname
+                        info.uid = 10001
+                        info.gid = 10001
+                        info.uname = ""
+                        info.gname = ""
+                        if member.isreg():
+                            stream = in_tar.extractfile(member)
+                            if stream is not None:
+                                out_tar.addfile(info, stream)
+                            else:
+                                out_tar.addfile(info)
+                        else:
+                            out_tar.addfile(info)
+            if process.stdin and not process.stdin.closed:
+                process.stdin.close()
+            _, stderr = process.communicate(timeout=60)
+            if process.returncode != 0:
+                err_msg = stderr.decode("utf-8", errors="replace").strip()
+                raise DockerError(f"Docker workspace restore failed: {err_msg}")
+        except Exception as exc:
+            if isinstance(exc, DockerError):
+                raise
+            raise DockerError(f"Docker workspace restore failed or timed out: {exc}") from exc
+        finally:
+            timer.cancel()
+            if process.poll() is None:
+                process.kill()
+                process.wait()
             if process.stdin and not process.stdin.closed:
                 process.stdin.close()
 

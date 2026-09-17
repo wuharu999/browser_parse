@@ -75,6 +75,37 @@ class FakeDockerRuntime:
         self.removed.append(job)
         return self.remove_result
 
+    def snapshot_workspace(self, job: DockerJob, target_path: Path) -> Path:
+        target = Path(target_path).resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        import tarfile
+        with tarfile.open(target, mode="w:gz") as tar:
+            data = b'{"scenario_state": "ok"}'
+            ti = tarfile.TarInfo(name="scenario_state.json")
+            ti.size = len(data)
+            tar.addfile(ti, io.BytesIO(data))
+        return target
+
+    def restore_workspace(self, job: DockerJob, source_tarball: Path) -> None:
+        source = Path(source_tarball).resolve()
+        if not source.is_file():
+            raise DockerError(f"Snapshot archive not found: {source}")
+        import tarfile
+        try:
+            with tarfile.open(source, mode="r:*") as tar:
+                for member in tar.getmembers():
+                    if member.name.startswith("/") or ".." in member.name:
+                        raise DockerError(f"Unsafe path in snapshot archive: {member.name}")
+                    if member.isreg():
+                        f = tar.extractfile(member)
+                        if f:
+                            self.copied[member.name] = f.read()
+        except Exception as exc:
+            if isinstance(exc, DockerError):
+                raise
+            raise DockerError(f"Corrupted snapshot archive: {exc}") from exc
+
+
 
 class FakeApi:
     def __init__(self, job: dict | None, blobs: dict[str, bytes] | None = None) -> None:

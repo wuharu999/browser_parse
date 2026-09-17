@@ -6,7 +6,7 @@ import { parseReport } from './report';
 import { availability, type Budget } from './budget';
 import { uploadFile, protectUpload, type UploadProgress, type WakeState } from './upload';
 import { onUiLanguage, setUiLanguage, t, uiLanguage } from './i18n';
-import { GrillIntakeView } from './grill/grill_intake';
+import { GrillIntakeView, formatRobotName } from './grill/grill_intake';
 import { GrillSessionView } from './grill/grill_session';
 import { parseRoute, type RouteState } from './grill/router';
 export { parseRoute, type RouteState };
@@ -99,6 +99,61 @@ function buildShell(): void {
   if (selected && selectedJob) renderResult(); else renderNew();
 }
 
+interface GrillSessionItem {
+  id: string;
+  status: string;
+  task_intent: string;
+  referenced_robot: string | null;
+  created_at: string;
+  token?: string;
+}
+
+let grillHistorySessions: GrillSessionItem[] = [];
+
+async function loadGrillSessions(): Promise<void> {
+  try {
+    const res = await fetch('/api/grill/sessions?limit=50');
+    if (res.ok) {
+      const data = await res.json();
+      grillHistorySessions = data.items || [];
+    }
+  } catch (err) {
+    console.error('Failed to load grill history', err);
+  }
+}
+
+function renderGrillSidebarHistory(container: HTMLElement, currentToken?: string): void {
+  container.replaceChildren();
+  if (!grillHistorySessions.length) {
+    const empty = el('div', 'sidebar-empty history-empty', t('No past interviews', '暂无历史推演'));
+    container.append(empty);
+    return;
+  }
+  for (const s of grillHistorySessions) {
+    const isSelected = !!currentToken && s.token === currentToken;
+    const item = button('', `history-item ${isSelected ? 'selected' : ''}`, () => {
+      if (s.token) navigate(`/grill/${s.token}`);
+    });
+    item.setAttribute('data-session-id', s.id);
+    item.setAttribute('aria-current', isSelected ? 'page' : 'false');
+
+    const titleEl = el('span', 'history-title', s.task_intent || t('Robot Scenario Analysis', '机器人场景推演'));
+    const statusMap: Record<string, string> = {
+      intake_pending: t('Initializing', '初始化中'),
+      interviewing: t('Interviewing', '推演中'),
+      ready_for_confirmation: t('Ready for confirmation', '待确认'),
+      analyzing: t('Analyzing', '分析中'),
+      completed: t('Completed', '已完成'),
+      failed: t('Failed', '失败'),
+    };
+    const st = statusMap[s.status] || s.status;
+    const robot = formatRobotName(s.referenced_robot);
+    const metaEl = el('span', 'history-meta', `${s.created_at.slice(0, 10)} · ${st} · ${robot}`);
+    item.append(titleEl, metaEl);
+    container.append(item);
+  }
+}
+
 function buildGrillShell(token?: string): void {
   if (grillSessionView) {
     grillSessionView.destroy();
@@ -107,12 +162,32 @@ function buildGrillShell(token?: string): void {
   document.documentElement.lang = uiLanguage();
   app.replaceChildren();
 
-  const shell = el('div', 'grill-shell');
-  const topbar = el('header', 'grill-topbar');
+  const shell = el('div', 'workspace');
+  const sidebar = el('aside', 'sidebar');
 
-  const brand = el('div', 'grill-brand');
-  brand.append(el('span', 'grill-brand-mark', '🤖'), el('span', '', t('Robot Scenario Grill', '机器人场景推演')));
+  const brand = el('div', 'brand');
+  const brandMark = el('span', 'brand-mark', '🤖');
+  const brandTitle = el('span', 'brand-title', t('Robot Scenario Grill', '机器人场景推演'));
+  brand.append(brandMark, brandTitle);
+  brand.style.cursor = 'pointer';
   brand.addEventListener('click', () => navigate('/grill'));
+
+  const newBtn = button(t('+  New interview', '+  新建推演'), 'button primary new-analysis', () => navigate('/grill'));
+  const sidebarLabel = el('div', 'sidebar-label', t('INTERVIEW HISTORY', '推演历史'));
+  const historyList = el('nav', 'history-list');
+  historyList.setAttribute('aria-label', t('Interview history', '推演历史'));
+
+  const connection = el('div', 'connection');
+  connection.append(
+    el('span', 'connection-dot online'),
+    el('span', '', t('Shared with everyone', '所有人共享'))
+  );
+
+  sidebar.append(brand, newBtn, sidebarLabel, historyList, connection);
+
+  const main = el('div', 'main');
+  const topbar = el('header', 'topbar');
+  topbar.append(el('span', 'workspace-title', t('Robot Scenario Grill', '机器人场景推演')));
 
   const modeNav = el('div', 'mode-nav');
   const logTab = button(t('📋 Log Analyzer', '📋 日志分析'), 'mode-tab', () => navigate('/log'));
@@ -123,18 +198,23 @@ function buildGrillShell(token?: string): void {
   const languageButton = button(uiLanguage() === 'en' ? '中文' : 'English', 'button text-button language-toggle', () => setUiLanguage(uiLanguage() === 'en' ? 'zh' : 'en'));
   languageButton.setAttribute('aria-label', 'Switch interface language / 切换界面语言');
   tools.append(modeNav, languageButton);
+  topbar.append(tools);
 
-  topbar.append(brand, tools);
-
-  const main = el('main', 'grill-main');
-  shell.append(topbar, main);
+  const content = el('div', 'content');
+  main.append(topbar, content);
+  shell.append(sidebar, main);
   app.append(shell);
 
+  renderGrillSidebarHistory(historyList, token);
+  void loadGrillSessions().then(() => {
+    renderGrillSidebarHistory(historyList, token);
+  });
+
   if (token) {
-    grillSessionView = new GrillSessionView(token, main, navigate);
+    grillSessionView = new GrillSessionView(token, content, navigate);
     void grillSessionView.start();
   } else {
-    const intakeView = new GrillIntakeView(main, navigate);
+    const intakeView = new GrillIntakeView(content, navigate);
     intakeView.render();
   }
 }
