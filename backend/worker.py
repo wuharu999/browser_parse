@@ -338,6 +338,7 @@ class DockerWorker:
             # and subagent tool invocations have immediate access to preinstalled
             # analysis packages (rosbags, mcap, numpy, pandas, pypdf, h5py, etc.).
             "VIRTUAL_ENV": "/opt/analysis-venv",
+            "PYTHONPATH": "/workspace:/opt/sandbox",
             "PATH": "/opt/analysis-venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         }
         if self.config.codex_provider_url:
@@ -608,7 +609,13 @@ class DockerWorker:
             while (next_activity := self._activity(container, job_id, seen_activity)) != seen_activity:
                 seen_activity = next_activity
                 self._checkpoint(job_id, deadline)
-            if command.returncode: raise WorkerError("Docker runner did not complete successfully")
+            if command.returncode:
+                try:
+                    res = self._result(container)
+                    err_detail = res.get("error") or res.get("report") if isinstance(res, dict) else None
+                except Exception:
+                    err_detail = None
+                raise WorkerError(f"Docker runner did not complete successfully: {err_detail}" if err_detail else "Docker runner did not complete successfully")
             self._checkpoint(job_id, deadline)
             if not self.runtime.disk_healthy(container, plan["disk_mb"]): raise WorkerError("Docker workspace or host disk limit reached")
 
