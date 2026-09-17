@@ -125,8 +125,7 @@ export class GrillSessionView {
     // Body based on state
     if (this.session.status === 'intake_pending' || (this.session.status === 'interviewing' && (!this.session.active_questions || this.session.active_questions.length === 0))) {
       wrapper.appendChild(this.renderWaitingState(
-        t('Worker Container Initializing Turn...', '计算容器正在初始化问答轮次...'),
-        t('Codex is reviewing your scenario intent, extracting specs from attached files, and formulating high-impact interview questions.', 'Codex 正在深入解析您的场景意图、提取附件中的规格参数，并生成具有针对性的访谈问题。')
+        t('Worker Container Initializing Turn...', '计算容器正在初始化问答轮次...')
       ));
     } else if (this.session.status === 'interviewing') {
       wrapper.appendChild(this.renderInterviewTurn());
@@ -141,14 +140,14 @@ export class GrillSessionView {
     this.container.appendChild(wrapper);
   }
 
-  private renderWaitingState(title: string, message: string): HTMLElement {
+  private renderWaitingState(title: string, message?: string): HTMLElement {
     const card = document.createElement('div');
     card.className = 'grill-card grill-loading-card';
     card.innerHTML = `
       <div class="grill-spinner"></div>
       <h3 class="loading-title">${this.escape(title)}</h3>
-      <p class="loading-desc">${this.escape(message)}</p>
-      <div class="loading-note">${t('Running in an isolated sandbox container. Resources will pause between questions.', '运行于隔离沙箱容器中。问题生成间隙资源将自动暂停以节省算力。')}</div>
+      ${message ? `<p class="loading-desc">${this.escape(message)}</p>` : ''}
+      <div class="loading-note">${t('Running in an isolated container. Resources will pause between questions.', '运行于隔离计算容器中。问题生成间隙资源将自动暂停以节省算力。')}</div>
     `;
     return card;
   }
