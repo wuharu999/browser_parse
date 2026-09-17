@@ -1,4 +1,6 @@
 import { GrillReport, GrillSession, BehaviorTreeNode } from './types';
+import { formatRobotName } from './grill_intake';
+import { t } from '../i18n';
 
 export type GrillReportTab = 'scenario' | 'capabilities' | 'architecture' | 'risk' | 'tree';
 
@@ -26,18 +28,18 @@ export class GrillReportView {
     header.innerHTML = `
       <div class="report-header-top">
         <div>
-          <span class="grill-badge status-badge completed">Report Ready</span>
-          <h1 class="report-title">${this.escape(this.session.task_intent || 'Robot Scenario Analysis')}</h1>
+          <span class="grill-badge status-badge completed">${t('Report Ready', '评估报告已就绪')}</span>
+          <h1 class="report-title">${this.escape(this.session.task_intent || t('Robot Scenario Analysis', '机器人场景分析'))}</h1>
         </div>
         <div class="report-export-actions">
-          <button type="button" class="grill-btn grill-btn-secondary" id="btn-export-json">Export JSON</button>
-          <button type="button" class="grill-btn grill-btn-secondary" id="btn-export-md">Export Markdown</button>
+          <button type="button" class="grill-btn grill-btn-secondary" id="btn-export-json">${t('Export JSON', '导出 JSON')}</button>
+          <button type="button" class="grill-btn grill-btn-secondary" id="btn-export-md">${t('Export Markdown', '导出 Markdown')}</button>
         </div>
       </div>
       <div class="report-meta">
-        <span><strong>Robot:</strong> ${this.escape(this.session.referenced_robot || 'Generic / Undefined')}</span>
-        <span><strong>Questions Answered:</strong> ${this.session.question_count} / 30</span>
-        <span><strong>Completed:</strong> ${new Date(this.session.finished_at || Date.now()).toLocaleString()}</span>
+        <span><strong>${t('Robot:', '机器人：')}</strong> ${this.escape(formatRobotName(this.session.referenced_robot))}</span>
+        <span><strong>${t('Questions Answered:', '已回答问题数：')}</strong> ${this.session.question_count} / 30</span>
+        <span><strong>${t('Completed:', '完成时间：')}</strong> ${new Date(this.session.finished_at || Date.now()).toLocaleString()}</span>
       </div>
     `;
     wrapper.appendChild(header);
@@ -47,11 +49,11 @@ export class GrillReportView {
     tabNav.className = 'grill-tabs';
 
     const tabs: Array<{ id: GrillReportTab; label: string; icon: string }> = [
-      { id: 'scenario', label: 'Scenario & Goal', icon: '🎯' },
-      { id: 'capabilities', label: 'Robot Capabilities', icon: '🤖' },
-      { id: 'architecture', label: 'System Architecture', icon: '⚙️' },
-      { id: 'risk', label: 'Risk & Evidence Matrix', icon: '🛡️' },
-      { id: 'tree', label: 'Behavior Tree Visualizer', icon: '🌲' },
+      { id: 'scenario', label: t('Scenario & Goal', '场景与目标'), icon: '🎯' },
+      { id: 'capabilities', label: t('Robot Capabilities', '机器人能力评估'), icon: '🤖' },
+      { id: 'architecture', label: t('System Architecture', '系统集成架构'), icon: '⚙️' },
+      { id: 'risk', label: t('Risk & Evidence Matrix', '风险与引证矩阵'), icon: '🛡️' },
+      { id: 'tree', label: t('Behavior Tree Visualizer', '行为树可视化'), icon: '🌲' },
     ];
 
     for (const tab of tabs) {
@@ -108,35 +110,35 @@ export class GrillReportView {
     const nodeCount = tree?.nodes?.length || 0;
 
     card.innerHTML = `
-      <h2 class="panel-heading">🎯 Confirmed Scenario & Objectives</h2>
+      <h2 class="panel-heading">${t('🎯 Confirmed Scenario & Objectives', '🎯 确认的场景与目标')}</h2>
       <div class="scenario-summary-box">
         <p class="summary-paragraph">${this.escape(summaryText)}</p>
       </div>
 
       <div class="metrics-grid">
         <div class="metric-card">
-          <div class="metric-value">${this.escape(this.session.referenced_robot || 'Not specified')}</div>
-          <div class="metric-label">Target Hardware</div>
+          <div class="metric-value">${this.escape(formatRobotName(this.session.referenced_robot))}</div>
+          <div class="metric-label">${t('Target Hardware', '目标硬件')}</div>
         </div>
         <div class="metric-card">
           <div class="metric-value">${this.session.question_count}</div>
-          <div class="metric-label">Interview Turns / Questions</div>
+          <div class="metric-label">${t('Interview Turns / Questions', '访谈轮次 / 问题数')}</div>
         </div>
         <div class="metric-card">
           <div class="metric-value">${nodeCount}</div>
-          <div class="metric-label">Modeled BT Nodes</div>
+          <div class="metric-label">${t('Modeled BT Nodes', '建模行为树节点数')}</div>
         </div>
         <div class="metric-card">
           <div class="metric-value">${this.report.risk_matrix?.risks?.length || 0}</div>
-          <div class="metric-label">Assessed Risks</div>
+          <div class="metric-label">${t('Assessed Risks', '评估风险项数')}</div>
         </div>
       </div>
 
-      <h3 class="panel-subheading">Operational Context</h3>
+      <h3 class="panel-subheading">${t('Operational Context', '运行上下文')}</h3>
       <ul class="context-list">
-        <li><strong>Task Intent:</strong> ${this.escape(this.session.task_intent)}</li>
-        <li><strong>Behavior Tree Root:</strong> <code>${this.escape(tree?.root_id || 'root')}</code></li>
-        <li><strong>Revision Index:</strong> Rev ${this.session.current_revision}</li>
+        <li><strong>${t('Task Intent:', '任务意图：')}</strong> ${this.escape(this.session.task_intent)}</li>
+        <li><strong>${t('Behavior Tree Root:', '行为树根节点：')}</strong> <code>${this.escape(tree?.root_id || 'root')}</code></li>
+        <li><strong>${t('Revision Index:', '迭代版本：')}</strong> Rev ${this.session.current_revision}</li>
       </ul>
     `;
     return card;
@@ -150,23 +152,23 @@ export class GrillReportView {
     const claims = caps?.claims || [];
 
     let html = `
-      <h2 class="panel-heading">🤖 Robot Hardware & Capabilities Assessment</h2>
-      <p class="panel-intro">${this.escape(caps?.summary || 'Analysis of robot physical capabilities, payload limits, reach, and perception suitability.')}</p>
+      <h2 class="panel-heading">${t('🤖 Robot Hardware & Capabilities Assessment', '🤖 机器人硬件与能力评估')}</h2>
+      <p class="panel-intro">${this.escape(caps?.summary || t('Analysis of robot physical capabilities, payload limits, reach, and perception suitability.', '分析机器人物理硬件能力、有效负载极限、机械臂工作半径及感知适配性。'))}</p>
     `;
 
     if (claims.length === 0) {
-      html += `<div class="empty-state">No specific hardware claims recorded.</div>`;
+      html += `<div class="empty-state">${t('No specific hardware claims recorded.', '暂无具体硬件指标断言记录。')}</div>`;
     } else {
       html += `
         <div class="claims-table-wrapper">
           <table class="grill-table">
             <thead>
               <tr>
-                <th>Status</th>
-                <th>Category</th>
-                <th>Claim / Capability</th>
-                <th>Assessment Statement</th>
-                <th>Citations</th>
+                <th>${t('Status', '状态')}</th>
+                <th>${t('Category', '分类')}</th>
+                <th>${t('Claim / Capability', '能力 / 指标断言')}</th>
+                <th>${t('Assessment Statement', '评估论断')}</th>
+                <th>${t('Citations', '引证依据')}</th>
               </tr>
             </thead>
             <tbody>
@@ -205,18 +207,18 @@ export class GrillReportView {
     const nodes = arch?.nodes || [];
 
     let html = `
-      <h2 class="panel-heading">⚙️ Proposed Integration Architecture</h2>
-      <p class="panel-intro">${this.escape(arch?.summary || 'ROS 2 software architecture, node topology, and communication graph.')}</p>
+      <h2 class="panel-heading">${t('⚙️ Proposed Integration Architecture', '⚙️ 推荐系统集成架构')}</h2>
+      <p class="panel-intro">${this.escape(arch?.summary || t('ROS 2 software architecture, node topology, and communication graph.', 'ROS 2 软件架构、节点拓扑与通信图谱。'))}</p>
       <div class="arch-meta-box">
-        <span><strong>Middleware:</strong> <code>${this.escape(arch?.middleware || 'ROS 2 Humble / CycloneDDS')}</code></span>
+        <span><strong>${t('Middleware:', '中间件：')}</strong> <code>${this.escape(arch?.middleware || 'ROS 2 Humble / CycloneDDS')}</code></span>
       </div>
     `;
 
     if (nodes.length === 0) {
-      html += `<div class="empty-state">No ROS 2 nodes defined.</div>`;
+      html += `<div class="empty-state">${t('No ROS 2 nodes defined.', '暂无 ROS 2 节点定义。')}</div>`;
     } else {
       html += `
-        <h3 class="panel-subheading">ROS 2 Nodes & Interfaces</h3>
+        <h3 class="panel-subheading">${t('ROS 2 Nodes & Interfaces', 'ROS 2 节点与接口')}</h3>
         <div class="arch-nodes-grid">
       `;
 
@@ -244,7 +246,7 @@ export class GrillReportView {
 
     if (arch?.recommendations && arch.recommendations.length > 0) {
       html += `
-        <h3 class="panel-subheading">Integration Recommendations</h3>
+        <h3 class="panel-subheading">${t('Integration Recommendations', '集成架构建议')}</h3>
         <ul class="recommendations-list">
           ${arch.recommendations.map(r => `<li>${this.escape(r)}</li>`).join('')}
         </ul>
@@ -263,23 +265,23 @@ export class GrillReportView {
     const risks = rm?.risks || [];
 
     let html = `
-      <h2 class="panel-heading">🛡️ Operational Risk & Evidence Matrix</h2>
-      <p class="panel-intro">${this.escape(rm?.summary || 'Identified failure modes, safety boundaries, and recommended mitigations.')}</p>
+      <h2 class="panel-heading">${t('🛡️ Operational Risk & Evidence Matrix', '🛡️ 运行风险与证据矩阵')}</h2>
+      <p class="panel-intro">${this.escape(rm?.summary || t('Identified failure modes, safety boundaries, and recommended mitigations.', '识别的故障模式、安全边界及推荐的缓解措施。'))}</p>
     `;
 
     if (risks.length === 0) {
-      html += `<div class="empty-state">No risk items cataloged.</div>`;
+      html += `<div class="empty-state">${t('No risk items cataloged.', '暂无编目的风险项。')}</div>`;
     } else {
       html += `
         <div class="risks-table-wrapper">
           <table class="grill-table">
             <thead>
               <tr>
-                <th>Severity</th>
-                <th>Likelihood</th>
-                <th>Hazard / Risk Title</th>
-                <th>Mitigation Strategy</th>
-                <th>Evidence / Citations</th>
+                <th>${t('Severity', '严重性')}</th>
+                <th>${t('Likelihood', '可能性')}</th>
+                <th>${t('Hazard / Risk Title', '危险源 / 风险标题')}</th>
+                <th>${t('Mitigation Strategy', '缓解策略')}</th>
+                <th>${t('Evidence / Citations', '证据 / 引证')}</th>
               </tr>
             </thead>
             <tbody>
@@ -321,12 +323,12 @@ export class GrillReportView {
     const rootId = treeData?.root_id || (nodes[0] ? nodes[0].id : 'root');
 
     let html = `
-      <h2 class="panel-heading">🌲 Behavior Tree Visualizer</h2>
-      <p class="panel-intro">Formal control flow model synthesized during the interview turns.</p>
+      <h2 class="panel-heading">${t('🌲 Behavior Tree Visualizer', '🌲 行为树可视化')}</h2>
+      <p class="panel-intro">${t('Formal control flow model synthesized during the interview turns.', '问答访谈过程中合成的形式化控制流模型。')}</p>
     `;
 
     if (nodes.length === 0) {
-      html += `<div class="empty-state">No Behavior Tree nodes recorded.</div>`;
+      html += `<div class="empty-state">${t('No Behavior Tree nodes recorded.', '暂无行为树节点记录。')}</div>`;
     } else {
       const nodeMap = new Map<string, BehaviorTreeNode>();
       for (const n of nodes) nodeMap.set(n.id, n);
@@ -345,11 +347,11 @@ export class GrillReportView {
     if (!node) return '';
 
     const iconMap: Record<string, string> = {
-      sequence: '➡️ Sequence',
-      fallback: '❓ Fallback',
-      action: '⚡ Action',
-      condition: '🔍 Condition',
-      decorator: '🔄 Decorator',
+      sequence: t('➡️ Sequence', '➡️ 顺序节点 (Sequence)'),
+      fallback: t('❓ Fallback', '❓ 选择节点 (Fallback)'),
+      action: t('⚡ Action', '⚡ 动作节点 (Action)'),
+      condition: t('🔍 Condition', '🔍 条件节点 (Condition)'),
+      decorator: t('🔄 Decorator', '🔄 装饰节点 (Decorator)'),
     };
 
     const typeLabel = iconMap[node.type] || node.type;
@@ -405,7 +407,7 @@ export class GrillReportView {
 export function generateGrillMarkdown(report: GrillReport, session: GrillSession): string {
   const lines: string[] = [];
   lines.push(`# Robot Scenario Assessment: ${session.task_intent}`);
-  lines.push(`**Target Robot:** ${session.referenced_robot || 'Not specified'}`);
+  lines.push(`**Target Robot:** ${formatRobotName(session.referenced_robot)}`);
   lines.push(`**Date:** ${new Date(session.finished_at || Date.now()).toISOString()}`);
   lines.push(`**Questions Answered:** ${session.question_count} / 30\n`);
 

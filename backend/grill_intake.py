@@ -40,6 +40,10 @@ INJECTION_OVERRIDE_PATTERNS = [
 ]
 
 KNOWN_ROBOTS = [
+    "Walker_Tienkung_DEX", "Walker Tienkung DEX", "天工行者DEX",
+    "Walker_C1_EDU共创者", "Walker_C1", "Walker C1",
+    "天工行者无界&无疆", "TienKung", "天工行者",
+    "Walker_S2_EDU探索者", "Walker_S2", "Walker S2",
     "Unitree B2", "Unitree Go2", "Unitree H1", "Unitree G1", "Unitree B1", "Unitree AlienGo",
     "Boston Dynamics Spot", "Spot", "ANYbotics ANYmal", "ANYmal",
     "UR3", "UR5", "UR10", "UR16", "UR20", "UR30", "Universal Robots",

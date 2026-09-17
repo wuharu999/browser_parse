@@ -1,10 +1,25 @@
 import { SessionCreateResponse } from './types';
+import { t } from '../i18n';
 
 export const ALLOWED_EXTENSIONS = ['.pdf', '.png', '.jpg', '.jpeg', '.webp', '.gif', '.md', '.txt'];
 
 export function isAllowedGrillExtension(filename: string): boolean {
   const ext = '.' + filename.split('.').pop()?.toLowerCase();
   return ALLOWED_EXTENSIONS.includes(ext);
+}
+
+export const SUPPORTED_ROBOTS = [
+  { id: 'Walker_Tienkung_DEX', en: 'Walker_Tienkung_DEX', zh: '天工行者DEX' },
+  { id: 'Walker_C1', en: 'Walker_C1', zh: 'Walker_C1_EDU共创者' },
+  { id: 'TienKung', en: 'TienKung', zh: '天工行者无界&无疆' },
+  { id: 'Walker_S2', en: 'Walker_S2', zh: 'Walker_S2_EDU探索者' },
+];
+
+export function formatRobotName(name: string | null | undefined): string {
+  if (!name) return t('Generic / Undefined', '通用 / 未指定');
+  const found = SUPPORTED_ROBOTS.find(r => r.id === name || r.en === name || r.zh === name);
+  if (found) return t(found.en, found.zh);
+  return name;
 }
 
 export class GrillIntakeView {
@@ -28,12 +43,13 @@ export class GrillIntakeView {
     const header = document.createElement('div');
     header.className = 'grill-header';
     header.innerHTML = `
-      <div class="grill-badge">🤖 Robot Scenario Grill Bot</div>
-      <h1 class="grill-title">Turn-based Scenario Modeling & Assessment</h1>
+      <div class="grill-badge">${t('🤖 Robot Scenario Grill Bot', '🤖 机器人场景推演')}</div>
+      <h1 class="grill-title">${t('Turn-based Scenario Modeling & Assessment', '基于多轮问答的机器人场景建模与评估')}</h1>
       <p class="grill-subtitle">
-        Enter your target robotic task. Our orchestrator will interview you through targeted, multi-choice
-        questions to formulate an explicit Behavior Tree, then deploy 3 specialist subagents to evaluate
-        hardware capabilities, integration architecture, and operational risk.
+        ${t(
+          'Enter your target robotic task. Our orchestrator will interview you through targeted, multi-choice questions to formulate an explicit Behavior Tree, then deploy 3 specialist subagents to evaluate hardware capabilities, integration architecture, and operational risk.',
+          '输入您的目标机器人任务。推演系统将通过有针对性的多选问答对您进行访谈，构建明确的行为树草案，随后调动三位专家子智能体，综合评估硬件能力、集成架构与运行风险。'
+        )}
       </p>
     `;
     wrapper.appendChild(header);
@@ -53,15 +69,18 @@ export class GrillIntakeView {
     intentGroup.className = 'grill-form-group';
     intentGroup.innerHTML = `
       <label class="grill-label" for="grill-intent">
-        Task Scenario Intent <span class="required">*</span>
+        ${t('Task Scenario Intent', '任务场景意图')} <span class="required">*</span>
       </label>
-      <div class="grill-hint">Describe what the robot needs to do, the environment, and any operational goals.</div>
+      <div class="grill-hint">${t('Describe what the robot needs to do, the environment, and any operational goals.', '描述机器人需要执行的任务、工作环境以及具体操作目标。')}</div>
     `;
     const intentInput = document.createElement('textarea');
     intentInput.id = 'grill-intent';
     intentInput.className = 'grill-textarea';
     intentInput.rows = 4;
-    intentInput.placeholder = 'e.g. Carry 5kg parts across an active warehouse floor with obstacles to packing station B. Must handle human cross-traffic and low light.';
+    intentInput.placeholder = t(
+      'e.g. Carry 5kg parts across an active warehouse floor with obstacles to packing station B. Must handle human cross-traffic and low light.',
+      '例如：使用四足机器人搬运 5kg 零件穿越有障碍物的车间，前往 B 包装工位。需应对人员穿行和弱光照环境。'
+    );
     intentGroup.appendChild(intentInput);
     formCard.appendChild(intentGroup);
 
@@ -69,31 +88,69 @@ export class GrillIntakeView {
     const robotGroup = document.createElement('div');
     robotGroup.className = 'grill-form-group';
     robotGroup.innerHTML = `
-      <label class="grill-label" for="grill-robot">Target Robot Hardware (Optional)</label>
-      <div class="grill-hint">Specify the robot model if known (e.g. Unitree B2, Boston Dynamics Spot, UR5e). Leave blank if undecided.</div>
+      <label class="grill-label" for="grill-robot">${t('Target Robot Hardware (Optional)', '目标机器人硬件（可选）')}</label>
+      <div class="grill-hint">${t(
+        'Select the target robot platform from the 4 supported models, or leave blank if undecided.',
+        '从4款支持的机器人平台中选择目标硬件，尚未确定可留空。'
+      )}</div>
     `;
-    const robotInput = document.createElement('input');
-    robotInput.id = 'grill-robot';
-    robotInput.type = 'text';
-    robotInput.className = 'grill-input';
-    robotInput.placeholder = 'e.g. Unitree B2 Quadruped';
-    robotGroup.appendChild(robotInput);
+
+    const robotSelect = document.createElement('select');
+    robotSelect.id = 'grill-robot';
+    robotSelect.className = 'grill-select';
+
+    const defaultOption = document.createElement('option');
+    defaultOption.value = '';
+    defaultOption.textContent = t('-- Undecided / Leave blank --', '-- 尚未确定 / 留空 --');
+    robotSelect.appendChild(defaultOption);
+
+    for (const r of SUPPORTED_ROBOTS) {
+      const opt = document.createElement('option');
+      opt.value = r.id;
+      opt.textContent = t(r.en, r.zh);
+      robotSelect.appendChild(opt);
+    }
+
+    const otherOption = document.createElement('option');
+    otherOption.value = '__custom__';
+    otherOption.textContent = t('Other custom model...', '其他自定义型号...');
+    robotSelect.appendChild(otherOption);
+
+    const customRobotInput = document.createElement('input');
+    customRobotInput.type = 'text';
+    customRobotInput.className = 'grill-input';
+    customRobotInput.style.display = 'none';
+    customRobotInput.style.marginTop = '8px';
+    customRobotInput.placeholder = t('Enter custom robot model name...', '输入自定义机器人型号名称...');
+
+    robotSelect.addEventListener('change', () => {
+      if (robotSelect.value === '__custom__') {
+        customRobotInput.style.display = 'block';
+        customRobotInput.focus();
+      } else {
+        customRobotInput.style.display = 'none';
+        customRobotInput.value = '';
+      }
+    });
+
+    robotGroup.appendChild(robotSelect);
+    robotGroup.appendChild(customRobotInput);
     formCard.appendChild(robotGroup);
 
     // File attachments
     const fileGroup = document.createElement('div');
     fileGroup.className = 'grill-form-group';
     fileGroup.innerHTML = `
-      <label class="grill-label">Supporting Documents & Diagrams (Optional)</label>
-      <div class="grill-hint">Attach floor plans, payload specs, sensor datasheets, or markdown notes (PDF, PNG, JPG, WebP, MD, TXT).</div>
+      <label class="grill-label">${t('Supporting Documents & Diagrams (Optional)', '支持文档与图纸（可选）')}</label>
+      <div class="grill-hint">${t('Attach floor plans, payload specs, sensor datasheets, or markdown notes (PDF, PNG, JPG, WebP, MD, TXT).', '可上传场地平面图、负载规范、传感器数据表或 Markdown 备忘（支持 PDF、PNG、JPG、WebP、MD、TXT）。')}</div>
     `;
 
     const dropZone = document.createElement('div');
     dropZone.className = 'grill-dropzone';
     dropZone.innerHTML = `
       <div class="dropzone-icon">📁</div>
-      <div class="dropzone-text">Click to select files or drag & drop here</div>
-      <div class="dropzone-types">PDF, PNG, JPG, WebP, Markdown, TXT (Max 32 MB total)</div>
+      <div class="dropzone-text">${t('Click to select files or drag & drop here', '点击选择文件或拖拽至此处')}</div>
+      <div class="dropzone-types">${t('PDF, PNG, JPG, WebP, Markdown, TXT (Max 32 MB total)', 'PDF、PNG、JPG、WebP、Markdown、TXT（总大小上限 32 MB）')}</div>
     `;
 
     const hiddenFileInput = document.createElement('input');
@@ -137,12 +194,17 @@ export class GrillIntakeView {
     const submitBtn = document.createElement('button');
     submitBtn.type = 'button';
     submitBtn.className = 'grill-btn grill-btn-primary';
-    submitBtn.textContent = 'Start Scenario Interview  →';
+    submitBtn.textContent = t('Start Scenario Interview  →', '开始场景访谈  →');
     submitBtn.addEventListener('click', () => {
       const intent = intentInput.value.trim();
-      const robot = robotInput.value.trim() || null;
+      let robot: string | null = null;
+      if (robotSelect.value === '__custom__') {
+        robot = customRobotInput.value.trim() || null;
+      } else if (robotSelect.value) {
+        robot = robotSelect.value;
+      }
       if (!intent) {
-        this.showNotice(noticeEl, 'Please enter a task scenario intent before starting.', true);
+        this.showNotice(noticeEl, t('Please enter a task scenario intent before starting.', '请在开始前填写任务场景意图。'), true);
         intentInput.focus();
         return;
       }
@@ -160,7 +222,7 @@ export class GrillIntakeView {
     for (const f of newFiles) {
       const ext = '.' + f.name.split('.').pop()?.toLowerCase();
       if (!ALLOWED_EXTENSIONS.includes(ext)) {
-        this.showNotice(noticeEl, `File "${f.name}" has unsupported format. Only ${ALLOWED_EXTENSIONS.join(', ')} are allowed.`, true);
+        this.showNotice(noticeEl, t(`File "${f.name}" has unsupported format. Only ${ALLOWED_EXTENSIONS.join(', ')} are allowed.`, `文件 "${f.name}" 格式不支持。仅支持：${ALLOWED_EXTENSIONS.join(', ')}`), true);
         continue;
       }
       if (!this.selectedFiles.some(existing => existing.name === f.name && existing.size === f.size)) {
@@ -185,7 +247,7 @@ export class GrillIntakeView {
       removeBtn.type = 'button';
       removeBtn.className = 'grill-file-remove';
       removeBtn.innerHTML = '&times;';
-      removeBtn.title = 'Remove file';
+      removeBtn.title = t('Remove file', '移除文件');
       removeBtn.addEventListener('click', () => {
         this.selectedFiles.splice(i, 1);
         this.renderFileList(listEl);
@@ -213,10 +275,10 @@ export class GrillIntakeView {
     if (this.isSubmitting) return;
     this.isSubmitting = true;
     submitBtn.disabled = true;
-    submitBtn.textContent = 'Creating private session...';
+    submitBtn.textContent = t('Creating private session...', '正在创建私密会话...');
 
     try {
-      this.showNotice(noticeEl, 'Initializing secure scenario session...', false);
+      this.showNotice(noticeEl, t('Initializing secure scenario session...', '正在初始化场景私密会话...'), false);
       const res = await fetch('/api/grill/sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -236,8 +298,8 @@ export class GrillIntakeView {
       if (this.selectedFiles.length > 0) {
         for (let i = 0; i < this.selectedFiles.length; i++) {
           const file = this.selectedFiles[i];
-          submitBtn.textContent = `Uploading file ${i + 1} of ${this.selectedFiles.length}...`;
-          this.showNotice(noticeEl, `Uploading "${file.name}"...`, false);
+          submitBtn.textContent = t(`Uploading file ${i + 1} of ${this.selectedFiles.length}...`, `正在上传第 ${i + 1} / ${this.selectedFiles.length} 个文件...`);
+          this.showNotice(noticeEl, t(`Uploading "${file.name}"...`, `正在上传 "${file.name}"...`), false);
 
           const uploadRes = await fetch(`/api/grill/sessions/${sessionId}/files?name=${encodeURIComponent(file.name)}`, {
             method: 'PUT',
@@ -254,14 +316,14 @@ export class GrillIntakeView {
         }
       }
 
-      this.showNotice(noticeEl, 'Session ready! Launching interview...', false);
+      this.showNotice(noticeEl, t('Session ready! Launching interview...', '会话已就绪！正在启动访谈...'), false);
       // Navigate to the private session link
       this.onNavigate(`/grill/s/${token}`);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      this.showNotice(noticeEl, `Error: ${msg}`, true);
+      this.showNotice(noticeEl, `${t('Error', '错误')}: ${msg}`, true);
       submitBtn.disabled = false;
-      submitBtn.textContent = 'Start Scenario Interview  →';
+      submitBtn.textContent = t('Start Scenario Interview  →', '开始场景访谈  →');
       this.isSubmitting = false;
     }
   }

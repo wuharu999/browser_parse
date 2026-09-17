@@ -290,8 +290,9 @@ summary { cursor: pointer; color: #70809a; }
 .grill-label { display: block; font-size: 0.88rem; font-weight: 600; color: #1e293b; margin-bottom: 6px; }
 .grill-label .required { color: #ef4444; }
 .grill-hint { font-size: 0.78rem; color: #64748b; margin-bottom: 8px; }
-.grill-textarea, .grill-input { width: 100%; border: 1px solid #cbd5e1; border-radius: 8px; padding: 10px 14px; font-size: 0.9rem; color: #0f172a; background: #fff; transition: border-color 0.15s, box-shadow 0.15s; }
-.grill-textarea:focus, .grill-input:focus { border-color: #0284c7; box-shadow: 0 0 0 3px rgba(14, 165, 233, 0.15); outline: none; }
+.grill-textarea, .grill-input, .grill-select { width: 100%; border: 1px solid #cbd5e1; border-radius: 8px; padding: 10px 14px; font-size: 0.9rem; color: #0f172a; background: #fff; transition: border-color 0.15s, box-shadow 0.15s; }
+.grill-textarea:focus, .grill-input:focus, .grill-select:focus { border-color: #0284c7; box-shadow: 0 0 0 3px rgba(14, 165, 233, 0.15); outline: none; }
+.grill-select { cursor: pointer; }
 .grill-textarea { resize: vertical; min-height: 90px; line-height: 1.5; }
 
 /* Buttons */

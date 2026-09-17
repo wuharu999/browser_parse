@@ -1,5 +1,7 @@
 import { CustomerAnswer, GrillSession } from './types';
 import { GrillReportView } from './grill_report';
+import { formatRobotName } from './grill_intake';
+import { t } from '../i18n';
 
 export class GrillSessionView {
   private token: string;
@@ -27,7 +29,7 @@ export class GrillSessionView {
   }
 
   public async start(): Promise<void> {
-    this.renderLoading('Connecting to scenario session...');
+    this.renderLoading(t('Connecting to scenario session...', '正在连接场景推演会话...'));
     await this.fetchSession();
   }
 
@@ -45,9 +47,9 @@ export class GrillSessionView {
       const res = await fetch(`/api/grill/session-by-token?token=${encodeURIComponent(this.token)}`);
       if (!res.ok) {
         if (res.status === 404 || res.status === 403) {
-          throw new Error('Session not found or invalid token. Please check your link.');
+          throw new Error(t('Session not found or invalid token. Please check your link.', '推演会话未找到或访问令牌无效，请检查链接。'));
         }
-        throw new Error(`Failed to load session: HTTP ${res.status}`);
+        throw new Error(t(`Failed to load session: HTTP ${res.status}`, `加载会话失败：HTTP ${res.status}`));
       }
 
       const data: GrillSession = await res.json();
@@ -92,15 +94,25 @@ export class GrillSessionView {
     const questionLimit = 30;
     const progressPercent = Math.min(100, Math.round((this.session.question_count / questionLimit) * 100));
 
+    const statusMap: Record<string, string> = {
+      intake_pending: t('Initializing', '初始化中'),
+      interviewing: t('Interviewing', '推演访谈中'),
+      ready_for_confirmation: t('Ready for Confirmation', '待客户确认'),
+      analyzing: t('Analyzing', '专家分析中'),
+      completed: t('Completed', '已完成'),
+      failed: t('Failed', '失败'),
+    };
+    const statusText = statusMap[this.session.status] || this.session.status.replace(/_/g, ' ').toUpperCase();
+
     header.innerHTML = `
       <div class="session-top-meta">
         <div>
-          <span class="grill-badge ${statusBadgeClass}">${this.session.status.replace(/_/g, ' ').toUpperCase()}</span>
+          <span class="grill-badge ${statusBadgeClass}">${statusText}</span>
           <h1 class="session-intent">${this.escape(this.session.task_intent)}</h1>
-          ${this.session.referenced_robot ? `<div class="session-robot">Target Robot: <strong>${this.escape(this.session.referenced_robot)}</strong></div>` : ''}
+          ${this.session.referenced_robot ? `<div class="session-robot">${t('Target Robot:', '目标机器人：')} <strong>${this.escape(formatRobotName(this.session.referenced_robot))}</strong></div>` : ''}
         </div>
         <div class="session-counter-box">
-          <div class="counter-label">Question Budget</div>
+          <div class="counter-label">${t('Question Budget', '问题配额')}</div>
           <div class="counter-val">${this.session.question_count} <span class="counter-max">/ ${questionLimit}</span></div>
           <div class="progress-bar-bg">
             <div class="progress-bar-fill" style="width: ${progressPercent}%"></div>
@@ -112,7 +124,10 @@ export class GrillSessionView {
 
     // Body based on state
     if (this.session.status === 'intake_pending' || (this.session.status === 'interviewing' && (!this.session.active_questions || this.session.active_questions.length === 0))) {
-      wrapper.appendChild(this.renderWaitingState('Worker Container Initializing Turn...', 'Codex is reviewing your scenario intent, extracting specs from attached files, and formulating high-impact interview questions.'));
+      wrapper.appendChild(this.renderWaitingState(
+        t('Worker Container Initializing Turn...', '计算容器正在初始化问答轮次...'),
+        t('Codex is reviewing your scenario intent, extracting specs from attached files, and formulating high-impact interview questions.', 'Codex 正在深入解析您的场景意图、提取附件中的规格参数，并生成具有针对性的访谈问题。')
+      ));
     } else if (this.session.status === 'interviewing') {
       wrapper.appendChild(this.renderInterviewTurn());
     } else if (this.session.status === 'ready_for_confirmation') {
@@ -133,7 +148,7 @@ export class GrillSessionView {
       <div class="grill-spinner"></div>
       <h3 class="loading-title">${this.escape(title)}</h3>
       <p class="loading-desc">${this.escape(message)}</p>
-      <div class="loading-note">Running in an isolated sandbox container. Resources will pause between questions.</div>
+      <div class="loading-note">${t('Running in an isolated sandbox container. Resources will pause between questions.', '运行于隔离沙箱容器中。问题生成间隙资源将自动暂停以节省算力。')}</div>
     `;
     return card;
   }
@@ -151,8 +166,8 @@ export class GrillSessionView {
     const turnIntro = document.createElement('div');
     turnIntro.className = 'turn-intro';
     turnIntro.innerHTML = `
-      <h2 class="turn-title">Interview Batch (${questions.length} question${questions.length > 1 ? 's' : ''})</h2>
-      <p class="turn-subtitle">Select an option, enter custom specs, or click "Not sure" for each question below.</p>
+      <h2 class="turn-title">${t(`Interview Batch (${questions.length} question${questions.length > 1 ? 's' : ''})`, `本轮访谈问答（共 ${questions.length} 题）`)}</h2>
+      <p class="turn-subtitle">${t('Select an option, enter custom specs, or click "Not sure" for each question below.', '请为以下问题选择一个选项、输入自定义规格，或点击“我不确定”。')}</p>
     `;
     turnCard.appendChild(turnIntro);
 
@@ -171,8 +186,8 @@ export class GrillSessionView {
 
       qCard.innerHTML = `
         <div class="question-header">
-          <span class="question-num">Question ${i + 1}</span>
-          ${q.why ? `<span class="question-why">💡 Why: ${this.escape(q.why)}</span>` : ''}
+          <span class="question-num">${t('Question', '问题')} ${i + 1}</span>
+          ${q.why ? `<span class="question-why">💡 ${t('Why:', '提问原因：')} ${this.escape(q.why)}</span>` : ''}
         </div>
         <div class="question-text">${this.escape(q.text)}</div>
       `;
@@ -209,7 +224,7 @@ export class GrillSessionView {
         unknownBtn.type = 'button';
         const isUnknown = !!currentAns.is_unknown;
         unknownBtn.className = `option-pill option-unknown ${isUnknown ? 'selected' : ''}`;
-        unknownBtn.innerHTML = `<span class="opt-unknown-icon">❓</span> <strong>I don't know / Not sure</strong>`;
+        unknownBtn.innerHTML = `<span class="opt-unknown-icon">❓</span> <strong>${t("I don't know / Not sure", '我不确定 / 暂无规定')}</strong>`;
         unknownBtn.addEventListener('click', () => {
           this.answers.set(q.id, {
             question_id: q.id,
@@ -231,7 +246,7 @@ export class GrillSessionView {
         const freeInput = document.createElement('input');
         freeInput.type = 'text';
         freeInput.className = 'grill-input free-text-input';
-        freeInput.placeholder = 'Or enter custom specification (Other)...';
+        freeInput.placeholder = t('Or enter custom specification (Other)...', '或输入自定义规格（其他）...');
         freeInput.value = currentAns.free_text_answer || '';
 
         freeInput.addEventListener('input', () => {
@@ -267,7 +282,7 @@ export class GrillSessionView {
     const submitBtn = document.createElement('button');
     submitBtn.type = 'button';
     submitBtn.className = 'grill-btn grill-btn-primary';
-    submitBtn.textContent = 'Submit Batch Answers  →';
+    submitBtn.textContent = t('Submit Batch Answers  →', '提交本轮回答  →');
     submitBtn.addEventListener('click', () => this.submitTurn(noticeEl, submitBtn));
 
     actions.appendChild(submitBtn);
@@ -290,7 +305,7 @@ export class GrillSessionView {
       const hasUnknown = !!ans?.is_unknown;
 
       if (!hasOption && !hasFree && !hasUnknown) {
-        this.showNotice(noticeEl, `Please provide an answer or click "Not sure" for: "${q.text}"`, true);
+        this.showNotice(noticeEl, t(`Please provide an answer or click "Not sure" for: "${q.text}"`, `请为以下问题提供答案或点击“我不确定”：“${q.text}”`), true);
         return;
       }
 
@@ -304,7 +319,7 @@ export class GrillSessionView {
 
     this.isSubmitting = true;
     submitBtn.disabled = true;
-    submitBtn.textContent = 'Submitting answers...';
+    submitBtn.textContent = t('Submitting answers...', '正在提交回答...');
 
     try {
       const res = await fetch(`/api/grill/sessions/${this.session?.id}/turns`, {
@@ -329,9 +344,9 @@ export class GrillSessionView {
       this.schedulePoll(2000);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      this.showNotice(noticeEl, `Error submitting answers: ${msg}`, true);
+      this.showNotice(noticeEl, t(`Error submitting answers: ${msg}`, `提交回答失败：${msg}`), true);
       submitBtn.disabled = false;
-      submitBtn.textContent = 'Submit Batch Answers  →';
+      submitBtn.textContent = t('Submit Batch Answers  →', '提交本轮回答  →');
       this.isSubmitting = false;
     }
   }
@@ -351,31 +366,33 @@ export class GrillSessionView {
 
     card.innerHTML += `
       <div class="confirmation-header">
-        <span class="grill-badge badge-success">✓ Scenario Ready for Confirmation</span>
-        <h2 class="confirm-title">Review Scenario Readback Summary</h2>
+        <span class="grill-badge badge-success">${t('✓ Scenario Ready for Confirmation', '✓ 场景就绪，等待确认')}</span>
+        <h2 class="confirm-title">${t('Review Scenario Readback Summary', '审阅场景确认摘要（Readback）')}</h2>
         <p class="confirm-subtitle">
-          The interview has captured the critical operational boundaries. Please review the summary below.
-          Once confirmed, 3 specialist subagents (Capability, Architecture, Risk) will run in parallel to generate the final report.
+          ${t(
+            'The interview has captured the critical operational boundaries. Please review the summary below. Once confirmed, 3 specialist subagents (Capability, Architecture, Risk) will run in parallel to generate the final report.',
+            '访谈已充分捕捉关键运行边界与约束。请审阅下方摘要。确认后，3位专家子智能体（硬件能力、系统架构、运行风险）将并行推演以生成最终评估报告。'
+          )}
         </p>
       </div>
 
       <div class="readback-box">
-        <div class="readback-label">Confirmed Scenario Readback:</div>
+        <div class="readback-label">${t('Confirmed Scenario Readback:', '已确认场景摘要：')}</div>
         <p class="readback-text">${this.escape(summaryText)}</p>
       </div>
 
       <div class="bt-summary-preview">
-        <strong>Modeled Behavior Tree:</strong> ${nodeCount} nodes synthesized (Root: <code>${this.escape(tree?.root_id || 'root')}</code>)
+        <strong>${t('Modeled Behavior Tree:', '建模行为树：')}</strong> ${nodeCount} ${t('nodes synthesized', '个节点已合成')} (Root: <code>${this.escape(tree?.root_id || 'root')}</code>)
       </div>
 
       <div class="grill-form-group confirm-notes-group">
-        <label class="grill-label" for="confirm-notes">Additional Customer Notes (Optional)</label>
-        <textarea id="confirm-notes" class="grill-textarea" rows="3" placeholder="Any final clarifications or emphasis for the specialist agents...">${this.escape(this.confirmationNote)}</textarea>
+        <label class="grill-label" for="confirm-notes">${t('Additional Customer Notes (Optional)', '补充说明 / 客户批注（可选）')}</label>
+        <textarea id="confirm-notes" class="grill-textarea" rows="3" placeholder="${t('Any final clarifications or emphasis for the specialist agents...', '可输入对专家智能体的补充说明、特别侧重点或约束要求...')}">${this.escape(this.confirmationNote)}</textarea>
       </div>
 
       <div class="confirm-actions">
         <button type="button" class="grill-btn grill-btn-primary btn-confirm-launch" id="btn-confirm">
-          Confirm Scenario & Generate Final Report  🚀
+          ${t('Confirm Scenario & Generate Final Report  🚀', '确认场景并启动专家综合推演  🚀')}
         </button>
       </div>
     `;
@@ -395,7 +412,7 @@ export class GrillSessionView {
     if (this.isSubmitting) return;
     this.isSubmitting = true;
     confirmBtn.disabled = true;
-    confirmBtn.textContent = 'Launching Specialist Subagents...';
+    confirmBtn.textContent = t('Launching Specialist Subagents...', '正在启动专家子智能体...');
 
     try {
       const res = await fetch(`/api/grill/sessions/${this.session?.id}/confirm`, {
@@ -419,9 +436,9 @@ export class GrillSessionView {
       this.schedulePoll(2000);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      this.showNotice(noticeEl, `Error confirming scenario: ${msg}`, true);
+      this.showNotice(noticeEl, t(`Error confirming scenario: ${msg}`, `确认场景失败：${msg}`), true);
       confirmBtn.disabled = false;
-      confirmBtn.textContent = 'Confirm Scenario & Generate Final Report  🚀';
+      confirmBtn.textContent = t('Confirm Scenario & Generate Final Report  🚀', '确认场景并启动专家综合推演  🚀');
       this.isSubmitting = false;
     }
   }
@@ -431,32 +448,32 @@ export class GrillSessionView {
     card.className = 'grill-card grill-analyzing-card';
     card.innerHTML = `
       <div class="grill-spinner"></div>
-      <h2 class="analyzing-title">Specialist Subagents Evaluating Scenario</h2>
-      <p class="analyzing-subtitle">Three specialist analysts are assessing technical feasibility in parallel:</p>
+      <h2 class="analyzing-title">${t('Specialist Subagents Evaluating Scenario', '专家子智能体正在评估场景')}</h2>
+      <p class="analyzing-subtitle">${t('Three specialist analysts are assessing technical feasibility in parallel:', '三位专业分析师正并行评估技术可行性：')}</p>
 
       <div class="specialist-cards-grid">
         <div class="specialist-card">
           <div class="specialist-icon">🤖</div>
-          <strong class="specialist-name">Capability Analyst</strong>
-          <div class="specialist-desc">Verifying payload, reach, sensor envelope, and hardware constraints.</div>
-          <div class="specialist-badge">Running</div>
+          <strong class="specialist-name">${t('Capability Analyst', '硬件能力分析师')}</strong>
+          <div class="specialist-desc">${t('Verifying payload, reach, sensor envelope, and hardware constraints.', '验证有效负载、机械臂工作半径、传感器包络及硬件物理约束。')}</div>
+          <div class="specialist-badge">${t('Running', '推演中')}</div>
         </div>
 
         <div class="specialist-card">
           <div class="specialist-icon">⚙️</div>
-          <strong class="specialist-name">Integration Analyst</strong>
-          <div class="specialist-desc">Synthesizing ROS 2 packages, node topologies, and topic contracts.</div>
-          <div class="specialist-badge">Running</div>
+          <strong class="specialist-name">${t('Integration Analyst', '系统集成分析师')}</strong>
+          <div class="specialist-desc">${t('Synthesizing ROS 2 packages, node topologies, and topic contracts.', '生成 ROS 2 软件包拓扑、节点通信契约与消息管道。')}</div>
+          <div class="specialist-badge">${t('Running', '推演中')}</div>
         </div>
 
         <div class="specialist-card">
           <div class="specialist-icon">🛡️</div>
-          <strong class="specialist-name">Risk & Evidence Analyst</strong>
-          <div class="specialist-desc">Evaluating failure recovery, safety boundaries, and wiki citations.</div>
-          <div class="specialist-badge">Running</div>
+          <strong class="specialist-name">${t('Risk & Evidence Analyst', '风险与证据分析师')}</strong>
+          <div class="specialist-desc">${t('Evaluating failure recovery, safety boundaries, and wiki citations.', '评估故障自愈机制、安全运行边界与知识库引证。')}</div>
+          <div class="specialist-badge">${t('Running', '推演中')}</div>
         </div>
       </div>
-      <div class="analyzing-note">This typically completes in ~15–30 seconds. Your report will appear automatically.</div>
+      <div class="analyzing-note">${t('This typically completes in ~15–30 seconds. Your report will appear automatically.', '专家综合推演通常耗时约 15–30 秒。评估报告生成后将自动展示。')}</div>
     `;
     return card;
   }
@@ -465,9 +482,9 @@ export class GrillSessionView {
     const card = document.createElement('div');
     card.className = 'grill-card grill-failed-card';
     card.innerHTML = `
-      <h2 class="failed-title">⚠️ Session Failed</h2>
-      <p class="failed-desc">${this.escape(this.session?.error_message || 'An error occurred during turn processing.')}</p>
-      <button type="button" class="grill-btn grill-btn-secondary" id="btn-restart">Start New Interview</button>
+      <h2 class="failed-title">${t('⚠️ Session Failed', '⚠️ 会话处理失败')}</h2>
+      <p class="failed-desc">${this.escape(this.session?.error_message || t('An error occurred during turn processing.', '轮次处理过程中发生错误。'))}</p>
+      <button type="button" class="grill-btn grill-btn-secondary" id="btn-restart">${t('Start New Interview', '发起新访谈')}</button>
     `;
     const restartBtn = card.querySelector('#btn-restart');
     restartBtn?.addEventListener('click', () => this.onNavigate('/grill'));
@@ -487,9 +504,9 @@ export class GrillSessionView {
     const card = document.createElement('div');
     card.className = 'grill-card grill-failed-card';
     card.innerHTML = `
-      <h2 class="failed-title">Access Error</h2>
+      <h2 class="failed-title">${t('Access Error', '访问错误')}</h2>
       <p class="failed-desc">${this.escape(msg)}</p>
-      <button type="button" class="grill-btn grill-btn-primary" id="btn-back-grill">Back to Grill Home</button>
+      <button type="button" class="grill-btn grill-btn-primary" id="btn-back-grill">${t('Back to Grill Home', '返回推演首页')}</button>
     `;
     const btn = card.querySelector('#btn-back-grill');
     btn?.addEventListener('click', () => this.onNavigate('/grill'));
