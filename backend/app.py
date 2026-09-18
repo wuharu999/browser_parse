@@ -69,7 +69,7 @@ class SanitizeJob(BaseModel):
 
 class Finish(BaseModel):
     status: Literal["completed", "failed", "cancelled"]
-    report: str = Field(max_length=20000)
+    report: str = Field(max_length=500000)  # grill reports carry full scenario JSON; regular jobs truncated by store.clean_report()
     cost_usd: float | None = Field(default=None, ge=0, le=100000)
     metrics: dict[str, Any] = Field(default_factory=dict)
     analysis_context: Any | None = None
