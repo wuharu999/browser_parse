@@ -922,6 +922,15 @@ class GrillStore:
             ).fetchall()
 
             for r in rows:
+                # If there is an active task currently queued or running for this session,
+                # Codex is actively generating a response! Do not run the idle hibernation countdown.
+                active_task = self.db.execute(
+                    "SELECT id FROM grill_tasks WHERE session_id = ? AND status IN ('queued', 'running', 'leased')",
+                    (r["id"],),
+                ).fetchone()
+                if active_task:
+                    continue
+
                 if r["status"] == "interviewing":
                     try:
                         questions = json.loads(r["active_questions"]) if r["active_questions"] else []

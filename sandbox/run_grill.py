@@ -89,6 +89,11 @@ def build_turn_prompt(
         "  3. TienKung (天工行者无界&无疆)",
         "  4. Walker_S2_EDU (Walker_S2_EDU探索者)",
         "  Codex must not recommend or assume any external or unsupported robot hardware.",
+        "",
+        "Accessible Robot Knowledge & Wikis:",
+        "- Hardware manuals, platform specifications, and kinematics/sensor capability docs for the 4 supported robot models are located under `/workspace/wiki/`.",
+        "- You MUST check `/workspace/wiki/` (e.g. read markdown files directly under /workspace/wiki/ or search using python3 /workspace/evidence.py search) to resolve robot hardware constraints (payload limits, reaching height, arm degrees of freedom, camera sensors, ROS2 interfaces).",
+        "- Do NOT repeatedly ask the customer about hardware specifications that are already documented in the engineering wikis!",
     ]
 
     if question_count >= 25:
@@ -545,9 +550,9 @@ def _write_config(model: str) -> None:
         pass
     home = WORKSPACE / ".codex"
     home.mkdir(parents=True, exist_ok=True)
-    reasoning_effort = os.environ.get("ROBOT_CODEX_REASONING_EFFORT", "high").strip().lower()
+    reasoning_effort = os.environ.get("ROBOT_CODEX_REASONING_EFFORT", "medium").strip().lower()
     if reasoning_effort not in {"low", "medium", "high", "max"}:
-        reasoning_effort = "high"
+        reasoning_effort = "medium"
     lines = [
         f"model = {json.dumps(model)}",
         f"model_reasoning_effort = {json.dumps(reasoning_effort)}",

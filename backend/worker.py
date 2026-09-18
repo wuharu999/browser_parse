@@ -360,6 +360,7 @@ class DockerWorker:
             "VIRTUAL_ENV": "/opt/analysis-venv",
             "PYTHONPATH": "/workspace:/opt/sandbox",
             "PATH": "/opt/analysis-venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "ROBOT_CODEX_REASONING_EFFORT": os.environ.get("ROBOT_CODEX_REASONING_EFFORT", "medium"),
         }
         if self.config.codex_provider_url:
             values["CODEX_PROVIDER_URL"] = self.config.codex_provider_url
@@ -508,7 +509,7 @@ class DockerWorker:
         raise CleanupUnconfirmed("Docker cleanup was not confirmed; worker stops before claiming another job")
 
     def _result(self, container: DockerJob) -> dict[str, Any]:
-        raw = self.runtime.copy_out_text(container, "/workspace/result.json", 96 * 1024)
+        raw = self.runtime.copy_out_text(container, "/workspace/result.json", 1024 * 1024)
         if raw is None: raise WorkerError("Docker runner result is unavailable")
         value = json.loads(raw)
         if not isinstance(value, dict):
@@ -611,6 +612,8 @@ class DockerWorker:
             existing_warm = self.grill_containers.get(session_id) if is_grill else None
 
             if existing_warm is not None and not is_resumed:
+                existing_warm["is_busy"] = True
+                existing_warm["last_activity"] = time.time()
                 if is_grill:
                     self._event(job_id, "progress", "[stage:reusing_container] Warm container found, loading turn data...")
                 container = existing_warm["container"]
@@ -733,6 +736,7 @@ class DockerWorker:
                     "session_id": session_id,
                     "last_activity": time.time(),
                     "plan": plan,
+                    "is_busy": False,
                 }
                 container = None
             else:
@@ -792,6 +796,8 @@ class DockerWorker:
         hibernated_sessions: list[str] = []
 
         for session_id, info in list(self.grill_containers.items()):
+            if info.get("is_busy"):
+                continue
             idle_seconds = now - info["last_activity"]
             if idle_seconds >= self.idle_timeout_seconds:
                 container = info["container"]
