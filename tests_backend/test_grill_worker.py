@@ -84,3 +84,85 @@ def test_grill_turn_runner_execution(tmp_path):
         assert len(report["risk_matrix"]["risks"]) > 0
     finally:
         run_grill.WORKSPACE = original_workspace
+
+
+def test_grill_turn_runner_writes_codex_config(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace_cfg"
+    workspace.mkdir()
+
+    monkeypatch.setenv("CODEX_PROVIDER_URL", "https://api.deepseek.com")
+    monkeypatch.setenv("ROBOT_CODEX_MODEL", "deepseek-flash")
+    monkeypatch.setenv("CODEX_PROVIDER_ENV_KEY", "DEEPSEEK_API_KEY")
+
+    job = {
+        "job_type": "grill",
+        "action": "turn",
+        "session_id": "grill_cfg_test",
+        "turn_index": 1,
+        "task_intent": "Inspect warehouse",
+        "referenced_robot": "Walker_Tienkung_DEX",
+        "scenario_state": None,
+        "customer_answers": [],
+    }
+
+    original_workspace = run_grill.WORKSPACE
+    try:
+        run_grill.WORKSPACE = workspace
+        ret = run_grill.run_grill(job)
+        assert ret == 0
+
+        config_path = workspace / ".codex" / "config.toml"
+        assert config_path.is_file()
+        content = config_path.read_text()
+        assert 'model_provider = "sandbox-provider"' in content
+        assert "https://api.deepseek.com" in content
+        assert 'model = "deepseek-flash"' in content
+
+        # DeepSeek catalog should be generated
+        models_path = workspace / ".codex" / "models.json"
+        assert models_path.is_file()
+        models_data = json.loads(models_path.read_text())
+        assert any(m["slug"] == "deepseek-flash" for m in models_data.get("models", []))
+    finally:
+        run_grill.WORKSPACE = original_workspace
+
+
+def test_run_codex_grill_writes_config(tmp_path, monkeypatch):
+    from sandbox import run_codex
+    workspace = tmp_path / "workspace_rc"
+    workspace.mkdir()
+
+    monkeypatch.setenv("CODEX_PROVIDER_URL", "https://api.deepseek.com")
+    monkeypatch.setenv("ROBOT_CODEX_MODEL", "deepseek-flash")
+    monkeypatch.setenv("CODEX_PROVIDER_ENV_KEY", "DEEPSEEK_API_KEY")
+
+    job = {
+        "job_type": "grill",
+        "action": "turn",
+        "session_id": "codex_grill_test",
+        "turn_index": 1,
+        "task_intent": "Move pallet",
+        "referenced_robot": "Walker_Tienkung_DEX",
+        "scenario_state": None,
+        "customer_answers": [],
+    }
+    job_file = tmp_path / "job.json"
+    job_file.write_text(json.dumps(job))
+
+    monkeypatch.setattr("sys.argv", ["run_codex.py", str(job_file)])
+    orig_rc_ws = run_codex.WORKSPACE
+    orig_rg_ws = run_grill.WORKSPACE
+    try:
+        run_codex.WORKSPACE = workspace
+        run_grill.WORKSPACE = workspace
+        ret = run_codex.main()
+        assert ret == 0
+        config_path = workspace / ".codex" / "config.toml"
+        assert config_path.is_file()
+        content = config_path.read_text()
+        assert 'model_provider = "sandbox-provider"' in content
+        assert "https://api.deepseek.com" in content
+    finally:
+        run_codex.WORKSPACE = orig_rc_ws
+        run_grill.WORKSPACE = orig_rg_ws
+

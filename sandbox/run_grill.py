@@ -535,6 +535,71 @@ def generate_fallback_report(
     }
 
 
+def _write_config(model: str) -> None:
+    # Delegate to run_codex._write_config if available
+    try:
+        from run_codex import _write_config as rc_write_config
+        rc_write_config(model)
+        return
+    except Exception:
+        pass
+    home = WORKSPACE / ".codex"
+    home.mkdir(parents=True, exist_ok=True)
+    reasoning_effort = os.environ.get("ROBOT_CODEX_REASONING_EFFORT", "high").strip().lower()
+    if reasoning_effort not in {"low", "medium", "high", "max"}:
+        reasoning_effort = "high"
+    lines = [
+        f"model = {json.dumps(model)}",
+        f"model_reasoning_effort = {json.dumps(reasoning_effort)}",
+    ]
+    provider_url = os.environ.get("CODEX_PROVIDER_URL")
+    key_env = os.environ.get("CODEX_PROVIDER_ENV_KEY", "OPENAI_API_KEY")
+    deepseek_modalities = {
+        "deepseek-flash": ["text", "image"],
+        "deepseek-v4.1-flash": ["text", "image"],
+        "deepseek-v4-flash": ["text"],
+        "deepseek-v4-pro": ["text"],
+        "deepseek-v4-flash-vision-exp": ["text", "image"],
+    }
+    if provider_url and model in deepseek_modalities:
+        catalog = {"models": [{
+            "slug": model, "display_name": model, "description": "DeepSeek Responses API",
+            "base_instructions": "You are Codex. Follow the user's task instructions, use available tools when needed, and provide concise, accurate results.",
+            "default_reasoning_level": reasoning_effort,
+            "supported_reasoning_levels": [{"effort": value, "description": value} for value in ("low", "high", "max")],
+            "shell_type": "shell_command", "visibility": "list", "supported_in_api": True,
+            "priority": 1, "availability_nux": None, "upgrade": None,
+            "support_verbosity": True, "default_verbosity": "low",
+            "apply_patch_tool_type": "freeform", "web_search_tool_type": "text",
+            "truncation_policy": {"mode": "tokens", "limit": 10000},
+            "context_window": 1048576, "max_context_window": 1048576,
+            "effective_context_window_percent": 95, "experimental_supported_tools": [],
+            "input_modalities": deepseek_modalities[model],
+            "supports_image_detail_original": "image" in deepseek_modalities[model],
+            "default_reasoning_summary": "none", "supports_search_tool": False,
+            "use_responses_lite": False, "multi_agent_version": "v2",
+        }]}
+        catalog_path = home / "models.json"
+        catalog_path.write_text(json.dumps(catalog))
+        lines += [f"model_catalog_json = {json.dumps(str(catalog_path))}",
+                  'web_search = "disabled"',
+                  'forced_login_method = "api"']
+    if provider_url:
+        lines += [
+            'model_provider = "sandbox-provider"',
+            "[model_providers.sandbox-provider]",
+            'name = "Sandbox provider"',
+            f"base_url = {json.dumps(provider_url)}",
+            f"env_key = {json.dumps(key_env)}",
+            'wire_api = "responses"',
+            "requires_openai_auth = false",
+            "supports_websockets = false",
+        ]
+    lines += ["[agents]", "enabled = true", "max_concurrent_threads_per_session = 3"]
+    (home / "config.toml").write_text("\n".join(lines) + "\n")
+    os.environ["CODEX_HOME"] = str(home)
+
+
 def run_grill(job: dict[str, Any], started: float | None = None) -> int:
     started_time = started or time.monotonic()
     action = job.get("action", "turn")
@@ -545,6 +610,12 @@ def run_grill(job: dict[str, Any], started: float | None = None) -> int:
     customer_answers = job.get("customer_answers") or []
     previous_state = job.get("scenario_state")
     question_count = int(job.get("question_count", 0))
+
+    model = os.environ.get("ROBOT_CODEX_MODEL") or os.environ.get("CODEX_MODEL") or "deepseek-flash"
+    try:
+        _write_config(model)
+    except Exception:
+        pass
 
     try:
         # Index wiki if present
@@ -577,7 +648,9 @@ def run_grill(job: dict[str, Any], started: float | None = None) -> int:
                     question_count=question_count,
                 )
                 final_out = WORKSPACE / "codex_turn_output.json"
-                model = os.environ.get("CODEX_MODEL", "gpt-5.6-luna")
+                _write_config(model)
+                run_env = os.environ.copy()
+                run_env["CODEX_HOME"] = str(WORKSPACE / ".codex")
                 try:
                     proc = subprocess.run(
                         [
@@ -590,6 +663,7 @@ def run_grill(job: dict[str, Any], started: float | None = None) -> int:
                         capture_output=True,
                         timeout=int(os.environ.get("ROBOT_RUN_TIMEOUT_SECONDS", "180")),
                         cwd=WORKSPACE,
+                        env=run_env,
                     )
                     if proc.returncode == 0 and final_out.is_file():
                         raw_content = final_out.read_text(errors="replace")

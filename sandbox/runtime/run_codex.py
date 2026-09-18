@@ -653,7 +653,9 @@ def main() -> int:
         job = json.loads(Path(sys.argv[1]).read_text())
         if not isinstance(job, dict):
             raise ValueError("job JSON must be an object")
-        if job.get("job_type") == "grill":
+        model = os.environ.get("ROBOT_CODEX_MODEL") or os.environ.get("CODEX_MODEL") or "deepseek-flash"
+        _write_config(model)
+        if job.get("job_type") == "grill" or job.get("mode") == "grill" or str(job.get("id", "")).startswith("gtask_"):
             for p in ["/workspace", str(WORKSPACE), "."]:
                 if p not in sys.path:
                     sys.path.insert(0, p)
@@ -662,11 +664,9 @@ def main() -> int:
             except ImportError:
                 from sandbox import run_grill
             return run_grill.run_grill(job, started)
-        model = os.environ.get("CODEX_MODEL", "gpt-5.6-luna")
         _assemble_inputs(job)
         if (WORKSPACE / "wiki").is_dir():
             subprocess.run(["python3", "/workspace/evidence.py", "--workspace", "/workspace", "index"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=False)
-        _write_config(model)
         # Arguments are fixed; untrusted job data is sent through stdin, never a shell.
         final_output = WORKSPACE / "final-report.txt"
         process = subprocess.Popen(

@@ -353,8 +353,12 @@ class DockerRuntime:
         self._run(["start", job.container])
 
     def exec_runner(self, job: DockerJob) -> subprocess.Popen:
-        return subprocess.Popen(["docker", "exec", job.container, PYTHON,
-                                 "/opt/sandbox/run_codex.py", "/workspace/job.json"],
+        runner_cmd = (
+            "import os, sys; "
+            "p = '/workspace/run_codex.py' if os.path.exists('/workspace/run_codex.py') else '/opt/sandbox/run_codex.py'; "
+            "os.execv(sys.executable, [sys.executable, p, '/workspace/job.json'])"
+        )
+        return subprocess.Popen(["docker", "exec", job.container, PYTHON, "-c", runner_cmd],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def copy_out_text(self, job: DockerJob, path: str, maximum: int = 256 * 1024) -> str | None:
