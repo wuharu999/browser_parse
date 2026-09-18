@@ -501,6 +501,33 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None, gri
         )
         return record
 
+    def _enrich_grill_session(sess: dict) -> dict:
+        """Add setup_stage and setup_message from the active task's events when session is waiting."""
+        if sess["status"] in ("intake_pending", "interviewing") and not sess.get("active_questions"):
+            task_id = grill_store.get_active_task_id(sess["id"])
+            if task_id:
+                sess["active_task_id"] = task_id
+                # Get latest events for this task to find the most recent [stage:X] event
+                events, _ = store.events(task_id, 0, limit=50, latest=True)
+                stage = "queued"
+                stage_message = ""
+                for ev in events:
+                    msg = ev.get("message", "")
+                    if "[stage:" in msg:
+                        # Extract stage name from [stage:xxx] prefix
+                        import re as _re
+                        m = _re.search(r'\[stage:(\w+)\]', msg)
+                        if m:
+                            stage = m.group(1)
+                            # Message after the tag
+                            stage_message = _re.sub(r'\[stage:\w+\]\s*', '', msg)
+                sess["setup_stage"] = stage
+                sess["setup_message"] = stage_message
+            else:
+                sess["setup_stage"] = "queued"
+                sess["setup_message"] = ""
+        return sess
+
     @app.get("/api/grill/session-by-token")
     async def grill_get_session_by_token(
         token: str = Query(...),
@@ -512,7 +539,7 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None, gri
             raise HTTPException(404, "Session not found or invalid token")
         sess["turns"] = grill_store.get_turns(sess["id"])
         sess["files"] = grill_store.get_files(sess["id"])
-        return sess
+        return _enrich_grill_session(sess)
 
     @app.get("/api/grill/sessions")
     async def grill_list_sessions(
@@ -542,7 +569,7 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None, gri
             raise HTTPException(404, "Session not found")
         sess["turns"] = grill_store.get_turns(session_id)
         sess["files"] = grill_store.get_files(session_id)
-        return sess
+        return _enrich_grill_session(sess)
 
     @app.get("/api/grill/sessions/{session_id}/files/{file_id}")
     async def grill_download_file(

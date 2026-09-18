@@ -136,6 +136,9 @@ export interface GrillSession {
   turns?: GrillTurn[];
   token?: string;
   container_state?: string;
+  setup_stage?: string;
+  setup_message?: string;
+  active_task_id?: string;
 }
 
 export interface SessionCreateResponse {

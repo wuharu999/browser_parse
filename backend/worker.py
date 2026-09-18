@@ -605,9 +605,14 @@ class DockerWorker:
             snapshot_path_str = job.get("snapshot_path")
             is_resumed = bool(job.get("is_resumed") or snapshot_path_str)
 
+            if is_grill:
+                self._event(job_id, "progress", "[stage:validating_resources] Validating worker capacity and resource plan...")
+
             existing_warm = self.grill_containers.get(session_id) if is_grill else None
 
             if existing_warm is not None and not is_resumed:
+                if is_grill:
+                    self._event(job_id, "progress", "[stage:reusing_container] Warm container found, loading turn data...")
                 container = existing_warm["container"]
                 with tempfile.TemporaryDirectory(prefix="robot-docker-stage-") as directory:
                     stage_dir = Path(directory)
@@ -618,9 +623,14 @@ class DockerWorker:
                         (stage_dir / "customer_answers.json").write_text(json.dumps(job["customer_answers"], ensure_ascii=False, separators=(",", ":")))
                     self.runtime.copy_in(container, stage_dir)
                 self._checkpoint(job_id, deadline)
-                self._event(job_id, "progress", "Warm container reused; execution continued.")
+                if is_grill:
+                    self._event(job_id, "progress", "[stage:codex_running] Warm container reused; Generating questions...")
+                else:
+                    self._event(job_id, "progress", "Warm container reused; execution continued.")
             elif is_grill and is_resumed and snapshot_path_str and Path(snapshot_path_str).is_file():
+                self._event(job_id, "progress", "[stage:creating_container] Provisioning isolated compute container...")
                 container = self.runtime.create(job_id, plan, self._container_env(timeout_seconds, job.get("files") or []))
+                self._event(job_id, "progress", "[stage:restoring_snapshot] Restoring workspace from saved snapshot...")
                 self.runtime.restore_workspace(container, Path(snapshot_path_str))
                 with tempfile.TemporaryDirectory(prefix="robot-docker-stage-") as directory:
                     stage_dir = Path(directory)
@@ -631,16 +641,31 @@ class DockerWorker:
                         (stage_dir / "customer_answers.json").write_text(json.dumps(job["customer_answers"], ensure_ascii=False, separators=(",", ":")))
                     self.runtime.copy_in(container, stage_dir)
                 self._checkpoint(job_id, deadline)
+                self._event(job_id, "progress", "[stage:starting_container] Starting container...")
                 self.runtime.start(container)
-                self._event(job_id, "progress", "Container created and workspace restored from snapshot; execution resumed.")
+                self._event(job_id, "progress", "[stage:codex_running] Container restored; Generating questions...")
             else:
+                if is_grill:
+                    self._event(job_id, "progress", "[stage:creating_container] Provisioning isolated compute container...")
                 container = self.runtime.create(job_id, plan, self._container_env(timeout_seconds, job.get("files") or []))
+                if is_grill:
+                    self._event(job_id, "progress", "[stage:staging_files] Downloading and staging input files...")
                 with tempfile.TemporaryDirectory(prefix="robot-docker-stage-") as directory:
                     self._stage_job(job, Path(directory), deadline)
                     self.runtime.copy_in(container, Path(directory))
                 self._checkpoint(job_id, deadline)
+                if is_grill:
+                    self._event(job_id, "progress", "[stage:starting_container] Starting container...")
                 self.runtime.start(container)
-                self._event(job_id, "progress", "Docker container created; Codex execution started.")
+                if is_grill:
+                    self._event(job_id, "progress", "[stage:codex_running] Docker container started; Generating questions...")
+                else:
+                    self._event(job_id, "progress", "Docker container created; Codex execution started.")
+
+            # Execution timer only starts once container is created, staged, and running
+            started = time.monotonic()
+            deadline = started + timeout_seconds
+            self._checkpoint(job_id, deadline)
 
             command = self.runtime.exec_runner(container)
             seen_activity = 0

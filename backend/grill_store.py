@@ -304,6 +304,15 @@ class GrillStore:
                 return None
             return self.get_session(row["id"])
 
+    def get_active_task_id(self, session_id: str) -> str | None:
+        """Return the task ID of the currently running or queued task for a session."""
+        with self.lock:
+            row = self.db.execute(
+                "SELECT id FROM grill_tasks WHERE session_id = ? AND status IN ('queued', 'running', 'leased') ORDER BY created_at DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            return row["id"] if row else None
+
     def list_sessions(self, limit: int = 100, cursor: int | None = None) -> tuple[list[dict], str | None]:
         with self.lock:
             query = """
@@ -905,7 +914,7 @@ class GrillStore:
         with self.lock:
             rows = self.db.execute(
                 """
-                SELECT id, status, container_state, snapshot_path, last_activity_at, updated_at, created_at
+                SELECT id, status, container_state, snapshot_path, last_activity_at, updated_at, created_at, active_questions
                 FROM grill_sessions
                 WHERE container_state != 'hibernated'
                   AND status IN ('interviewing', 'ready_for_confirmation')
@@ -913,6 +922,15 @@ class GrillStore:
             ).fetchall()
 
             for r in rows:
+                if r["status"] == "interviewing":
+                    try:
+                        questions = json.loads(r["active_questions"]) if r["active_questions"] else []
+                    except Exception:
+                        questions = []
+                    if not questions:
+                        # Before questions are ready and presented to user, do not start idle timer
+                        continue
+
                 ref_time_str = r["last_activity_at"] or r["updated_at"] or r["created_at"]
                 try:
                     ref_dt = datetime.fromisoformat(ref_time_str.replace("Z", "+00:00"))

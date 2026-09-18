@@ -90,19 +90,35 @@ export class GrillSessionView {
     const header = document.createElement('div');
     header.className = 'grill-session-header';
 
-    const statusBadgeClass = `status-badge ${this.session.status}`;
+    const isSettingUp = this.session.status === 'intake_pending' ||
+      (this.session.status === 'interviewing' && (!this.session.active_questions || this.session.active_questions.length === 0));
+
+    const statusBadgeClass = `status-badge ${isSettingUp ? 'setup' : this.session.status}`;
     const questionLimit = 25;
     const progressPercent = Math.min(100, Math.round((this.session.question_count / questionLimit) * 100));
 
     const statusMap: Record<string, string> = {
-      intake_pending: t('Initializing', '初始化中'),
-      interviewing: t('Interviewing', '推演访谈中'),
+      intake_pending: t('Setting up pipeline', '管线初始化中'),
+      interviewing: isSettingUp ? t('Initializing turn', '准备本轮推演中') : t('Interviewing', '推演访谈中'),
       ready_for_confirmation: t('Ready for Confirmation', '待客户确认'),
       analyzing: t('Analyzing', '专家分析中'),
       completed: t('Completed', '已完成'),
       failed: t('Failed', '失败'),
     };
     const statusText = statusMap[this.session.status] || this.session.status.replace(/_/g, ' ').toUpperCase();
+
+    const counterBoxHtml = isSettingUp
+      ? `<div class="session-counter-box">
+          <div class="counter-label">${t('Status', '状态')}</div>
+          <div class="counter-val setup-standby">${t('Preparing...', '环境准备中...')}</div>
+        </div>`
+      : `<div class="session-counter-box">
+          <div class="counter-label">${t('Question Budget', '问题配额')}</div>
+          <div class="counter-val">${this.session.question_count} <span class="counter-max">/ ${questionLimit}</span></div>
+          <div class="progress-bar-bg">
+            <div class="progress-bar-fill" style="width: ${progressPercent}%"></div>
+          </div>
+        </div>`;
 
     header.innerHTML = `
       <div class="session-top-meta">
@@ -111,28 +127,24 @@ export class GrillSessionView {
           <h1 class="session-intent">${this.escape(this.session.task_intent)}</h1>
           ${this.session.referenced_robot ? `<div class="session-robot">${t('Target Robot:', '目标机器人：')} <strong>${this.escape(formatRobotName(this.session.referenced_robot))}</strong></div>` : ''}
         </div>
-        <div class="session-counter-box">
-          <div class="counter-label">${t('Question Budget', '问题配额')}</div>
-          <div class="counter-val">${this.session.question_count} <span class="counter-max">/ ${questionLimit}</span></div>
-          <div class="progress-bar-bg">
-            <div class="progress-bar-fill" style="width: ${progressPercent}%"></div>
-          </div>
-        </div>
+        ${counterBoxHtml}
       </div>
     `;
     wrapper.appendChild(header);
 
-    // Phased wind-down guidance hint
-    if (this.session.question_count >= 20) {
-      const hint = document.createElement('div');
-      hint.className = 'budget-hint urgent';
-      hint.textContent = t('Final turn budget (at most 5 questions remaining). Preparing final readback.', '推演已接近上限（剩余最多 5 题）。请聚焦未决关键决策并准备最终确认摘要。');
-      wrapper.appendChild(hint);
-    } else if (this.session.question_count >= 15) {
-      const hint = document.createElement('div');
-      hint.className = 'budget-hint warning';
-      hint.textContent = t('Approaching question limit (at most 10 questions remaining). Focusing on key constraints.', '推演提问已达 15 题（后续最多还可提问 10 题，如信息已充分无需问满）。请聚焦关键约束。');
-      wrapper.appendChild(hint);
+    // Phased wind-down guidance hint (only active once questions are being answered)
+    if (!isSettingUp) {
+      if (this.session.question_count >= 20) {
+        const hint = document.createElement('div');
+        hint.className = 'budget-hint urgent';
+        hint.textContent = t('Final turn budget (at most 5 questions remaining). Preparing final readback.', '推演已接近上限（剩余最多 5 题）。请聚焦未决关键决策并准备最终确认摘要。');
+        wrapper.appendChild(hint);
+      } else if (this.session.question_count >= 15) {
+        const hint = document.createElement('div');
+        hint.className = 'budget-hint warning';
+        hint.textContent = t('Approaching question limit (at most 10 questions remaining). Focusing on key constraints.', '推演提问已达 15 题（后续最多还可提问 10 题，如信息已充分无需问满）。请聚焦关键约束。');
+        wrapper.appendChild(hint);
+      }
     }
 
     // Uploaded Documents card
@@ -195,9 +207,7 @@ export class GrillSessionView {
 
     // Body based on state
     if (this.session.status === 'intake_pending' || (this.session.status === 'interviewing' && (!this.session.active_questions || this.session.active_questions.length === 0))) {
-      wrapper.appendChild(this.renderWaitingState(
-        t('Worker Container Initializing Turn...', '计算容器正在初始化问答轮次...')
-      ));
+      wrapper.appendChild(this.renderSetupProgress());
     } else if (this.session.status === 'interviewing') {
       wrapper.appendChild(this.renderInterviewTurn());
     } else if (this.session.status === 'ready_for_confirmation') {
@@ -211,18 +221,80 @@ export class GrillSessionView {
     this.container.appendChild(wrapper);
   }
 
-  private renderWaitingState(title: string, message?: string): HTMLElement {
+  private renderSetupProgress(): HTMLElement {
     const card = document.createElement('div');
     card.className = 'grill-card grill-loading-card';
-    const displayTitle = (this.session?.container_state === 'hibernated' || !title)
+
+    const currentStage = this.session?.setup_stage || 'queued';
+    const isHibernated = this.session?.container_state === 'hibernated';
+
+    // Define the pipeline stages in order
+    const stages: Array<{ key: string; label: string; labelZh: string }> = isHibernated
+      ? [
+          { key: 'queued', label: 'Queued for worker', labelZh: '排队等待执行' },
+          { key: 'validating_resources', label: 'Validating resources', labelZh: '检查计算资源' },
+          { key: 'creating_container', label: 'Provisioning container', labelZh: '创建计算容器' },
+          { key: 'restoring_snapshot', label: 'Restoring session data', labelZh: '恢复推演会话数据' },
+          { key: 'starting_container', label: 'Starting container', labelZh: '启动计算容器' },
+          { key: 'codex_running', label: 'Generating interview questions', labelZh: '正在生成场景推演问题' },
+        ]
+      : [
+          { key: 'queued', label: 'Queued for worker', labelZh: '排队等待执行' },
+          { key: 'validating_resources', label: 'Validating resources', labelZh: '检查计算资源' },
+          { key: 'creating_container', label: 'Provisioning container', labelZh: '创建计算容器' },
+          { key: 'staging_files', label: 'Staging input files', labelZh: '传输输入文件' },
+          { key: 'starting_container', label: 'Starting container', labelZh: '启动计算容器' },
+          { key: 'codex_running', label: 'Generating interview questions', labelZh: '正在生成场景推演问题' },
+        ];
+
+    // Also handle warm container reuse (skip most steps)
+    if (currentStage === 'reusing_container') {
+      stages.splice(0, stages.length,
+        { key: 'queued', label: 'Queued for worker', labelZh: '排队等待执行' },
+        { key: 'validating_resources', label: 'Validating resources', labelZh: '检查计算资源' },
+        { key: 'reusing_container', label: 'Warm container detected', labelZh: '发现缓存容器' },
+        { key: 'codex_running', label: 'Generating interview questions', labelZh: '正在生成场景推演问题' },
+      );
+    }
+
+    const currentIndex = stages.findIndex(s => s.key === currentStage);
+
+    const title = isHibernated
       ? t('Warming up container and resuming session...', '正在唤醒计算容器并恢复推演会话...')
-      : title;
-    card.innerHTML = `
-      <div class="grill-spinner"></div>
-      <h3 class="loading-title">${this.escape(displayTitle)}</h3>
-      ${message ? `<p class="loading-desc">${this.escape(message)}</p>` : ''}
-      <div class="loading-note">${t('Running in an isolated container. Resources will pause between questions.', '运行于隔离计算容器中。问题生成间隙资源将自动暂停以节省算力。')}</div>
-    `;
+      : t('Setting up scenario analysis pipeline...', '正在准备场景分析管线...');
+
+    let html = `<h3 class="loading-title">${this.escape(title)}</h3>`;
+    html += '<div class="setup-stages">';
+
+    for (let i = 0; i < stages.length; i++) {
+      const s = stages[i];
+      const label = t(s.label, s.labelZh);
+      let statusClass = 'stage-pending';
+      let icon = '○';
+      if (i < currentIndex) {
+        statusClass = 'stage-done';
+        icon = '✓';
+      } else if (i === currentIndex) {
+        statusClass = 'stage-active';
+        icon = '◉';
+      }
+      html += `<div class="setup-stage-row ${statusClass}">
+        <span class="stage-icon">${icon}</span>
+        <span class="stage-label">${this.escape(label)}</span>
+      </div>`;
+    }
+
+    html += '</div>';
+
+    // Show current activity message if available
+    const stageMsg = this.session?.setup_message;
+    if (stageMsg) {
+      html += `<div class="setup-stage-message">${this.escape(stageMsg)}</div>`;
+    }
+
+    html += `<div class="loading-note">${t('Running in an isolated container. This typically takes 15-30 seconds.', '运行于隔离计算容器中。通常需要 15-30 秒。')}</div>`;
+
+    card.innerHTML = html;
     return card;
   }
 
