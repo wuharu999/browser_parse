@@ -130,9 +130,10 @@ function renderGrillSidebarHistory(container: HTMLElement, currentToken?: string
     return;
   }
   for (const s of grillHistorySessions) {
-    const isSelected = !!currentToken && s.token === currentToken;
+    const sessionToken = s.token || s.id;
+    const isSelected = !!currentToken && (currentToken === s.token || currentToken === s.id);
     const item = button('', `history-item ${isSelected ? 'selected' : ''}`, () => {
-      if (s.token) navigate(`/grill/${s.token}`);
+      if (sessionToken) navigate(`/grill/s/${sessionToken}`);
     });
     item.setAttribute('data-session-id', s.id);
     item.setAttribute('aria-current', isSelected ? 'page' : 'false');

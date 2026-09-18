@@ -254,14 +254,24 @@ class GrillStore:
             return False
         with self.lock:
             row = self.db.execute(
-                "SELECT token_hash FROM grill_sessions WHERE id = ?",
+                "SELECT token, token_hash FROM grill_sessions WHERE id = ?",
                 (session_id,),
             ).fetchone()
             if not row:
                 return False
             expected = row["token_hash"]
             provided = token_hash(raw_token)
-            return hmac.compare_digest(expected, provided)
+            if hmac.compare_digest(expected, provided):
+                return True
+            if row["token"]:
+                try:
+                    if hmac.compare_digest(row["token"].encode("utf-8"), raw_token.encode("utf-8")):
+                        return True
+                except Exception:
+                    pass
+            if raw_token == session_id:
+                return True
+            return False
 
     def get_session(self, session_id: str) -> dict | None:
         with self.lock:
@@ -273,6 +283,8 @@ class GrillStore:
                 return None
             res = dict(row)
             res.pop("token_hash", None)
+            if not res.get("token"):
+                res["token"] = res["id"]
             res["scenario_state"] = json.loads(res["scenario_state"]) if res.get("scenario_state") else None
             res["active_questions"] = json.loads(res["active_questions"]) if res.get("active_questions") else []
             res["final_report"] = json.loads(res["final_report"]) if res.get("final_report") else None
@@ -285,8 +297,8 @@ class GrillStore:
         th = token_hash(raw_token)
         with self.lock:
             row = self.db.execute(
-                "SELECT id FROM grill_sessions WHERE token_hash = ?",
-                (th,),
+                "SELECT id FROM grill_sessions WHERE token_hash = ? OR token = ? OR id = ?",
+                (th, raw_token, raw_token),
             ).fetchone()
             if not row:
                 return None
@@ -314,6 +326,8 @@ class GrillStore:
             for row in rows:
                 item = dict(row)
                 item.pop("_cursor", None)
+                if not item.get("token"):
+                    item["token"] = item["id"]
                 items.append(item)
             next_cursor = str(rows[-1]["_cursor"]) if more and rows else None
             return items, next_cursor
@@ -756,10 +770,10 @@ class GrillStore:
                 self.db.execute(
                     """
                     UPDATE grill_sessions
-                    SET status = 'failed', error_message = ?, updated_at = ?
+                    SET status = 'failed', error_message = ?, updated_at = ?, finished_at = ?, container_state = 'terminated'
                     WHERE id = ?
                     """,
-                    (err, now_stamp, session_id),
+                    (err, now_stamp, now_stamp, session_id),
                 )
                 self.db.commit()
                 return

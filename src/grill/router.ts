@@ -8,7 +8,14 @@ export function parseRoute(path: string): RouteState {
     const token = path.slice('/grill/s/'.length).split('/')[0].split('?')[0].trim();
     return { mode: 'grill', token: token || undefined };
   }
-  if (path === '/grill' || path.startsWith('/grill/')) {
+  if (path.startsWith('/grill/')) {
+    const rest = path.slice('/grill/'.length).split('/')[0].split('?')[0].trim();
+    if (rest && rest !== 's') {
+      return { mode: 'grill', token: rest };
+    }
+    return { mode: 'grill' };
+  }
+  if (path === '/grill') {
     return { mode: 'grill' };
   }
   return { mode: 'log' };

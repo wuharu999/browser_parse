@@ -25,6 +25,10 @@ describe('Grill Bot routing', () => {
       mode: 'grill',
       token: 'tok_with_query',
     });
+    expect(parseRoute('/grill/sec_tok_12345')).toEqual({
+      mode: 'grill',
+      token: 'sec_tok_12345',
+    });
   });
 });
 

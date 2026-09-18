@@ -507,6 +507,8 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None, gri
     ):
         sess = grill_store.get_session_by_token(token)
         if not sess:
+            sess = grill_store.get_session(token)
+        if not sess:
             raise HTTPException(404, "Session not found or invalid token")
         sess["turns"] = grill_store.get_turns(sess["id"])
         sess["files"] = grill_store.get_files(sess["id"])
