@@ -2,7 +2,10 @@
 !sandbox/
 sandbox/*
 !sandbox/Dockerfile
-!sandbox/run_codex.py
+# Keep the canonical runner used by sandbox/Dockerfile in the build context.
+!sandbox/runtime/
+sandbox/runtime/*
+!sandbox/runtime/run_codex.py
 !sandbox/analysis_context.py
 !sandbox/requirements.lock
 !sandbox/check_environment.py
