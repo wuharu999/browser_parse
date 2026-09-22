@@ -47,8 +47,8 @@ export class GrillIntakeView {
       <h1 class="grill-title">${t('Turn-based Scenario Modeling & Assessment', '基于多轮问答的机器人场景建模与评估')}</h1>
       <p class="grill-subtitle">
         ${t(
-          'Enter your target robotic task. Our orchestrator will interview you through targeted, multi-choice questions to formulate an explicit Behavior Tree, then deploy 3 specialist subagents to evaluate hardware capabilities, integration architecture, and operational risk.',
-          '输入您的目标机器人任务。推演系统将通过有针对性的多选问答对您进行访谈，构建明确的行为树草案，随后调动三位专家子智能体，综合评估硬件能力、集成架构与运行风险。'
+          'Describe what you want the robot to do. Answer a few focused questions to clarify your scenario, then receive an assessment of hardware capabilities, system integration, and operational risks.',
+          '描述您希望机器人完成的任务，通过几轮有针对性的问答明确场景需求，随后获取硬件能力、系统集成与运行风险的评估报告。'
         )}
       </p>
     `;

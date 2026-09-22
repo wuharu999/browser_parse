@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 from backend.docker_runtime import DockerCleanupError, DockerJob, DockerRuntime
 from backend.resources import PROFILES
-from backend.worker import CleanupUnconfirmed, DockerWorker, WorkerApi, WorkerConfig, WorkerError, _input_path
+from backend.worker import CleanupUnconfirmed, DockerWorker, JobCancelled, JobTimedOut, WorkerApi, WorkerConfig, WorkerError, _input_path
 
 
 class FinishedProcess:
@@ -174,6 +174,49 @@ class DockerWorkerTests(unittest.TestCase):
     def worker(self, job: dict | None, blobs: dict[str, bytes] | None = None) -> tuple[DockerWorker, FakeApi, FakeDockerRuntime]:
         api, runtime = FakeApi(job, blobs), FakeDockerRuntime()
         return DockerWorker(self.config, api, runtime, guard=None), api, runtime
+
+    def test_wiki_staging_does_not_make_a_network_request_per_file(self) -> None:
+        worker, api, _ = self.worker({"id": "gtask_probe"})
+        for index in range(200):
+            (self.config.runtime_dir / f"page_{index}.md").write_text("reference")
+        destination = Path(self.temporary.name) / "staged"
+        clock = [0.0]
+
+        def status_request(_job_id):
+            clock[0] += 0.02  # Simulated 20 ms API round trip; no real sleep.
+            return {"cancel_requested": False}
+
+        with patch("backend.worker.time.monotonic", side_effect=lambda: clock[0]), patch.object(api, "get_job", side_effect=status_request) as requests:
+            worker._write_local_tree(self.config.runtime_dir, destination, "gtask_probe", 30)
+        self.assertLessEqual(requests.call_count, 2)
+        self.assertLessEqual(clock[0], 0.04)
+        self.assertEqual(len(list(destination.glob("*"))), 201)
+        self.assertEqual((destination / "page_199.md").read_text(), "reference")
+
+    def test_staging_still_checks_cancellation_during_long_copies(self) -> None:
+        worker, api, _ = self.worker({"id": "gtask_probe"})
+        for index in range(20):
+            (self.config.runtime_dir / f"page_{index}.md").write_text("reference")
+        destination = Path(self.temporary.name) / "staged"
+        clock = [0.0]
+        original_read = Path.read_bytes
+
+        def slow_read(path):
+            clock[0] += 0.3
+            return original_read(path)
+
+        with patch("backend.worker.time.monotonic", side_effect=lambda: clock[0]), patch.object(Path, "read_bytes", slow_read), patch.object(api, "get_job", side_effect=lambda _: {"cancel_requested": clock[0] >= 0.5}):
+            with self.assertRaises(JobCancelled):
+                worker._write_local_tree(self.config.runtime_dir, destination, "gtask_probe", 30)
+        self.assertLessEqual(clock[0], 1.3)
+        self.assertLess(len(list(destination.glob("*"))), 21)
+
+    def test_staging_checks_deadline_between_remote_status_checks(self) -> None:
+        worker, _, _ = self.worker({"id": "gtask_probe"})
+        (self.config.runtime_dir / "second.md").write_text("reference")
+        with patch("backend.worker.time.monotonic", side_effect=[0.0, 0.0, 0.0, 0.6, 0.6, 0.6]):
+            with self.assertRaises(JobTimedOut):
+                worker._write_local_tree(self.config.runtime_dir, Path(self.temporary.name) / "staged", "gtask_probe", 0.5)
 
     def test_verified_input_is_staged_then_fixed_runner_completes(self) -> None:
         data = b"not extracted on the worker host"

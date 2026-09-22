@@ -403,13 +403,23 @@ class DockerWorker:
     def _write_local_tree(self, source: Path, destination: Path, job_id: str, deadline: float, maximum: int | None = None) -> None:
         if not source.is_dir(): raise WorkerError(f"runtime directory is unavailable: {source}")
         root = source.resolve()
+        next_status_check = 0.0
         for path in sorted(root.rglob("*")):
-            self._checkpoint(job_id, deadline)
+            # A remote status request per wiki entry makes startup depend on
+            # hundreds of network round trips. Keep local deadlines per entry,
+            # and check cancellation once a second while copying.
+            now = time.monotonic()
+            if now >= deadline:
+                raise JobTimedOut("sandbox time limit reached during preparation")
+            if now >= next_status_check:
+                self._checkpoint(job_id, deadline)
+                next_status_check = time.monotonic() + 1.0
             if not path.is_file() or path.is_symlink(): continue
             if maximum is not None and path.stat().st_size > maximum: raise WorkerError(f"wiki file exceeds {maximum} byte transfer cap: {path.name}")
             relative = path.resolve().relative_to(root)
             if "__pycache__" in relative.parts or relative.suffix == ".pyc": continue
             target = destination / relative; target.parent.mkdir(parents=True, exist_ok=True); target.write_bytes(path.read_bytes())
+        self._checkpoint(job_id, deadline)
 
     def _event(self, job_id: str, kind: str, message: str, agent: str = "worker", subagent: dict[str, Any] | None = None) -> None:
         if subagent is None:
