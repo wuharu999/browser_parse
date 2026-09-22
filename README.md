@@ -196,6 +196,29 @@ Run the offline estimator with `uv run python scripts/estimate_cost.py --model d
 
 Library selection and format boundaries are recorded in [docs/open-source-options.md](docs/open-source-options.md). The small custom parser is limited to robot-specific normalization, source provenance, and evidence selection; archive and compression formats use existing implementations.
 
+## Grill runtime and report status
+
+`sandbox/runtime/` contains the canonical job runners. The top-level
+`sandbox/run_codex.py` and `sandbox/run_grill.py` preserve existing Python and CLI
+entry points; the worker stages the canonical files and Docker copies the same
+log runner into its image.
+
+Production grill turns and reports require a configured model. Model failures
+are reported as failures instead of silently substituting template findings.
+`ROBOT_GRILL_USE_FALLBACK=1` is an explicit test/demo mode: its reports are marked
+incomplete and contain no verified hardware or safety claims.
+
+A completed report-generation job does not certify the scenario. Reports expose
+`assessment_status` (`incomplete` or `review_required`) and outstanding validation
+items. Legacy template reports, unresolved blockers, missing sections, and missing
+evidence remain incomplete. Citation checks verify file/line availability, not
+whether a source proves technical feasibility. Human review is still required.
+
+Deploy changes to both the ECS API/frontend and the worker checkout. Existing
+databases receive additive confirmation-note and Q&A request-ID fields at startup;
+keep database/upload backups as described in the deployment guide. Q&A requires
+the separate `ROBOT_CHAT_API_KEY` configuration and returns unavailable when absent.
+
 ## Verification (2026-09-09)
 
 Production build and automated tests cover format recognition, archive/source fairness, lifecycle/metadata retention, numeric identity, UTF-8/long-line preservation, reconciled omissions, brief byte budgets, context pagination, duplicate archive paths, corrupt archives, resource caps, structured reports, and idempotent demo seeding.

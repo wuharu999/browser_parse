@@ -372,7 +372,7 @@ def test_answer_submission_on_hibernated_session_restores_and_executes(tmp_path:
     assert snap_path is not None and Path(snap_path).is_file()
 
     # 3. User returns and submits answers to active questions
-    answers = [{"question_id": "q_next", "selected_option": "Option A", "free_text": None, "unknown": False}]
+    answers = [{"question_id": "q_next", "selected_option": None, "free_text": "Option A", "unknown": False}]
     updated_sess = store.submit_answers(sid, token, answers)
     assert updated_sess["status"] == "analyzing"
     assert updated_sess["container_state"] == "warm"
@@ -422,7 +422,7 @@ def test_warm_container_reused_within_5_minutes(tmp_path: Path):
     initial_cid = worker.grill_containers[sid]["container"].container
 
     # 2. User answers after 60 seconds (well within 300s window)
-    answers = [{"question_id": "q_next", "selected_option": "Slow down", "free_text": None, "unknown": False}]
+    answers = [{"question_id": "q_next", "selected_option": None, "free_text": "Slow down", "unknown": False}]
     store.submit_answers(sid, token, answers)
 
     # 3. Worker executes Turn 2

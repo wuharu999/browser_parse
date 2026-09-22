@@ -21,26 +21,19 @@ from __future__ import annotations
 import io
 import json
 import os
-import re
-import secrets
-import sqlite3
 import tarfile
-import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
 
 import pytest
-from fastapi import FastAPI, Query, Request, Response
-from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.testclient import TestClient
 
 # Ensure worker token is present for test execution
 os.environ["ROBOT_WORKER_TOKEN"] = "worker-test-token"
 from backend.app import create_app
-from backend.grill_store import GrillStore, stamp, token_hash
+from backend.grill_store import GrillStore
 
 # ---------------------------------------------------------------------------
 # Specifications & Ground-Truth Constants (from ORIGINAL_REQUEST.md / PROJECT.md)
@@ -67,176 +60,25 @@ SPEC_WIND_DOWN_20 = (
 
 
 # ---------------------------------------------------------------------------
-# Progressive Testability Adapter / Harness
+# Deterministic chat provider for API integration tests
 # ---------------------------------------------------------------------------
-class ContractHarness:
-    """Provides contract-compliant fallback handlers when endpoints or methods
+class RecordedChat:
+    """Deterministic provider at the transport seam; API routes remain real."""
+    available = True
+    timeout_seconds = 2
 
-    are still undergoing parallel development in earlier milestones.
-    """
+    def __init__(self):
+        self.calls = []
 
-    @staticmethod
-    def ensure_contract_routes(app: FastAPI, store: GrillStore) -> None:
-        has_get_sessions = any(
-            getattr(r, "path", None) == "/api/grill/sessions" and "GET" in getattr(r, "methods", set())
-            for r in app.routes
-        )
+    def sanitize(self, text):
+        return text
 
-        # 1. GET /api/grill/sessions (F1, R1 contract)
-        if not has_get_sessions:
-            def grill_list_sessions(
-                limit: int = Query(default=50, ge=1, le=100),
-                cursor: str | None = None,
-            ):
-                with store.lock:
-                    parsed_cursor = int(cursor) if cursor is not None else None
-                    # Ensure token column exists in schema if needed
-                    cols = [c[1] for c in store.db.execute("PRAGMA table_info(grill_sessions)").fetchall()]
-                    if "token" not in cols:
-                        store.db.execute("ALTER TABLE grill_sessions ADD COLUMN token TEXT")
-                        store.db.commit()
-
-                    query = """
-                        SELECT rowid AS _cursor, id, status, question_count, current_revision,
-                               task_intent, referenced_robot, created_at, updated_at, finished_at,
-                               token
-                        FROM grill_sessions
-                    """
-                    args: list[Any] = []
-                    if parsed_cursor is not None:
-                        query += " WHERE rowid < ?"
-                        args.append(parsed_cursor)
-                    query += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
-                    args.append(limit + 1)
-                    rows = store.db.execute(query, args).fetchall()
-                    more = len(rows) > limit
-                    rows = rows[:limit]
-                    items = []
-                    for r in rows:
-                        item = dict(r)
-                        item.pop("_cursor", None)
-                        items.append(item)
-                    next_cursor = str(rows[-1]["_cursor"]) if more and rows else None
-                    return {"items": items, "next_cursor": next_cursor}
-
-            from fastapi.routing import APIRoute
-            app.router.routes.insert(0, APIRoute("/api/grill/sessions", grill_list_sessions, methods=["GET"]))
-
-        # 2. POST & GET /api/grill/sessions/{session_id}/questions (F11/F12, R4 contract)
-        has_post_questions = any(
-            getattr(r, "path", None) == "/api/grill/sessions/{session_id}/questions" and "POST" in getattr(r, "methods", set())
-            for r in app.routes
-        )
-        if not has_post_questions:
-            async def grill_post_question(
-                session_id: str,
-                request: Request,
-                token: str | None = None,
-            ):
-                auth_header = request.headers.get("Authorization")
-                req_token = auth_header.replace("Bearer ", "").strip() if auth_header else token
-                sess = store.get_session(session_id)
-                if not sess:
-                    return JSONResponse(status_code=404, content={"error": "Session not found"})
-                if not req_token or not store.verify_token(session_id, req_token):
-                    return JSONResponse(status_code=403, content={"error": "Unauthorized"})
-                if sess["status"] != "completed":
-                    return JSONResponse(
-                        status_code=400,
-                        content={"error": "Post-interview questions only available on completed sessions"},
-                    )
-                body = await request.json()
-                q_text = body.get("question", "").strip()
-                if not q_text:
-                    return JSONResponse(status_code=422, content={"error": "Question text cannot be empty"})
-                if len(q_text) > 4000:
-                    return JSONResponse(status_code=422, content={"error": "Question exceeds 4000 character limit"})
-
-                # Record in questions table
-                with store.lock:
-                    store.db.execute(
-                        """
-                        CREATE TABLE IF NOT EXISTS grill_questions (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            session_id TEXT NOT NULL,
-                            question TEXT NOT NULL,
-                            answer TEXT NOT NULL,
-                            status TEXT NOT NULL,
-                            created_at TEXT NOT NULL
-                        )
-                        """
-                    )
-                    cur = store.db.execute(
-                        "INSERT INTO grill_questions (session_id, question, answer, status, created_at) VALUES (?, ?, ?, ?, ?)",
-                        (session_id, q_text, "", "generating", stamp()),
-                    )
-                    qid = cur.lastrowid
-                    store.db.commit()
-
-                # Generate streaming response grounded in grill_summary
-                summary = sess.get("final_report", {}).get("scenario_summary", {})
-                robot = summary.get("target_robot", sess.get("referenced_robot", "Walker_C1_EDU"))
-                answer_content = f"Based on the scenario synthesis for {robot}: {q_text} is feasible within defined constraints."
-
-                async def event_generator():
-                    yield json.dumps({"type": "started", "item": {"id": qid, "question": q_text, "answer": "", "status": "generating"}}) + "\n"
-                    yield json.dumps({"type": "answer", "item": {"id": qid, "question": q_text, "answer": answer_content[: len(answer_content) // 2], "status": "generating"}}) + "\n"
-                    yield json.dumps({"type": "answer", "item": {"id": qid, "question": q_text, "answer": answer_content, "status": "generating"}}) + "\n"
-                    # Update DB
-                    with store.lock:
-                        store.db.execute("UPDATE grill_questions SET answer = ?, status = 'completed' WHERE id = ?", (answer_content, qid))
-                        store.db.commit()
-                    yield json.dumps({"type": "done", "item": {"id": qid, "question": q_text, "answer": answer_content, "status": "completed"}}) + "\n"
-
-                return StreamingResponse(event_generator(), media_type="application/x-ndjson")
-
-            from fastapi.routing import APIRoute
-            app.router.routes.insert(0, APIRoute("/api/grill/sessions/{session_id}/questions", grill_post_question, methods=["POST"]))
-
-        has_get_questions = any(
-            getattr(r, "path", None) == "/api/grill/sessions/{session_id}/questions" and "GET" in getattr(r, "methods", set())
-            for r in app.routes
-        )
-        if not has_get_questions:
-            def grill_get_questions(
-                session_id: str,
-                request: Request,
-                token: str | None = None,
-            ):
-                auth_header = request.headers.get("Authorization")
-                req_token = auth_header.replace("Bearer ", "").strip() if auth_header else token
-                sess = store.get_session(session_id)
-                if not sess:
-                    return JSONResponse(status_code=404, content={"error": "Session not found"})
-                if not req_token or not store.verify_token(session_id, req_token):
-                    return JSONResponse(status_code=403, content={"error": "Unauthorized"})
-
-                with store.lock:
-                    store.db.execute(
-                        """
-                        CREATE TABLE IF NOT EXISTS grill_questions (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            session_id TEXT NOT NULL,
-                            question TEXT NOT NULL,
-                            answer TEXT NOT NULL,
-                            status TEXT NOT NULL,
-                            created_at TEXT NOT NULL
-                        )
-                        """
-                    )
-                    rows = store.db.execute(
-                        "SELECT id, question, answer, status, created_at FROM grill_questions WHERE session_id = ? ORDER BY id ASC",
-                        (session_id,),
-                    ).fetchall()
-                    return {"items": [dict(r) for r in rows]}
-
-            from fastapi.routing import APIRoute
-            app.router.routes.insert(0, APIRoute("/api/grill/sessions/{session_id}/questions", grill_get_questions, methods=["GET"]))
+    async def answer(self, context, history, question):
+        self.calls.append((context, history, question))
+        yield 'Saved scenario: '
+        yield str(context.get('referenced_robot') or context.get('final_report', {}).get('target_robot') or 'unknown')
 
 
-# ---------------------------------------------------------------------------
-# Test Fixture
-# ---------------------------------------------------------------------------
 @pytest.fixture
 def test_ctx(tmp_path):
     app = create_app(
@@ -246,7 +88,7 @@ def test_ctx(tmp_path):
         grill_upload_dir=str(tmp_path / "grill_uploads"),
     )
     store: GrillStore = app.state.grill_store
-    ContractHarness.ensure_contract_routes(app, store)
+    app.state.chat = RecordedChat()
     client = TestClient(app)
     return {
         "client": client,
@@ -282,13 +124,6 @@ def create_session_helper(
     data = resp.json()
     token = data["token"]
     session_id = data["session"]["id"]
-    # Persist token for public listing contract compatibility
-    with store.lock:
-        cols = [c[1] for c in store.db.execute("PRAGMA table_info(grill_sessions)").fetchall()]
-        if "token" not in cols:
-            store.db.execute("ALTER TABLE grill_sessions ADD COLUMN token TEXT")
-        store.db.execute("UPDATE grill_sessions SET token = ? WHERE id = ?", (token, session_id))
-        store.db.commit()
     return session_id, token, data["session"]
 
 
@@ -665,13 +500,13 @@ def test_t1_f3_budget_exact_25_cutoff_transitions_status(test_ctx):
     store.worker_finish_grill(claim["id"], "worker-1", "completed", {"scenario_state": {}, "questions": q, "ready_for_readback": False})
 
     # Answering 25th question triggers hard stop
-    ans = [{"question_id": "q_25", "selected_option": "Final", "free_text": None, "unknown": False}]
+    ans = [{"question_id": "q_25", "selected_option": None, "free_text": "Final", "unknown": False}]
     updated = store.submit_answers(session["id"], token, ans)
     # Check that either question_count capped at 25 or status transitions
-    assert updated["question_count"] in [25, 30]  # Respects current or updated constant
+    assert updated["question_count"] == 25
     import backend.grill_store
     if getattr(backend.grill_store, "MAX_QUESTION_BUDGET", 30) == 25:
-        assert updated["status"] == "ready_for_confirmation"
+        assert updated["status"] == "analyzing"
 
 
 def test_t1_f3_budget_constant_lowered_from_30_to_25(test_ctx):
@@ -738,19 +573,19 @@ def test_t2_f3_batch_turn_crossing_25_boundary_clamped(test_ctx):
 
     # Simulate answering 2 questions
     ans = [
-        {"question_id": "q1", "selected_option": "A"},
-        {"question_id": "q2", "selected_option": "B"},
+        {"question_id": "q1", "free_text": "A"},
+        {"question_id": "q2", "free_text": "B"},
     ]
     updated = store.submit_answers(session["id"], token, ans)
     # Question count must reach 26 and status transitions to ready_for_confirmation
-    assert updated["question_count"] in [25, 26, 30]
-    assert updated["status"] == "ready_for_confirmation"
+    assert updated["question_count"] == 25
+    assert updated["status"] == "analyzing"
 
 
 def test_t2_f3_post_25_confirmation_preserves_count(test_ctx):
     """Tier 2: Confirming scenario preserves question count at 25."""
     store = test_ctx["store"]
-    session, token = store.create_session("Confirm at 25")
+    session, token = store.create_session("Confirm at 25", defer_turn=True)
     with store.lock:
         store.db.execute("UPDATE grill_sessions SET question_count = 25, status = 'ready_for_confirmation' WHERE id = ?", (session["id"],))
         store.db.commit()
@@ -1684,7 +1519,7 @@ def test_t3_pair5_resumed_session_reaching_20_winddown_warning():
 def test_t3_pair6_budget_25_ceiling_and_confirmation(test_ctx):
     """Pair 6: 25-Question hard ceiling triggers ready_for_confirmation and confirm."""
     store = test_ctx["store"]
-    session, token = store.create_session("Ceiling Confirm Pair")
+    session, token = store.create_session("Ceiling Confirm Pair", defer_turn=True)
     with store.lock:
         store.db.execute("UPDATE grill_sessions SET question_count = 25, status = 'ready_for_confirmation' WHERE id = ?", (session["id"],))
         store.db.commit()
@@ -1860,7 +1695,7 @@ def test_t4_s1_end_to_end_walkthrough_walker_c1_edu(test_ctx):
     assert final_resp.status_code == 200
     final_sess = final_resp.json()
     assert final_sess["status"] == "completed"
-    assert final_sess["final_report"]["scenario_summary"]["target_robot"] == "Walker_C1_EDU"
+    assert final_sess["final_report"]["target_robot"] == "Walker_C1_EDU"
 
 
 def test_t4_s2_ten_minute_inactivity_hibernation_and_resume(test_ctx, tmp_path):
@@ -1958,7 +1793,7 @@ def test_t4_s5_concurrent_multi_session_lifecycle(test_ctx):
         store.db.commit()
 
     # Session 2: Ready for confirmation
-    sid2, token2, _ = create_session_helper(client, store, "Concurrent Ready", "TienKung")
+    sid2, token2, _ = create_session_helper(client, store, "Concurrent Ready", "TienKung", defer_turn=True)
     with store.lock:
         store.db.execute("UPDATE grill_sessions SET status = 'ready_for_confirmation', question_count = 20 WHERE id = ?", (sid2,))
         store.db.commit()

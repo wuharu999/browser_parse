@@ -262,7 +262,7 @@ function createMockSession(overrides: Partial<GrillSession> = {}): GrillSession 
           },
         ],
         answers: [
-          { question_id: 'q_speed', selected_option: '0.5-1.2 m/s', is_unknown: false },
+          { question_id: 'q_speed', selected_option: '0.5-1.2 m/s', unknown: false },
         ],
         created_at: '2026-09-17T10:01:00Z',
       },
@@ -441,7 +441,7 @@ function renderTranscriptDOM(session: GrillSession): MockElement {
       for (const a of turn.answers) {
         const aBox = new MockElement('div');
         aBox.className = 'past-answer-box';
-        aBox.textContent = `A: ${a.selected_option || a.free_text_answer || (a.is_unknown ? 'Unknown' : '')}`;
+        aBox.textContent = `A: ${a.selected_option || a.free_text || (a.unknown ? 'Unknown' : '')}`;
         turnRow.appendChild(aBox);
       }
       turnsCard.appendChild(turnRow);
@@ -700,7 +700,7 @@ describe('Frontend E2E Requirements Test Suite (Tiers 1-4)', () => {
             id: 1,
             turn_index: 1,
             questions: [{ id: 'q1', text: 'Voltage?', options: [] }],
-            answers: [{ question_id: 'q1', is_unknown: true }],
+            answers: [{ question_id: 'q1', unknown: true }],
             created_at: '2026-09-17T10:00:00Z',
           },
         ],
@@ -716,7 +716,7 @@ describe('Frontend E2E Requirements Test Suite (Tiers 1-4)', () => {
             id: 1,
             turn_index: 1,
             questions: [{ id: 'q1', text: 'Spec?', options: [] }],
-            answers: [{ question_id: 'q1', free_text_answer: 'Tolerance < 0.05mm & Temp > 40°C' }],
+            answers: [{ question_id: 'q1', free_text: 'Tolerance < 0.05mm & Temp > 40°C' }],
             created_at: '2026-09-17T10:00:00Z',
           },
         ],

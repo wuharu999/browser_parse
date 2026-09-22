@@ -18,6 +18,32 @@ def client(tmp_path):
     return TestClient(app)
 
 
+def test_grill_qa_unavailable_does_not_fabricate_an_answer(client):
+    store = client.app.state.grill_store
+    session, token = store.create_session('Choose a robot', defer_turn=True)
+    store.db.execute("UPDATE grill_sessions SET status = 'completed' WHERE id = ?", (session['id'],))
+    store.db.commit()
+    client.app.state.chat.key = ''
+    response = client.post(f"/api/grill/sessions/{session['id']}/questions", headers={'Authorization': f'Bearer {token}'}, json={'question': 'Is this safe?'})
+    assert response.status_code == 503
+    assert store.list_followup_questions(session['id'])['items'] == []
+
+
+def test_grill_free_text_and_unknown_reach_worker(client):
+    store = client.app.state.grill_store
+    session, token = store.create_session('Clean glass')
+    task = store.worker_claim_grill('worker', {'cpu_milli': 2000, 'memory_mb': 4096})
+    questions = [{'id': 'q1', 'text': 'Which surface?', 'target_ids': ['f_surface']}, {'id': 'q2', 'text': 'Which robot?', 'target_ids': ['f_robot']}]
+    store.worker_finish_grill(task['id'], 'worker', 'completed', {'scenario_state': {}, 'questions': questions})
+    response = client.post(f"/api/grill/sessions/{session['id']}/turns", headers={'Authorization': f'Bearer {token}'}, json={'answers': [{'question_id': 'q1', 'free_text_answer': 'Inner glass'}, {'question_id': 'q2', 'is_unknown': True}]})
+    assert response.status_code == 200, response.text
+    next_task = store.worker_claim_grill('worker', {'cpu_milli': 2000, 'memory_mb': 4096})
+    assert next_task['customer_answers'][0]['free_text'] == 'Inner glass'
+    assert next_task['customer_answers'][1]['unknown'] is True
+    assert next_task['normalized_updates']['resolved_fields'][0]['value'] == 'Inner glass'
+    assert next_task['normalized_updates']['unresolved_fields'] == ['f_robot']
+
+
 def test_grill_api_full_flow(client):
     # 1. Create session
     create_resp = client.post(
@@ -208,7 +234,7 @@ def test_grill_api_full_flow(client):
     )
     final_obj = final_sess_resp.json()
     assert final_obj["status"] == "completed"
-    assert final_obj["final_report"]["scenario_summary"]["target_robot"] == "Unitree B2"
+    assert final_obj["final_report"]["target_robot"] == "Unitree B2"
     assert len(final_obj["turns"]) >= 2
 
 
@@ -389,7 +415,8 @@ def test_phased_wind_down_prompts():
         assert "Codex must not recommend or assume any external or unsupported robot hardware." in prompt
 
 
-def test_question_budget_ceiling_runner(tmp_path):
+def test_question_budget_ceiling_runner(tmp_path, monkeypatch):
+    monkeypatch.setenv('ROBOT_GRILL_USE_FALLBACK', '1')
     from sandbox import run_grill
 
     workspace = tmp_path / "workspace_budget"

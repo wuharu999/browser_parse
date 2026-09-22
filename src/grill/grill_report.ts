@@ -1,3 +1,4 @@
+import { sessionContextCards } from './session_context';
 import { GrillReport, GrillSession, BehaviorTreeNode } from './types';
 import { formatRobotName } from './grill_intake';
 import { t } from '../i18n';
@@ -10,11 +11,17 @@ export class GrillReportView {
   private session: GrillSession;
   private container: HTMLElement;
   private activeTab: GrillReportTab = 'scenario';
+  private qaPanel: QuestionsPanel;
 
   constructor(report: GrillReport, session: GrillSession, container: HTMLElement) {
     this.report = report;
     this.session = session;
     this.container = container;
+    this.qaPanel = new QuestionsPanel(session.id, '/api/grill/sessions', session.token);
+  }
+
+  public destroy(): void {
+    this.qaPanel.destroy();
   }
 
   public render(): void {
@@ -29,7 +36,7 @@ export class GrillReportView {
     header.innerHTML = `
       <div class="report-header-top">
         <div>
-          <span class="grill-badge status-badge completed">${t('Report Ready', '评估报告已就绪')}</span>
+          <span class="grill-badge status-badge ${this.report.assessment_status === 'incomplete' ? 'ready_for_confirmation' : 'completed'}">${this.report.assessment_status === 'incomplete' ? t('Incomplete assessment · review required', '评估未完成 · 需补充核验') : t('Report Ready', '评估报告已就绪')}</span>
           <h1 class="report-title">${this.escape(this.session.task_intent || t('Robot Scenario Analysis', '机器人场景分析'))}</h1>
         </div>
         <div class="report-export-actions">
@@ -38,12 +45,26 @@ export class GrillReportView {
         </div>
       </div>
       <div class="report-meta">
-        <span><strong>${t('Robot:', '机器人：')}</strong> ${this.escape(formatRobotName(this.session.referenced_robot))}</span>
+        <span><strong>${t('Robot:', '机器人：')}</strong> ${this.escape(formatRobotName(this.report.target_robot || this.session.referenced_robot))}</span>
         <span><strong>${t('Questions Answered:', '已回答问题数：')}</strong> ${this.session.question_count} / 25</span>
         <span><strong>${t('Completed:', '完成时间：')}</strong> ${new Date(this.session.finished_at || Date.now()).toLocaleString()}</span>
       </div>
     `;
     wrapper.appendChild(header);
+    if (this.report.validation?.issues.length) {
+      const gaps = document.createElement('div');
+      gaps.className = 'grill-card';
+      const heading = document.createElement('h2');
+      heading.textContent = t('Outstanding assessment items', '待补充的评估事项');
+      const list = document.createElement('ul');
+      for (const issue of this.report.validation.issues) {
+        const item = document.createElement('li');
+        item.textContent = issue;
+        list.appendChild(item);
+      }
+      gaps.append(heading, list);
+      wrapper.appendChild(gaps);
+    }
 
     // Tab navigation
     const tabNav = document.createElement('nav');
@@ -94,12 +115,10 @@ export class GrillReportView {
 
     wrapper.appendChild(contentEl);
 
-    // Attach post-interview streaming Q&A panel below the report
-    const qaPanel = new QuestionsPanel(this.session.id, '/api/grill/sessions', this.session.token);
-    wrapper.appendChild(qaPanel.element);
-    void qaPanel.poll();
-
+    // Keep the conversation and typed question intact while switching report tabs.
+    wrapper.appendChild(this.qaPanel.element);
     this.container.appendChild(wrapper);
+    this.qaPanel.start();
 
     // Bind export buttons
     const btnJson = wrapper.querySelector('#btn-export-json');
@@ -124,7 +143,7 @@ export class GrillReportView {
 
       <div class="metrics-grid">
         <div class="metric-card">
-          <div class="metric-value">${this.escape(formatRobotName(this.session.referenced_robot))}</div>
+          <div class="metric-value">${this.escape(formatRobotName(this.report.target_robot || this.session.referenced_robot))}</div>
           <div class="metric-label">${t('Target Hardware', '目标硬件')}</div>
         </div>
         <div class="metric-card">
@@ -149,62 +168,9 @@ export class GrillReportView {
       </ul>
     `;
 
-    if (this.session.files && this.session.files.length > 0) {
-      const filesCard = document.createElement('div');
-      filesCard.className = 'grill-card session-files-card';
-      filesCard.style.marginTop = '20px';
-      const h3 = document.createElement('h3');
-      h3.textContent = `${t('Uploaded Documents & Diagrams', '上传参考文档与图纸')} (${this.session.files.length})`;
-      filesCard.appendChild(h3);
-
-      for (const f of this.session.files) {
-        const fileRow = document.createElement('div');
-        fileRow.className = 'file-item';
-        const fileLink = document.createElement('a');
-        fileLink.href = `/api/grill/sessions/${this.session.id}/files/${f.id}?token=${encodeURIComponent(this.session.token || '')}`;
-        fileLink.target = '_blank';
-        fileLink.className = 'file-link';
-        fileLink.textContent = `📎 ${f.name} (${f.size} B)`;
-        fileRow.appendChild(fileLink);
-        filesCard.appendChild(fileRow);
-      }
-      card.appendChild(filesCard);
-    }
-
-    if (this.session.turns && this.session.turns.length > 0) {
-      const turnsCard = document.createElement('div');
-      turnsCard.className = 'grill-card turns-history-card';
-      turnsCard.style.marginTop = '20px';
-      const h3 = document.createElement('h3');
-      h3.textContent = t('Past Turn Transcript', '往轮问答推演记录');
-      turnsCard.appendChild(h3);
-
-      for (const turn of this.session.turns) {
-        const turnRow = document.createElement('div');
-        turnRow.className = 'turn-row';
-        turnRow.setAttribute('data-turn-index', String(turn.turn_index));
-
-        const turnHeader = document.createElement('div');
-        turnHeader.className = 'turn-row-header';
-        turnHeader.textContent = `${t('Turn', '第')} ${turn.turn_index} ${t('', '轮问答')}`;
-        turnRow.appendChild(turnHeader);
-
-        for (const q of turn.questions) {
-          const qBox = document.createElement('div');
-          qBox.className = 'past-question-box';
-          qBox.textContent = `Q: ${q.text} ${q.why ? `(💡 ${q.why})` : ''}`;
-          turnRow.appendChild(qBox);
-        }
-        for (const a of turn.answers) {
-          const aBox = document.createElement('div');
-          aBox.className = 'past-answer-box';
-          const ansText = a.selected_option || a.free_text_answer || (a.is_unknown ? 'Unknown' : '');
-          aBox.textContent = `A: ${ansText}`;
-          turnRow.appendChild(aBox);
-        }
-        turnsCard.appendChild(turnRow);
-      }
-      card.appendChild(turnsCard);
+    for (const context of sessionContextCards(this.session)) {
+      context.style.marginTop = '20px';
+      card.appendChild(context);
     }
 
     return card;
@@ -276,7 +242,7 @@ export class GrillReportView {
       <h2 class="panel-heading">${t('⚙️ Proposed Integration Architecture', '⚙️ 推荐系统集成架构')}</h2>
       <p class="panel-intro">${this.escape(arch?.summary || t('ROS 2 software architecture, node topology, and communication graph.', 'ROS 2 软件架构、节点拓扑与通信图谱。'))}</p>
       <div class="arch-meta-box">
-        <span><strong>${t('Middleware:', '中间件：')}</strong> <code>${this.escape(arch?.middleware || 'ROS 2 Humble / CycloneDDS')}</code></span>
+        <span><strong>${t('Middleware:', '中间件：')}</strong> <code>${this.escape(arch?.middleware || t('Not specified', '未指定'))}</code></span>
       </div>
     `;
 
@@ -300,6 +266,8 @@ export class GrillReportView {
               <span class="node-type">${this.escape(node.type)}</span>
             </div>
             <div class="node-topics">
+              ${node.responsibility ? `<p>${this.escape(node.responsibility)}</p>` : ''}
+              ${(node.interfaces || []).map(value => `<div>${this.escape(value)}</div>`).join('')}
               ${subTopics ? `<div class="topic-row"><span>Sub:</span> ${subTopics}</div>` : ''}
               ${pubTopics ? `<div class="topic-row"><span>Pub:</span> ${pubTopics}</div>` : ''}
             </div>
@@ -408,9 +376,10 @@ export class GrillReportView {
     return card;
   }
 
-  private renderTreeNode(nodeId: string, nodeMap: Map<string, BehaviorTreeNode>, depth: number): string {
+  private renderTreeNode(nodeId: string, nodeMap: Map<string, BehaviorTreeNode>, depth: number, visited = new Set<string>()): string {
     const node = nodeMap.get(nodeId);
-    if (!node) return '';
+    if (!node || visited.has(nodeId) || depth > 100) return '';
+    visited.add(nodeId);
 
     const iconMap: Record<string, string> = {
       sequence: t('➡️ Sequence', '➡️ 顺序节点 (Sequence)'),
@@ -420,14 +389,15 @@ export class GrillReportView {
       decorator: t('🔄 Decorator', '🔄 装饰节点 (Decorator)'),
     };
 
-    const typeLabel = iconMap[node.type] || node.type;
-    const typeClass = `bt-node-${node.type}`;
+    const kind = node.type.toLowerCase().replace(/[^a-z]/g, '');
+    const typeLabel = iconMap[kind] || node.type;
+    const typeClass = `bt-node-${kind}`;
 
     let html = `
       <div class="bt-node-item" style="margin-left: ${depth * 24}px">
         <div class="bt-node-box ${typeClass}">
           <span class="bt-node-type-pill">${this.escape(typeLabel)}</span>
-          <strong class="bt-node-name">${this.escape(node.name || node.id)}</strong>
+          <strong class="bt-node-name">${this.escape(node.label || node.name || node.id)}</strong>
           ${node.description ? `<span class="bt-node-desc">${this.escape(node.description)}</span>` : ''}
         </div>
       </div>
@@ -435,7 +405,7 @@ export class GrillReportView {
 
     if (node.children && node.children.length > 0) {
       for (const childId of node.children) {
-        html += this.renderTreeNode(childId, nodeMap, depth + 1);
+        html += this.renderTreeNode(childId, nodeMap, depth + 1, visited);
       }
     }
 
@@ -473,15 +443,18 @@ export class GrillReportView {
 export function generateGrillMarkdown(report: GrillReport, session: GrillSession): string {
   const lines: string[] = [];
   lines.push(`# Robot Scenario Assessment: ${session.task_intent}`);
-  lines.push(`**Target Robot:** ${formatRobotName(session.referenced_robot)}`);
+  lines.push(`**Target Robot:** ${formatRobotName(report.target_robot || session.referenced_robot)}`);
   lines.push(`**Date:** ${new Date(session.finished_at || Date.now()).toISOString()}`);
-  lines.push(`**Questions Answered:** ${session.question_count} / 30\n`);
+  lines.push(`**Questions Answered:** ${session.question_count} / 25\n`);
+
+  if (report.assessment_status === 'incomplete') lines.push('**Assessment incomplete:** ' + (report.validation?.issues || []).join('; ') + '\n');
 
   lines.push(`## 1. Scenario Summary\n${report.scenario_summary || session.readback_summary || ''}\n`);
 
   lines.push(`## 2. Capabilities Assessment\n${report.capabilities?.summary || ''}\n`);
   for (const c of report.capabilities?.claims || []) {
     lines.push(`- **[${c.status.toUpperCase()}]** ${c.title} (${c.category}): ${c.statement}`);
+    if (c.citations?.length) lines.push(`  Sources: ${c.citations.join('; ')}`);
   }
   lines.push('');
 
@@ -494,6 +467,7 @@ export function generateGrillMarkdown(report: GrillReport, session: GrillSession
   lines.push(`## 4. Operational Risk Matrix\n${report.risk_matrix?.summary || ''}\n`);
   for (const r of report.risk_matrix?.risks || []) {
     lines.push(`- **${r.title}** (Severity: ${r.severity}, Likelihood: ${r.likelihood}): ${r.mitigation}`);
+    if (r.citations?.length) lines.push(`  Sources: ${r.citations.join('; ')}`);
   }
   lines.push('');
 

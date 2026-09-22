@@ -19,6 +19,7 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from backend.resources import PROFILES
+from sandbox.runtime.grill_contract import normalize_report
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 DEFAULT_GRILL_DB = "data/grill.sqlite3"
@@ -157,6 +158,7 @@ class GrillStore:
                 ("hibernated_at", "TEXT DEFAULT NULL"),
                 ("last_activity_at", "TEXT DEFAULT NULL"),
                 ("summary_context", "TEXT DEFAULT NULL"),
+                ("confirmation_note", "TEXT DEFAULT NULL"),
             ]:
                 try:
                     self.db.execute(f"ALTER TABLE grill_sessions ADD COLUMN {col} {col_def}")
@@ -166,6 +168,11 @@ class GrillStore:
                 self.db.execute("ALTER TABLE grill_tasks ADD COLUMN snapshot_path TEXT DEFAULT NULL")
             except sqlite3.OperationalError:
                 pass
+            columns = {row['name'] for row in self.db.execute('PRAGMA table_info(grill_followup_questions)')}
+            if 'request_id' not in columns:
+                self.db.execute('ALTER TABLE grill_followup_questions ADD COLUMN request_id TEXT')
+            self.db.execute('CREATE UNIQUE INDEX IF NOT EXISTS grill_question_request ON grill_followup_questions(session_id, request_id) WHERE request_id IS NOT NULL')
+            self.db.commit()
 
     def create_session(
         self,
@@ -237,6 +244,9 @@ class GrillStore:
             ).fetchone()
             if existing:
                 return existing["id"]
+            session = self.db.execute('SELECT status FROM grill_sessions WHERE id = ?', (session_id,)).fetchone()
+            if not session or session['status'] != 'intake_pending':
+                raise ValueError('Only a new interview can be started')
             task_id = f"gtask_{secrets.token_hex(12)}"
             self.db.execute(
                 """
@@ -288,6 +298,10 @@ class GrillStore:
             res["scenario_state"] = json.loads(res["scenario_state"]) if res.get("scenario_state") else None
             res["active_questions"] = json.loads(res["active_questions"]) if res.get("active_questions") else []
             res["final_report"] = json.loads(res["final_report"]) if res.get("final_report") else None
+            if res["final_report"] is not None:
+                res["final_report"] = normalize_report(res["final_report"], session_id=session_id, task_intent=res["task_intent"], state=res["scenario_state"])
+            pending = self.db.execute("SELECT action FROM grill_tasks WHERE session_id = ? AND status IN ('queued', 'running', 'leased') ORDER BY rowid DESC LIMIT 1", (session_id,)).fetchone()
+            res['pending_action'] = pending['action'] if pending else None
             res["files"] = self.get_files(session_id)
             return res
 
@@ -426,27 +440,35 @@ class GrillStore:
             self.db.commit()
 
     def add_followup_question(self, session_id: str, question: str) -> dict:
-        q_id = f"gq_{secrets.token_hex(8)}"
-        now = stamp()
+        return self.begin_followup_question(session_id, question)[0]
+
+    def begin_followup_question(self, session_id: str, question: str, request_id: str | None = None) -> tuple[dict, bool]:
+        """Atomically admit one answer; request IDs make network retries idempotent."""
         with self.lock:
+            if request_id:
+                existing = self.db.execute(
+                    'SELECT rowid AS sequence, * FROM grill_followup_questions WHERE session_id = ? AND request_id = ?',
+                    (session_id, request_id),
+                ).fetchone()
+                if existing:
+                    if existing['question'] != question:
+                        raise ValueError('Request ID already used for a different question')
+                    return dict(existing), False
+            if self.db.execute("SELECT 1 FROM grill_followup_questions WHERE session_id = ? AND status = 'generating'", (session_id,)).fetchone():
+                raise ValueError('An answer is already being generated')
+            q_id, now = f'gq_{secrets.token_hex(8)}', stamp()
             self.db.execute(
-                """
-                INSERT INTO grill_followup_questions (
-                    id, session_id, question, answer, status, created_at, updated_at
-                ) VALUES (?, ?, ?, '', 'generating', ?, ?)
-                """,
-                (q_id, session_id, question, now, now),
+                "INSERT INTO grill_followup_questions (id, session_id, question, answer, status, created_at, updated_at, request_id) VALUES (?, ?, ?, '', 'generating', ?, ?, ?)",
+                (q_id, session_id, question, now, now, request_id),
             )
             self.db.commit()
-            return {
-                "id": q_id,
-                "session_id": session_id,
-                "question": question,
-                "answer": "",
-                "status": "generating",
-                "created_at": now,
-                "updated_at": now,
-            }
+            row = self.db.execute('SELECT rowid AS sequence, * FROM grill_followup_questions WHERE id = ?', (q_id,)).fetchone()
+            return dict(row), True
+
+    def interrupt_questions(self) -> None:
+        with self.lock:
+            self.db.execute("UPDATE grill_followup_questions SET status = 'interrupted', failure_reason = 'Service restarted', updated_at = ? WHERE status = 'generating'", (stamp(),))
+            self.db.commit()
 
     def update_followup_question(
         self,
@@ -467,7 +489,7 @@ class GrillStore:
             )
             self.db.commit()
             row = self.db.execute(
-                "SELECT * FROM grill_followup_questions WHERE id = ?",
+                "SELECT rowid AS sequence, * FROM grill_followup_questions WHERE id = ?",
                 (question_id,),
             ).fetchone()
             return dict(row) if row else None
@@ -479,16 +501,27 @@ class GrillStore:
         before: str | None = None,
     ) -> dict:
         with self.lock:
-            query = "SELECT * FROM grill_followup_questions WHERE session_id = ?"
+            query = 'SELECT rowid AS sequence, * FROM grill_followup_questions WHERE session_id = ?'
             args: list[Any] = [session_id]
-            if before:
-                query += " AND created_at < ?"
-                args.append(before)
-            query += " ORDER BY created_at ASC LIMIT ?"
-            args.append(limit)
+            if before is not None:
+                try:
+                    cursor = int(before)
+                except (TypeError, ValueError):
+                    raise ValueError('Question cursor must be a positive integer') from None
+                if cursor < 1:
+                    raise ValueError('Question cursor must be a positive integer')
+                query += ' AND rowid < ?'
+                args.append(cursor)
+            query += ' ORDER BY rowid DESC LIMIT ?'
+            args.append(limit + 1)
             rows = self.db.execute(query, args).fetchall()
-            items = [dict(r) for r in rows]
-            return {"items": items}
+            page = rows[:limit]
+            active = self.db.execute("SELECT rowid AS sequence, * FROM grill_followup_questions WHERE session_id = ? AND status = 'generating' ORDER BY rowid DESC LIMIT 1", (session_id,)).fetchone()
+            return {
+                'items': [dict(row) for row in reversed(page)],
+                'next_before': page[-1]['sequence'] if len(rows) > limit else None,
+                'active': dict(active) if active else None,
+            }
 
     def get_followup_chat_context(self, session_id: str) -> tuple[dict, list[dict]]:
         with self.lock:
@@ -509,11 +542,14 @@ class GrillStore:
                     "summary": sess.get("readback_summary") or sess.get("final_report"),
                     "status": sess.get("status"),
                 }
+            if not isinstance(context, dict):
+                context = {'summary': context}
+            context.update(final_report=sess.get('final_report'), scenario_state=sess.get('scenario_state'), confirmation_note=sess.get('confirmation_note'))
             q_rows = self.db.execute(
                 """
                 SELECT question, answer FROM grill_followup_questions
                 WHERE session_id = ? AND status = 'completed' AND answer != ''
-                ORDER BY created_at ASC
+                ORDER BY rowid ASC
                 """,
                 (session_id,),
             ).fetchall()
@@ -538,14 +574,29 @@ class GrillStore:
             ).fetchone()
             if not row:
                 raise ValueError("Session not found")
-            if row["status"] not in ("interviewing", "ready_for_confirmation"):
+            if row["status"] != "interviewing":
                 raise ValueError(f"Session is in status '{row['status']}', cannot submit answers")
 
             was_hibernated = row["container_state"] == "hibernated"
             snapshot_path = row["snapshot_path"]
 
             active_q = json.loads(row["active_questions"]) if row["active_questions"] else []
-            new_count = row["question_count"] + len(active_q)
+            question_map = {q['id']: q for q in active_q}
+            answer_ids = [answer.get('question_id') for answer in answers]
+            if not question_map or len(answer_ids) != len(set(answer_ids)) or set(answer_ids) != set(question_map):
+                raise ValueError('Submit exactly one answer for each active question')
+            for answer in answers:
+                question = question_map[answer['question_id']]
+                selected = answer.get('selected_option')
+                free_text = str(answer.get('free_text') or '').strip()
+                if answer.get('unknown'):
+                    if selected or free_text:
+                        raise ValueError('Unknown cannot be combined with another answer')
+                elif not selected and not free_text:
+                    raise ValueError('Answer cannot be empty')
+                if selected and selected not in {option['label'] for option in question.get('options', [])}:
+                    raise ValueError('Selected option is not one of the active question options')
+            new_count = min(MAX_QUESTION_BUDGET, row["question_count"] + len(active_q))
 
             # Update latest turn with answers
             latest_turn = self.db.execute(
@@ -571,20 +622,14 @@ class GrillStore:
             else:
                 next_turn_index = 1
 
-            # Check question limit
-            if new_count >= MAX_QUESTION_BUDGET:
-                new_status = "ready_for_confirmation"
-            else:
-                new_status = "analyzing"
-
             self.db.execute(
                 """
                 UPDATE grill_sessions
-                SET question_count = ?, status = ?, container_state = 'warm',
+                SET question_count = ?, status = ?, active_questions = '[]', container_state = 'warm',
                     last_activity_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (new_count, new_status, now_stamp, now_stamp, session_id),
+                (new_count, 'analyzing', now_stamp, now_stamp, session_id),
             )
 
             # Queue next worker turn task with snapshot_path if resumed from hibernation
@@ -613,21 +658,23 @@ class GrillStore:
         now_stamp = stamp()
         with self.lock:
             row = self.db.execute(
-                "SELECT status, readback_summary, scenario_state FROM grill_sessions WHERE id = ?",
+                "SELECT status, active_questions, readback_summary, scenario_state FROM grill_sessions WHERE id = ?",
                 (session_id,),
             ).fetchone()
             if not row:
                 raise ValueError("Session not found")
-            if row["status"] not in ("ready_for_confirmation", "interviewing"):
+            if row["status"] != "ready_for_confirmation":
                 raise ValueError(f"Session cannot be confirmed in status '{row['status']}'")
+            if json.loads(row['active_questions'] or '[]') or self.get_active_task_id(session_id):
+                raise ValueError('Wait for the interview to finish before confirming')
 
             self.db.execute(
                 """
                 UPDATE grill_sessions
-                SET status = 'analyzing', updated_at = ?
+                SET status = 'analyzing', confirmation_note = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (now_stamp, session_id),
+                (confirmation_note, now_stamp, session_id),
             )
 
             # Queue specialist report synthesis task
@@ -642,17 +689,6 @@ class GrillStore:
             )
             self.db.commit()
 
-        return self.get_session(session_id) or {}
-
-    def confirm_and_finalize(self, session_id: str, raw_token: str, confirmation_note: str | None = None) -> dict:
-        self.confirm_scenario(session_id, raw_token, confirmation_note)
-        now_stamp = stamp()
-        with self.lock:
-            self.db.execute(
-                "UPDATE grill_sessions SET status = 'completed', container_state = 'completed', finished_at = ?, updated_at = ? WHERE id = ?",
-                (now_stamp, now_stamp, session_id),
-            )
-            self.db.commit()
         return self.get_session(session_id) or {}
 
     def _expire_leases(self) -> None:
@@ -739,6 +775,7 @@ class GrillStore:
                 "files": files,
                 "task_intent": session["task_intent"],
                 "referenced_robot": session["referenced_robot"],
+                "confirmation_note": session["confirmation_note"],
                 "scenario_state": json.loads(session["scenario_state"]) if session["scenario_state"] else None,
                 "active_questions": json.loads(session["active_questions"]) if session["active_questions"] else [],
                 "customer_answers": customer_answers,
@@ -756,13 +793,23 @@ class GrillStore:
         error_message: str | None = None,
     ) -> None:
         now_stamp = stamp()
-        with self.lock:
+        with self.lock, self.db:
             task = self.db.execute(
                 "SELECT * FROM grill_tasks WHERE id = ?",
                 (task_id,),
             ).fetchone()
             if not task:
-                return
+                raise KeyError('Grill task not found')
+            if task['worker_id'] != worker_id:
+                raise PermissionError('Grill task belongs to another worker')
+            if task['status'] in {'completed', 'failed', 'cancelled'}:
+                return  # Retrying a finish request must not apply the output twice.
+            if task['status'] != 'running':
+                raise ValueError('Grill task is not running')
+            if status not in {'completed', 'failed', 'cancelled'}:
+                raise ValueError('Invalid terminal task status')
+            if status == 'completed' and not isinstance(output, dict):
+                raise ValueError('Grill output must be a JSON object')
 
             self.db.execute(
                 """
@@ -794,6 +841,14 @@ class GrillStore:
                 ready_for_readback = bool(output.get("ready_for_readback", False))
                 readback_summary = output.get("summary") or (new_state.get("summary") if isinstance(new_state, dict) else None)
 
+                # Check if ready for customer readback or question budget reached
+                sess_row = self.db.execute("SELECT question_count FROM grill_sessions WHERE id = ?", (session_id,)).fetchone()
+                curr_q_count = sess_row["question_count"] if sess_row else 0
+                new_questions = new_questions[:max(0, min(3, MAX_QUESTION_BUDGET - curr_q_count))]
+                # A readback can summarize unresolved work at the budget limit,
+                # but it must never discard questions still awaiting answers.
+                ready_for_readback = ready_for_readback and not new_questions
+
                 # Record the new turn questions in grill_turns
                 turn_id = f"gturn_{secrets.token_hex(10)}"
                 self.db.execute(
@@ -811,10 +866,6 @@ class GrillStore:
                         now_stamp,
                     ),
                 )
-
-                # Check if ready for customer readback or question budget reached
-                sess_row = self.db.execute("SELECT question_count FROM grill_sessions WHERE id = ?", (session_id,)).fetchone()
-                curr_q_count = sess_row["question_count"] if sess_row else 0
 
                 if ready_for_readback or curr_q_count >= MAX_QUESTION_BUDGET:
                     sess_status = "ready_for_confirmation"
@@ -847,8 +898,9 @@ class GrillStore:
                     )
 
             elif task["action"] == "report":
-                # Final report from 3 specialist subagents
-                final_report = output.get("report") or output
+                # Normalize evidence assessment before exposing it to the customer.
+                sess = self.get_session(session_id)
+                final_report = normalize_report(output.get("report") or output, session_id=session_id, task_intent=sess['task_intent'], state=sess['scenario_state'])
                 summary_ctx = output.get("summary_context")
                 summary_ctx_str = json.dumps(summary_ctx, ensure_ascii=False) if summary_ctx else None
                 self.db.execute(
@@ -1010,4 +1062,3 @@ class GrillStore:
             "user_status_en": "Warming up container and resuming session...",
             "user_status_zh": "正在唤醒计算容器并恢复推演会话...",
         }
-

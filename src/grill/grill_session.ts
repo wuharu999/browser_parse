@@ -1,3 +1,4 @@
+import { sessionContextCards } from './session_context';
 import { CustomerAnswer, GrillSession } from './types';
 import { GrillReportView } from './grill_report';
 import { formatRobotName } from './grill_intake';
@@ -8,6 +9,7 @@ export class GrillSessionView {
   private container: HTMLElement;
   private onNavigate: (path: string) => void;
   private session: GrillSession | null = null;
+  private reportView: GrillReportView | null = null;
   private answers: Map<string, CustomerAnswer> = new Map();
   private confirmationNote = '';
   private isSubmitting = false;
@@ -21,6 +23,7 @@ export class GrillSessionView {
   }
 
   public destroy(): void {
+    this.reportView?.destroy();
     this.isDestroyed = true;
     if (this.pollTimeout) {
       window.clearTimeout(this.pollTimeout);
@@ -45,14 +48,17 @@ export class GrillSessionView {
   private async fetchSession(isSilent = false): Promise<void> {
     try {
       const res = await fetch(`/api/grill/session-by-token?token=${encodeURIComponent(this.token)}`);
+      if (this.isDestroyed) return;
       if (!res.ok) {
         if (res.status === 404 || res.status === 403) {
-          throw new Error(t('Session not found or invalid token. Please check your link.', '推演会话未找到或访问令牌无效，请检查链接。'));
+          this.renderError(t('Session not found or invalid token. Please check your link.', '推演会话未找到或访问令牌无效，请检查链接。'));
+          return;
         }
         throw new Error(t(`Failed to load session: HTTP ${res.status}`, `加载会话失败：HTTP ${res.status}`));
       }
 
       const data: GrillSession = await res.json();
+      if (this.isDestroyed) return;
       this.session = data;
       this.render();
 
@@ -66,10 +72,12 @@ export class GrillSessionView {
         this.schedulePoll(2000);
       }
     } catch (err: unknown) {
+      if (this.isDestroyed) return;
       if (!isSilent) {
         const msg = err instanceof Error ? err.message : String(err);
         this.renderError(msg);
       }
+      this.schedulePoll();
     }
   }
 
@@ -78,8 +86,9 @@ export class GrillSessionView {
     this.container.replaceChildren();
 
     if (this.session.status === 'completed' && this.session.final_report) {
-      const reportView = new GrillReportView(this.session.final_report, this.session, this.container);
-      reportView.render();
+      this.reportView?.destroy();
+      this.reportView = new GrillReportView(this.session.final_report, this.session, this.container);
+      this.reportView.render();
       return;
     }
 
@@ -90,7 +99,7 @@ export class GrillSessionView {
     const header = document.createElement('div');
     header.className = 'grill-session-header';
 
-    const isSettingUp = this.session.status === 'intake_pending' ||
+    const isSettingUp = this.session.status === 'intake_pending' || this.session.pending_action === 'turn' ||
       (this.session.status === 'interviewing' && (!this.session.active_questions || this.session.active_questions.length === 0));
 
     const statusBadgeClass = `status-badge ${isSettingUp ? 'setup' : this.session.status}`;
@@ -101,7 +110,7 @@ export class GrillSessionView {
       intake_pending: t('Setting up pipeline', '管线初始化中'),
       interviewing: isSettingUp ? t('Initializing turn', '准备本轮推演中') : t('Interviewing', '推演访谈中'),
       ready_for_confirmation: t('Ready for Confirmation', '待客户确认'),
-      analyzing: t('Analyzing', '专家分析中'),
+      analyzing: this.session.pending_action === 'turn' ? t('Preparing next questions', '正在准备下一轮问题') : t('Analyzing', '专家分析中'),
       completed: t('Completed', '已完成'),
       failed: t('Failed', '失败'),
     };
@@ -147,63 +156,7 @@ export class GrillSessionView {
       }
     }
 
-    // Uploaded Documents card
-    if (this.session.files && this.session.files.length > 0) {
-      const filesCard = document.createElement('div');
-      filesCard.className = 'grill-card session-files-card';
-      const h3 = document.createElement('h3');
-      h3.textContent = `${t('Uploaded Documents & Diagrams', '上传参考文档与图纸')} (${this.session.files.length})`;
-      filesCard.appendChild(h3);
-
-      for (const f of this.session.files) {
-        const fileRow = document.createElement('div');
-        fileRow.className = 'file-item';
-        const fileLink = document.createElement('a');
-        fileLink.href = `/api/grill/sessions/${this.session.id}/files/${f.id}?token=${encodeURIComponent(this.token)}`;
-        fileLink.target = '_blank';
-        fileLink.className = 'file-link';
-        fileLink.textContent = `📎 ${f.name} (${f.size} B)`;
-        fileRow.appendChild(fileLink);
-        filesCard.appendChild(fileRow);
-      }
-      wrapper.appendChild(filesCard);
-    }
-
-    // Past Turn Transcript
-    if (this.session.turns && this.session.turns.length > 0) {
-      const turnsCard = document.createElement('div');
-      turnsCard.className = 'grill-card turns-history-card';
-      const h3 = document.createElement('h3');
-      h3.textContent = t('Past Turn Transcript', '往轮问答推演记录');
-      turnsCard.appendChild(h3);
-
-      for (const turn of this.session.turns) {
-        const turnRow = document.createElement('div');
-        turnRow.className = 'turn-row';
-        turnRow.setAttribute('data-turn-index', String(turn.turn_index));
-
-        const turnHeader = document.createElement('div');
-        turnHeader.className = 'turn-row-header';
-        turnHeader.textContent = `${t('Turn', '第')} ${turn.turn_index} ${t('', '轮问答')}`;
-        turnRow.appendChild(turnHeader);
-
-        for (const q of turn.questions) {
-          const qBox = document.createElement('div');
-          qBox.className = 'past-question-box';
-          qBox.textContent = `Q: ${q.text} ${q.why ? `(💡 ${q.why})` : ''}`;
-          turnRow.appendChild(qBox);
-        }
-        for (const a of turn.answers) {
-          const aBox = document.createElement('div');
-          aBox.className = 'past-answer-box';
-          const ansText = a.selected_option || a.free_text_answer || (a.is_unknown ? 'Unknown' : '');
-          aBox.textContent = `A: ${ansText}`;
-          turnRow.appendChild(aBox);
-        }
-        turnsCard.appendChild(turnRow);
-      }
-      wrapper.appendChild(turnsCard);
-    }
+    for (const card of sessionContextCards(this.session, this.token)) wrapper.appendChild(card);
 
     // Body based on state
     if (this.session.status === 'intake_pending' || (this.session.status === 'interviewing' && (!this.session.active_questions || this.session.active_questions.length === 0))) {
@@ -213,7 +166,7 @@ export class GrillSessionView {
     } else if (this.session.status === 'ready_for_confirmation') {
       wrapper.appendChild(this.renderConfirmationState());
     } else if (this.session.status === 'analyzing') {
-      wrapper.appendChild(this.renderAnalyzingState());
+      wrapper.appendChild(this.session.pending_action === 'turn' ? this.renderSetupProgress() : this.renderAnalyzingState());
     } else if (this.session.status === 'failed') {
       wrapper.appendChild(this.renderFailedState());
     }
@@ -325,7 +278,7 @@ export class GrillSessionView {
       // Current answer state for this question
       let currentAns = this.answers.get(q.id);
       if (!currentAns) {
-        currentAns = { question_id: q.id, selected_option: null, free_text_answer: null, is_unknown: false };
+        currentAns = { question_id: q.id, selected_option: null, free_text: null, unknown: false };
         this.answers.set(q.id, currentAns);
       }
 
@@ -345,7 +298,7 @@ export class GrillSessionView {
       for (const opt of q.options) {
         const optBtn = document.createElement('button');
         optBtn.type = 'button';
-        const isSelected = currentAns.selected_option === opt.label && !currentAns.is_unknown && !currentAns.free_text_answer;
+        const isSelected = currentAns.selected_option === opt.label && !currentAns.unknown && !currentAns.free_text;
         optBtn.className = `option-pill ${isSelected ? 'selected' : ''}`;
         optBtn.innerHTML = `
           <strong class="opt-label">${this.escape(opt.label)}</strong>
@@ -355,8 +308,8 @@ export class GrillSessionView {
           this.answers.set(q.id, {
             question_id: q.id,
             selected_option: opt.label,
-            free_text_answer: null,
-            is_unknown: false,
+            free_text: null,
+            unknown: false,
           });
           this.render();
         });
@@ -367,15 +320,15 @@ export class GrillSessionView {
       if (q.allow_unknown !== false) {
         const unknownBtn = document.createElement('button');
         unknownBtn.type = 'button';
-        const isUnknown = !!currentAns.is_unknown;
+        const isUnknown = !!currentAns.unknown;
         unknownBtn.className = `option-pill option-unknown ${isUnknown ? 'selected' : ''}`;
         unknownBtn.innerHTML = `<span class="opt-unknown-icon">❓</span> <strong>${t("I don't know / Not sure", '我不确定 / 暂无规定')}</strong>`;
         unknownBtn.addEventListener('click', () => {
           this.answers.set(q.id, {
             question_id: q.id,
             selected_option: null,
-            free_text_answer: null,
-            is_unknown: true,
+            free_text: null,
+            unknown: true,
           });
           this.render();
         });
@@ -392,23 +345,24 @@ export class GrillSessionView {
         freeInput.type = 'text';
         freeInput.className = 'grill-input free-text-input';
         freeInput.placeholder = t('Or enter custom specification (Other)...', '或输入自定义规格（其他）...');
-        freeInput.value = currentAns.free_text_answer || '';
+        freeInput.value = currentAns.free_text || '';
 
         freeInput.addEventListener('input', () => {
           const val = freeInput.value.trim();
           if (val) {
+            optionsBox.querySelectorAll('.selected').forEach(option => option.classList.remove('selected'));
             this.answers.set(q.id, {
               question_id: q.id,
               selected_option: null,
-              free_text_answer: val,
-              is_unknown: false,
+              free_text: val,
+              unknown: false,
             });
-          } else if (currentAns?.free_text_answer) {
+          } else if (this.answers.get(q.id)?.free_text) {
             this.answers.set(q.id, {
               question_id: q.id,
               selected_option: null,
-              free_text_answer: null,
-              is_unknown: false,
+              free_text: null,
+              unknown: false,
             });
           }
         });
@@ -446,8 +400,8 @@ export class GrillSessionView {
     for (const q of questions) {
       const ans = this.answers.get(q.id);
       const hasOption = !!ans?.selected_option;
-      const hasFree = !!ans?.free_text_answer?.trim();
-      const hasUnknown = !!ans?.is_unknown;
+      const hasFree = !!ans?.free_text?.trim();
+      const hasUnknown = !!ans?.unknown;
 
       if (!hasOption && !hasFree && !hasUnknown) {
         this.showNotice(noticeEl, t(`Please provide an answer or click "Not sure" for: "${q.text}"`, `请为以下问题提供答案或点击“我不确定”：“${q.text}”`), true);
@@ -457,8 +411,8 @@ export class GrillSessionView {
       submissionAnswers.push({
         question_id: q.id,
         selected_option: (hasOption && ans) ? ans.selected_option : null,
-        free_text_answer: (hasFree && ans) ? ans.free_text_answer : null,
-        is_unknown: hasUnknown,
+        free_text: (hasFree && ans) ? ans.free_text : null,
+        unknown: hasUnknown,
       });
     }
 
@@ -482,12 +436,14 @@ export class GrillSessionView {
       }
 
       const updated: GrillSession = await res.json();
+      if (this.isDestroyed) return;
       this.session = updated;
       this.answers.clear();
       this.isSubmitting = false;
       this.render();
       this.schedulePoll(2000);
     } catch (err: unknown) {
+      if (this.isDestroyed) return;
       const msg = err instanceof Error ? err.message : String(err);
       this.showNotice(noticeEl, t(`Error submitting answers: ${msg}`, `提交回答失败：${msg}`), true);
       submitBtn.disabled = false;
@@ -575,11 +531,13 @@ export class GrillSessionView {
       }
 
       const updated: GrillSession = await res.json();
+      if (this.isDestroyed) return;
       this.session = updated;
       this.isSubmitting = false;
       this.render();
       this.schedulePoll(2000);
     } catch (err: unknown) {
+      if (this.isDestroyed) return;
       const msg = err instanceof Error ? err.message : String(err);
       this.showNotice(noticeEl, t(`Error confirming scenario: ${msg}`, `确认场景失败：${msg}`), true);
       confirmBtn.disabled = false;

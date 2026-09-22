@@ -76,26 +76,26 @@ describe('Grill Question & Answer Contract', () => {
     const ansOption: CustomerAnswer = {
       question_id: q.id,
       selected_option: '< 5kg',
-      free_text_answer: null,
-      is_unknown: false,
+      free_text: null,
+      unknown: false,
     };
     expect(ansOption.selected_option).toBe('< 5kg');
 
     const ansUnknown: CustomerAnswer = {
       question_id: q.id,
       selected_option: null,
-      free_text_answer: null,
-      is_unknown: true,
+      free_text: null,
+      unknown: true,
     };
-    expect(ansUnknown.is_unknown).toBe(true);
+    expect(ansUnknown.unknown).toBe(true);
 
     const ansFree: CustomerAnswer = {
       question_id: q.id,
       selected_option: null,
-      free_text_answer: 'Exactly 7.2kg with custom clamp',
-      is_unknown: false,
+      free_text: 'Exactly 7.2kg with custom clamp',
+      unknown: false,
     };
-    expect(ansFree.free_text_answer).toContain('7.2kg');
+    expect(ansFree.free_text).toContain('7.2kg');
   });
 });
 
@@ -177,7 +177,7 @@ describe('Grill Markdown Report Generation', () => {
 
     expect(md).toContain('# Robot Scenario Assessment: Carry warehouse pallet with B2 quadruped');
     expect(md).toContain('**Target Robot:** Unitree B2');
-    expect(md).toContain('**Questions Answered:** 24 / 30');
+    expect(md).toContain('**Questions Answered:** 24 / 25');
     expect(md).toContain('## 1. Scenario Summary');
     expect(md).toContain('## 2. Capabilities Assessment');
     expect(md).toContain('**[VERIFIED]** Payload capacity');

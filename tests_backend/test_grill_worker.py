@@ -1,8 +1,14 @@
 import json
 import tempfile
+import pytest
 from pathlib import Path
 from backend.grill_store import GrillStore
 from sandbox import run_grill
+
+
+@pytest.fixture(autouse=True)
+def demo_runner(monkeypatch):
+    monkeypatch.setenv('ROBOT_GRILL_USE_FALLBACK', '1')
 
 
 def test_grill_turn_runner_execution(tmp_path):
@@ -78,10 +84,11 @@ def test_grill_turn_runner_execution(tmp_path):
         report = res3["report"]
         assert "scenario_summary" in report
         assert "capabilities" in report
-        assert "architecture" in report
+        assert "system_architecture" in report
         assert "risk_matrix" in report
-        assert len(report["capabilities"]["claims"]) > 0
-        assert len(report["risk_matrix"]["risks"]) > 0
+        assert report["assessment_status"] == "incomplete"
+        assert report["capabilities"]["claims"] == []
+        assert report["risk_matrix"]["risks"] == []
     finally:
         run_grill.WORKSPACE = original_workspace
 
@@ -165,4 +172,3 @@ def test_run_codex_grill_writes_config(tmp_path, monkeypatch):
     finally:
         run_codex.WORKSPACE = orig_rc_ws
         run_grill.WORKSPACE = orig_rg_ws
-

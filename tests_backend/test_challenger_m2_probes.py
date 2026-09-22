@@ -644,7 +644,9 @@ def test_probe_4_store_level_scanner_boundary_and_status_filtering(tmp_path: Pat
     store.worker_finish_grill(claim2["id"], "worker-test", "completed", {
         "scenario_state": {"rev": 25}, "questions": [], "ready_for_readback": True
     })
-    store.confirm_and_finalize(s2["id"], tok2)
+    store.confirm_scenario(s2["id"], tok2)
+    report_task = store.worker_claim_grill('worker-test', {'cpu_milli': 2000, 'memory_mb': 4096})
+    store.worker_finish_grill(report_task['id'], 'worker-test', 'completed', {'scenario_summary': 'Task 2 assessment'})
     assert store.get_session(s2["id"])["status"] == "completed"
 
     t_base = time.time()
@@ -695,7 +697,7 @@ def test_probe_5_cold_resumption_provisions_fresh_container_and_restores(tmp_pat
     assert snap_file.is_file()
 
     # User submits Turn 2 answers
-    answers = [{"question_id": "q_turn_1", "selected_option": "Option A", "free_text": "Proceed with 24V supply", "unknown": False}]
+    answers = [{"question_id": "q_turn_1", "selected_option": None, "free_text": "Proceed with 24V supply", "unknown": False}]
     updated = store.submit_answers(sid, token, answers)
     assert updated["status"] == "analyzing"
     assert updated["container_state"] == "warm"
@@ -744,7 +746,7 @@ def test_probe_5_alternating_warm_and_cold_multi_turn_lifecycle(tmp_path: Path):
     assert len(runtime.created) == 1
 
     # --- Turn 2: Warm reuse within 60s (<300s) ---
-    store.submit_answers(sid, token, [{"question_id": "q_turn_1", "selected_option": "Opt1", "free_text": None, "unknown": False}])
+    store.submit_answers(sid, token, [{"question_id": "q_turn_1", "selected_option": None, "free_text": "Opt1", "unknown": False}])
     worker.run_once()
     assert len(runtime.created) == 1  # Reused c1
     assert worker.grill_containers[sid]["container"].container == c1
@@ -756,7 +758,7 @@ def test_probe_5_alternating_warm_and_cold_multi_turn_lifecycle(tmp_path: Path):
     assert c1 in runtime.removed_containers
 
     # --- Turn 3: Cold resumption ---
-    store.submit_answers(sid, token, [{"question_id": "q_turn_2", "selected_option": "Opt2", "free_text": None, "unknown": False}])
+    store.submit_answers(sid, token, [{"question_id": "q_turn_2", "selected_option": None, "free_text": "Opt2", "unknown": False}])
     worker.run_once()
     assert len(runtime.created) == 2  # New container c2
     c2 = worker.grill_containers[sid]["container"].container
@@ -764,7 +766,7 @@ def test_probe_5_alternating_warm_and_cold_multi_turn_lifecycle(tmp_path: Path):
     assert len(runtime.restores_performed) == 1
 
     # --- Turn 4: Warm reuse within 120s (<300s) ---
-    store.submit_answers(sid, token, [{"question_id": "q_turn_3", "selected_option": "Opt3", "free_text": None, "unknown": False}])
+    store.submit_answers(sid, token, [{"question_id": "q_turn_3", "selected_option": None, "free_text": "Opt3", "unknown": False}])
     worker.run_once()
     assert len(runtime.created) == 2  # Reused c2
     assert worker.grill_containers[sid]["container"].container == c2
@@ -776,7 +778,7 @@ def test_probe_5_alternating_warm_and_cold_multi_turn_lifecycle(tmp_path: Path):
     assert c2 in runtime.removed_containers
 
     # --- Turn 5: Cold resumption ---
-    store.submit_answers(sid, token, [{"question_id": "q_turn_4", "selected_option": "Opt4", "free_text": None, "unknown": False}])
+    store.submit_answers(sid, token, [{"question_id": "q_turn_4", "selected_option": None, "free_text": "Opt4", "unknown": False}])
     worker.run_once()
     assert len(runtime.created) == 3  # New container c3
     c3 = worker.grill_containers[sid]["container"].container

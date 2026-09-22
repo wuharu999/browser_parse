@@ -134,7 +134,7 @@ def test_grill_store_lifecycle(tmp_path):
 
     final_sess = store.get_session(session["id"])
     assert final_sess["status"] == "completed"
-    assert final_sess["final_report"]["scenario_summary"]["target_robot"] == "Unitree B2"
+    assert final_sess["final_report"]["target_robot"] == "Unitree B2"
 
 
 def test_question_budget_hard_stop(tmp_path):
@@ -153,10 +153,10 @@ def test_question_budget_hard_stop(tmp_path):
     store.worker_finish_grill(claim["id"], "worker-1", "completed", {"scenario_state": {}, "questions": q, "ready_for_readback": False})
 
     # Submitting answer should hit hard stop at 25
-    ans = [{"question_id": "q_last", "selected_option": "Yes", "free_text": None, "unknown": False}]
+    ans = [{"question_id": "q_last", "selected_option": None, "free_text": "Yes", "unknown": False}]
     updated = store.submit_answers(session["id"], token, ans)
     assert updated["question_count"] == 25
-    assert updated["status"] == "ready_for_confirmation"
+    assert updated["status"] == "analyzing"
 
 
 def test_list_sessions_store(tmp_path):

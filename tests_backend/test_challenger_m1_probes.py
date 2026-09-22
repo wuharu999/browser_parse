@@ -201,14 +201,14 @@ def test_probe_2_budget_constant_and_store_ceiling(test_app):
         store.db.commit()
 
     answers = [
-        {"question_id": "q1", "selected_option": "opt1", "free_text": ""},
-        {"question_id": "q2", "selected_option": "opt2", "free_text": ""},
+        {"question_id": "q1", "selected_option": None, "free_text": "opt1"},
+        {"question_id": "q2", "selected_option": None, "free_text": "opt2"},
     ]
 
     updated = store.submit_answers(sid, token, answers)
     assert updated["question_count"] == 25
     # Must immediately transition to ready_for_confirmation upon hitting 25
-    assert updated["status"] == "ready_for_confirmation"
+    assert updated["status"] == "analyzing"
 
 
 def test_probe_2_store_update_from_turn_result_enforces_readback(test_app):
@@ -318,7 +318,7 @@ def test_probe_3_runner_ready_for_readback_at_budget(tmp_path, monkeypatch):
     # Run inside tmp_path
     monkeypatch.setattr("sandbox.run_grill.WORKSPACE", tmp_path)
     (tmp_path / "inputs").mkdir(parents=True, exist_ok=True)
-    os.environ["ROBOT_GRILL_USE_FALLBACK"] = "1"
+    monkeypatch.setenv('ROBOT_GRILL_USE_FALLBACK', '1')
 
     job = {
         "action": "turn",
@@ -511,5 +511,4 @@ def test_probe_5_forbidden_ip_never_present_in_codebase():
                 offending_files.append(str(path.relative_to(root_dir)))
 
     assert not offending_files, f"Forbidden IP {forbidden_ip} found in source files: {offending_files}"
-
 

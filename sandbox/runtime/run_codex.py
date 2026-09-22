@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from .analysis_context import MAX_CONTEXT_BYTES, validate_context
+    from ..analysis_context import MAX_CONTEXT_BYTES, validate_context
 except ImportError:  # Executed as /opt/sandbox/run_codex.py in the job image.
     from analysis_context import MAX_CONTEXT_BYTES, validate_context
 
@@ -536,8 +536,8 @@ Inputs are under /workspace/inputs and optional wiki context under /workspace/wi
 """
 
 
-def _write_config(model: str) -> None:
-    home = WORKSPACE / ".codex"
+def _write_config(model: str, workspace: Path | None = None) -> None:
+    home = (workspace or WORKSPACE) / ".codex"
     home.mkdir(parents=True, exist_ok=True)
     # Tiered reasoning architecture (R1.1): The main orchestrator uses high reasoning effort
     # by default for deep synthesis and root-cause analysis, configurable via ROBOT_CODEX_REASONING_EFFORT.

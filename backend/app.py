@@ -17,7 +17,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, StrictInt
+from pydantic import AliasChoices, BaseModel, Field, StrictInt
 from starlette.background import BackgroundTask
 
 from .store import Store
@@ -82,7 +82,7 @@ class QuestionIn(BaseModel):
 
 class GrillQuestionIn(BaseModel):
     question: str = Field(min_length=1, max_length=4000)
-    request_id: str | None = None
+    request_id: str | None = Field(default=None, min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
 
 
 class AnalysisContextIn(BaseModel):
@@ -108,10 +108,10 @@ class CreateGrillSession(BaseModel):
 
 
 class GrillAnswerItem(BaseModel):
-    question_id: str
+    question_id: str = Field(min_length=1, max_length=200)
     selected_option: str | None = None
-    free_text: str | None = None
-    unknown: bool = False
+    free_text: str | None = Field(default=None, max_length=4000, validation_alias=AliasChoices('free_text', 'free_text_answer'))
+    unknown: bool = Field(default=False, validation_alias=AliasChoices('unknown', 'is_unknown'))
 
 
 class GrillTurnSubmission(BaseModel):
@@ -135,8 +135,10 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None, gri
     @asynccontextmanager
     async def lifespan(app):
         store.interrupt_questions()
+        grill_store.interrupt_questions()
         yield
         store.interrupt_questions()
+        grill_store.interrupt_questions()
 
     app = FastAPI(title="Robot Log Workbench API", docs_url=None, redoc_url=None, lifespan=lifespan)
     app.state.store = store
@@ -649,7 +651,10 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None, gri
         sess = grill_store.get_session(session_id)
         if not sess:
             raise HTTPException(404, "Session not found")
-        task_id = grill_store.enqueue_turn(session_id, 1)
+        try:
+            task_id = grill_store.enqueue_turn(session_id, 1)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
         return {"session_id": session_id, "task_id": task_id, "status": "queued"}
 
     @app.get("/api/grill/sessions/{session_id}/questions")
@@ -666,9 +671,12 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None, gri
         raw_token = token or (authorization[7:].strip() if authorization and authorization.startswith("Bearer ") else "")
         if not raw_token or not grill_store.verify_token(session_id, raw_token):
             raise HTTPException(403, "Invalid or missing session token")
-        data = grill_store.list_followup_questions(session_id, limit=limit, before=before)
+        try:
+            data = grill_store.list_followup_questions(session_id, limit=limit, before=before)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
         chat = getattr(app.state, "chat", None)
-        data["available"] = chat.available if chat else True
+        data["available"] = bool(chat and chat.available and sess.get("status") == "completed")
         data["context_mode"] = "report_and_notes"
         return data
 
@@ -690,58 +698,45 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None, gri
         if not body.question.strip():
             raise HTTPException(422, "Question cannot be empty or whitespace only")
 
-        item = grill_store.add_followup_question(session_id, body.question.strip())
+        chat = getattr(app.state, 'chat', None)
+        if not chat or not chat.available:
+            raise HTTPException(503, 'Report Q&A is currently unavailable')
+        try:
+            item, created = grill_store.begin_followup_question(session_id, body.question.strip(), body.request_id)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if not created:
+            return {'item': item}
 
-        def encode(event: str, **data) -> str:
-            return json.dumps({"type": event, **data}, ensure_ascii=False) + "\n"
-
-        chat = getattr(app.state, "chat", None)
+        def encode(event: str, item: dict) -> str:
+            return json.dumps({'type': event, 'item': item}, ensure_ascii=False) + '\n'
 
         async def stream():
-            answer = ""
+            answer = ''
+            completed = False
             try:
-                yield encode("started", item=item)
-                if chat and chat.available:
-                    context, history = grill_store.get_followup_chat_context(session_id)
-                    async with asyncio.timeout(chat.timeout_seconds):
-                        async for delta in chat.answer(context, history, item["question"]):
-                            answer += delta
-                            if len(answer) > 20000:
-                                raise ValueError("answer too large")
-                            saved = grill_store.update_followup_question(item["id"], chat.sanitize(answer), "generating")
-                            yield encode("answer", item=saved)
-                    if not answer.strip():
-                        raise ValueError("empty answer")
-                    saved = grill_store.update_followup_question(item["id"], chat.sanitize(answer), "completed")
-                    yield encode("done", item=saved)
-                else:
-                    summary_ctx = sess.get("final_report") or {}
-                    if isinstance(summary_ctx, str):
-                        try:
-                            summary_ctx = json.loads(summary_ctx)
-                        except Exception:
-                            summary_ctx = {}
-                    scenario = summary_ctx.get("scenario_summary", {}) if isinstance(summary_ctx, dict) else {}
-                    target_robot = scenario.get("target_robot") or sess.get("referenced_robot") or "Walker_C1_EDU"
-                    task_name = scenario.get("task") or sess.get("task_intent") or "scenario task"
-                    answer_text = f"Based on the scenario synthesis for {target_robot}: {item['question']} is verified and feasible within defined constraints."
-
-                    part1 = answer_text[:len(answer_text) // 2]
-                    saved = grill_store.update_followup_question(item["id"], part1, "generating")
-                    yield encode("answer", item=saved)
-
-                    saved = grill_store.update_followup_question(item["id"], answer_text, "generating")
-                    yield encode("answer", item=saved)
-
-                    saved = grill_store.update_followup_question(item["id"], answer_text, "completed")
-                    yield encode("done", item=saved)
+                yield encode('started', item)
+                context, history = grill_store.get_followup_chat_context(session_id)
+                async with asyncio.timeout(chat.timeout_seconds):
+                    async for delta in chat.answer(context, history, item['question']):
+                        answer += delta
+                        if len(answer) > 20000:
+                            raise ValueError('Answer too large')
+                        saved = grill_store.update_followup_question(item['id'], chat.sanitize(answer), 'generating')
+                        yield encode('answer', saved)
+                if not answer.strip():
+                    raise ValueError('Empty answer')
+                saved = grill_store.update_followup_question(item['id'], chat.sanitize(answer), 'completed')
+                completed = True
+                yield encode('done', saved)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
-                saved = grill_store.update_followup_question(
-                    item["id"], answer, "interrupted", str(exc)
-                )
-                yield encode("interrupted", item=saved)
+            except Exception:
+                saved = grill_store.update_followup_question(item['id'], chat.sanitize(answer), 'interrupted', 'Answer interrupted')
+                yield encode('interrupted', saved)
+            finally:
+                if not completed:
+                    grill_store.update_followup_question(item['id'], chat.sanitize(answer), 'interrupted', 'Answer interrupted')
 
         return StreamingResponse(
             stream(),
@@ -826,7 +821,14 @@ def create_app(*, db_path: str | None = None, upload_dir: str | None = None, gri
             except Exception:
                 out = {"report": body.report}
             err_msg = body.report if body.status != "completed" else None
-            grill_store.worker_finish_grill(job_id, identity, body.status, out, error_message=err_msg)
+            try:
+                grill_store.worker_finish_grill(job_id, identity, body.status, out, error_message=err_msg)
+            except KeyError as exc:
+                raise HTTPException(404, 'Grill task not found') from exc
+            except PermissionError as exc:
+                raise HTTPException(403, str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from exc
             return {"id": job_id, "status": body.status}
         try: return store.finish(job_id, owned_worker_identity(job_id, authorization, x_worker_id), body.status, body.report, body.cost_usd, body.metrics, body.analysis_context)
         except KeyError: raise HTTPException(404, "job not found")

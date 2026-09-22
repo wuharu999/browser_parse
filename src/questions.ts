@@ -1,6 +1,6 @@
 import { t } from './i18n';
 
-export type Question = { id: number | string; request_id?: string; question: string; answer: string; status: 'generating' | 'completed' | 'interrupted'; error?: string | null };
+export type Question = { id: number | string; request_id?: string; sequence?: number; question: string; answer: string; status: 'generating' | 'completed' | 'interrupted'; error?: string | null };
 type History = { items: Question[]; next_before?: number | null; active?: Question | null; available: boolean; context_mode?: string };
 export type ChatEvent = { type: 'started' | 'answer' | 'done' | 'interrupted'; item: Question };
 
@@ -8,18 +8,20 @@ export async function readAnswer(response: Response, receive: (event: ChatEvent)
   if (!response.body) throw new Error('Missing response stream');
   const reader = response.body.getReader(), decoder = new TextDecoder();
   let buffer = '', ended = false;
+  const consume = (line: string) => {
+    if (!line.trim()) return;
+    const event = JSON.parse(line) as ChatEvent;
+    if (!event.item || !['started', 'answer', 'done', 'interrupted'].includes(event.type)) throw new Error('Invalid response stream');
+    receive(event);
+    if (event.type === 'done' || event.type === 'interrupted') ended = true;
+  };
   try {
     while (true) {
       const { value, done } = await reader.read();
       buffer += decoder.decode(value, { stream: !done });
       const lines = buffer.split('\n'); buffer = lines.pop() ?? '';
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        const event = JSON.parse(line) as ChatEvent;
-        if (!event.item || !['started', 'answer', 'done', 'interrupted'].includes(event.type)) throw new Error('Invalid response stream');
-        receive(event);
-        if (event.type === 'done' || event.type === 'interrupted') ended = true;
-      }
+      for (const line of lines) consume(line);
+      if (done && buffer.trim()) consume(buffer);
       if (done) break;
     }
     if (!ended) throw new Error('Answer stream interrupted');
@@ -48,6 +50,10 @@ export class QuestionsPanel {
   private streaming = false;
   private loaded = false;
   private error = '';
+  private destroyed = false;
+  private polling = false;
+  private pollTimer: ReturnType<typeof setTimeout> | undefined;
+  private requests = new AbortController();
   private pending: { question: string; request_id: string } | undefined;
 
   constructor(
@@ -72,6 +78,23 @@ export class QuestionsPanel {
     this.labels();
   }
 
+  start(): void {
+    if (this.polling || this.destroyed) return;
+    this.polling = true;
+    const refresh = async () => {
+      if (this.destroyed) return;
+      await this.poll();
+      if (!this.destroyed) this.pollTimer = setTimeout(refresh, 2000);
+    };
+    void refresh();
+  }
+
+  destroy(): void {
+    this.destroyed = true;
+    clearTimeout(this.pollTimer);
+    this.requests.abort();
+  }
+
   labels(): void {
     const isGrill = this.basePath.includes('grill');
     this.heading.textContent = isGrill
@@ -91,7 +114,7 @@ export class QuestionsPanel {
   }
 
   async poll(older = false): Promise<void> {
-    if (this.loading || this.streaming || !this.element.isConnected) return;
+    if (this.destroyed || this.loading || this.streaming || !this.element.isConnected) return;
     this.loading = true; this.controls();
     try {
       const url = `${this.basePath}/${this.jobId}/questions${older && this.before ? `?before=${this.before}` : ''}`;
@@ -99,9 +122,10 @@ export class QuestionsPanel {
       if (this.token) {
         headers['Authorization'] = `Bearer ${this.token}`;
       }
-      const response = await fetch(url, { headers });
+      const response = await fetch(url, { headers, signal: this.requests.signal });
       if (!response.ok) throw new Error('history unavailable');
       const page = await response.json() as History;
+      if (this.destroyed) return;
       this.available = page.available !== false;
       if (page.context_mode) this.contextMode = page.context_mode;
       this.active = page.active || null;
@@ -110,6 +134,7 @@ export class QuestionsPanel {
       if (page.active) this.items.set(page.active.id, page.active);
       this.loaded = true; this.error = ''; this.render(older);
     } catch {
+      if (this.destroyed) return;
       this.error = t('Could not load questions. Retrying…', '无法加载问答，正在重试…'); this.controls();
     } finally { this.loading = false; this.controls(); }
   }
@@ -138,7 +163,7 @@ export class QuestionsPanel {
     if (!this.items.size) {
       const empty = node('p', 'muted'); empty.textContent = t('Ask a question to start the shared conversation.', '提出问题，开始共享对话。'); this.transcript.append(empty);
     }
-    for (const item of [...this.items.values()].sort((a, b) => String(a.id).localeCompare(String(b.id), undefined, { numeric: true }))) {
+    for (const item of [...this.items.values()].sort((a, b) => a.sequence !== undefined && b.sequence !== undefined ? a.sequence - b.sequence : String(a.id).localeCompare(String(b.id), undefined, { numeric: true }))) {
       const exchange = node('article', 'question-exchange'); exchange.dataset.questionId = String(item.id);
       const question = node('p', 'question-text'), answer = node('p', 'question-answer');
       question.textContent = item.question;
@@ -157,7 +182,7 @@ export class QuestionsPanel {
   }
 
   private async submit(question: string): Promise<void> {
-    if (!question || this.streaming || this.loading || this.active || !this.available) return;
+    if (this.destroyed || !question || this.streaming || this.loading || this.active || !this.available) return;
     // Keep this ID on ambiguous network failures; only an explicit new attempt
     // after a known interrupted answer gets a new ID.
     if (this.pending?.question !== question) this.pending = { question, request_id: requestId() };
@@ -165,6 +190,7 @@ export class QuestionsPanel {
     this.streaming = true; this.error = ''; this.controls();
     let acknowledged = false;
     const receive = (item: Question) => {
+      if (this.destroyed) return;
       acknowledged = true;
       if (this.input.value.trim() === question) this.input.value = '';
       this.items.set(item.id, item); this.active = item.status === 'generating' ? item : null;
@@ -176,7 +202,7 @@ export class QuestionsPanel {
       if (this.token) {
         headers['Authorization'] = `Bearer ${this.token}`;
       }
-      const response = await fetch(url, { method: 'POST', headers, body: JSON.stringify(pending) });
+      const response = await fetch(url, { method: 'POST', headers, body: JSON.stringify(pending), signal: this.requests.signal });
       if (!response.ok) {
         if (response.status === 409) this.pending = undefined;
         throw new Error('request failed');
@@ -185,6 +211,7 @@ export class QuestionsPanel {
       else receive((await response.json() as { item: Question }).item);
       this.pending = undefined;
     } catch {
+      if (this.destroyed) return;
       this.error = acknowledged ? t('Connection interrupted. Checking the saved answer…', '连接中断，正在检查已保存的回答…') : t('Could not send. Your question is preserved; send again to retry.', '发送失败，问题已保留；可再次发送重试。');
     } finally {
       this.streaming = false; this.controls();

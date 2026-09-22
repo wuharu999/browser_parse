@@ -24,14 +24,15 @@ export interface GrillQuestion {
 export interface CustomerAnswer {
   question_id: string;
   selected_option?: string | null;
-  free_text_answer?: string | null;
-  is_unknown?: boolean;
+  free_text?: string | null;
+  unknown?: boolean;
 }
 
 export interface BehaviorTreeNode {
   id: string;
-  name: string;
-  type: 'sequence' | 'fallback' | 'action' | 'condition' | 'decorator';
+  name?: string;
+  label?: string;
+  type: 'sequence' | 'fallback' | 'action' | 'condition' | 'decorator' | 'Sequence' | 'Fallback' | 'Action' | 'Condition' | 'SubTree' | 'Retry' | 'Timeout' | 'Loop';
   description?: string;
   parent_id?: string | null;
   children?: string[];
@@ -55,7 +56,7 @@ export interface CapabilityClaim {
   claim_id: string;
   title: string;
   category: string;
-  status: 'verified' | 'feasible' | 'gap' | 'unsupported';
+  status: 'verified' | 'feasible' | 'gap' | 'unsupported' | 'unknown' | 'candidate' | 'documented' | 'inferred';
   statement: string;
   citations?: string[];
 }
@@ -66,18 +67,23 @@ export interface ArchNode {
   type: string;
   topics_sub?: string[];
   topics_pub?: string[];
+  responsibility?: string;
+  interfaces?: string[];
 }
 
 export interface RiskItem {
   risk_id: string;
   title: string;
-  severity: 'low' | 'medium' | 'high' | 'critical';
-  likelihood: 'low' | 'medium' | 'high';
+  severity: 'low' | 'medium' | 'high' | 'critical' | 'unknown';
+  likelihood: 'low' | 'medium' | 'high' | 'unknown';
   mitigation: string;
   citations?: string[];
 }
 
 export interface GrillReport {
+  assessment_status?: 'incomplete' | 'review_required';
+  validation?: { issues: string[] };
+  target_robot?: string | null;
   schema_version: string;
   session_id: string;
   scenario_summary: string;
@@ -139,6 +145,7 @@ export interface GrillSession {
   setup_stage?: string;
   setup_message?: string;
   active_task_id?: string;
+  pending_action?: 'turn' | 'report' | null;
 }
 
 export interface SessionCreateResponse {

@@ -32,4 +32,10 @@ describe('question answer streaming', () => {
     await readAnswer(new Response(event('interrupted', 'Partial')), () => {});
     await expect(readAnswer(new Response('{"type":"unexpected"}\n'), () => {})).rejects.toThrow();
   });
+
+  it('accepts the terminal frame without a trailing newline', async () => {
+    const received: ChatEvent[] = [];
+    await readAnswer(new Response(event('done', 'Complete answer').trimEnd()), e => received.push(e));
+    expect(received.at(-1)?.item.answer).toBe('Complete answer');
+  });
 });

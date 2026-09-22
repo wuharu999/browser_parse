@@ -306,8 +306,8 @@ def test_budget_boundary_jump_from_24_to_26(store):
 
     # Submit answers to both questions
     answers = [
-        {"question_id": "q_024", "selected_option": "A"},
-        {"question_id": "q_025", "selected_option": "B"},
+        {"question_id": "q_024", "free_text": "A"},
+        {"question_id": "q_025", "free_text": "B"},
     ]
     store.submit_answers(session_id, token, answers)
 
@@ -322,8 +322,8 @@ def test_budget_boundary_jump_from_24_to_26(store):
     is_clamped_to_25 = (recorded_count == 25)
 
     # Status must transition to ready_for_confirmation because count >= 25
-    assert recorded_status == "ready_for_confirmation", (
-        f"Status should be 'ready_for_confirmation' when budget is reached, got {recorded_status}"
+    assert recorded_status == "analyzing", (
+        f"Final answer must be processed before confirmation, got {recorded_status}"
     )
 
     # Now verify build_turn_prompt with the resulting question count
@@ -345,9 +345,7 @@ def test_budget_boundary_jump_from_24_to_26(store):
     assert draft["questions"] == []
     assert draft["checks"]["ready_for_readback"] is True
 
-    # Test what happens if someone attempts to submit answers again when ready_for_confirmation
-    # Note: store allows submit_answers when in ('interviewing', 'ready_for_confirmation')
-    # Let's see what happens if another answer submission occurs:
+    # A second submission cannot advance the count while the final answer is processing.
     with store.lock:
         store.db.execute(
             "UPDATE grill_sessions SET active_questions = ? WHERE id = ?",
@@ -355,10 +353,11 @@ def test_budget_boundary_jump_from_24_to_26(store):
         )
         store.db.commit()
 
-    store.submit_answers(session_id, token, [{"question_id": "q_026", "selected_option": "A"}])
+    with pytest.raises(ValueError):
+        store.submit_answers(session_id, token, [{"question_id": "q_026", "free_text": "A"}])
     re_updated = store.get_session(session_id)
-    assert re_updated["status"] == "ready_for_confirmation"
-    # Even if count increases to 27, status stays ready_for_confirmation
+    assert re_updated["status"] == "analyzing"
+    assert re_updated['question_count'] == 25
 
 
 def test_budget_wind_down_prompt_levels():
@@ -539,7 +538,7 @@ def test_concurrent_turn_answers_atomic_locking(store):
             store.submit_answers(
                 session_id,
                 token,
-                answers=[{"question_id": "q1", "selected_option": "Option A"}],
+                answers=[{"question_id": "q1", "free_text": "Option A"}],
             )
             return True
         except ValueError:
