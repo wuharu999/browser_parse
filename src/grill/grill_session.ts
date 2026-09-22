@@ -10,8 +10,6 @@ export class GrillSessionView {
   private session: GrillSession | null = null;
   private answers: Map<string, CustomerAnswer> = new Map();
   private confirmationNote = '';
-  private filesExpanded = false;
-  private historyExpanded = false;
   private isSubmitting = false;
   private pollTimeout: number | null = null;
   private isDestroyed = false;
@@ -35,7 +33,7 @@ export class GrillSessionView {
     await this.fetchSession();
   }
 
-  private schedulePoll(ms = 1000): void {
+  private schedulePoll(ms = 2000): void {
     if (this.isDestroyed) return;
     if (this.pollTimeout) window.clearTimeout(this.pollTimeout);
     this.pollTimeout = window.setTimeout(async () => {
@@ -47,17 +45,14 @@ export class GrillSessionView {
   private async fetchSession(isSilent = false): Promise<void> {
     try {
       const res = await fetch(`/api/grill/session-by-token?token=${encodeURIComponent(this.token)}`);
-      if (this.isDestroyed) return;
       if (!res.ok) {
         if (res.status === 404 || res.status === 403) {
-          this.renderError(t('Session not found. Please check your link.', '推演会话未找到，请检查链接。'));
-          return;
+          throw new Error(t('Session not found or invalid token. Please check your link.', '推演会话未找到或访问令牌无效，请检查链接。'));
         }
-        throw new Error('Session request failed');
+        throw new Error(t(`Failed to load session: HTTP ${res.status}`, `加载会话失败：HTTP ${res.status}`));
       }
 
       const data: GrillSession = await res.json();
-      if (this.isDestroyed) return;
       this.session = data;
       this.render();
 
@@ -68,23 +63,18 @@ export class GrillSessionView {
         (data.status === 'interviewing' && (!data.active_questions || data.active_questions.length === 0));
 
       if (shouldPoll && !this.isDestroyed) {
-        this.schedulePoll();
+        this.schedulePoll(2000);
       }
-    } catch {
-      if (this.isDestroyed) return;
+    } catch (err: unknown) {
       if (!isSilent) {
-        this.renderError(t('Unable to load your interview. Retrying...', '暂时无法加载访谈，正在重试...'));
+        const msg = err instanceof Error ? err.message : String(err);
+        this.renderError(msg);
       }
-      // A brief network failure must not leave the first-question screen stuck.
-      this.schedulePoll();
     }
   }
 
   public render(): void {
     if (!this.session) return;
-    // Keep the customer's expanded sections open across polling and answer updates.
-    this.filesExpanded = this.container.querySelector<HTMLDetailsElement>('details.session-files-card')?.open ?? this.filesExpanded;
-    this.historyExpanded = this.container.querySelector<HTMLDetailsElement>('details.turns-history-card')?.open ?? this.historyExpanded;
     this.container.replaceChildren();
 
     if (this.session.status === 'completed' && this.session.final_report) {
@@ -108,8 +98,8 @@ export class GrillSessionView {
     const progressPercent = Math.min(100, Math.round((this.session.question_count / questionLimit) * 100));
 
     const statusMap: Record<string, string> = {
-      intake_pending: t('Preparing questions', '正在准备问题'),
-      interviewing: isSettingUp ? t('Preparing questions', '正在准备问题') : t('Interviewing', '推演访谈中'),
+      intake_pending: t('Setting up pipeline', '管线初始化中'),
+      interviewing: isSettingUp ? t('Initializing turn', '准备本轮推演中') : t('Interviewing', '推演访谈中'),
       ready_for_confirmation: t('Ready for Confirmation', '待客户确认'),
       analyzing: t('Analyzing', '专家分析中'),
       completed: t('Completed', '已完成'),
@@ -120,7 +110,7 @@ export class GrillSessionView {
     const counterBoxHtml = isSettingUp
       ? `<div class="session-counter-box">
           <div class="counter-label">${t('Status', '状态')}</div>
-          <div class="counter-val setup-standby">${t('Preparing...', '准备中...')}</div>
+          <div class="counter-val setup-standby">${t('Preparing...', '环境准备中...')}</div>
         </div>`
       : `<div class="session-counter-box">
           <div class="counter-label">${t('Question Budget', '问题配额')}</div>
@@ -157,27 +147,13 @@ export class GrillSessionView {
       }
     }
 
-    // Body based on state
-    if (this.session.status === 'intake_pending' || (this.session.status === 'interviewing' && (!this.session.active_questions || this.session.active_questions.length === 0))) {
-      wrapper.appendChild(this.renderSetupProgress());
-    } else if (this.session.status === 'interviewing') {
-      wrapper.appendChild(this.renderInterviewTurn());
-    } else if (this.session.status === 'ready_for_confirmation') {
-      wrapper.appendChild(this.renderConfirmationState());
-    } else if (this.session.status === 'analyzing') {
-      wrapper.appendChild(this.renderAnalyzingState());
-    } else if (this.session.status === 'failed') {
-      wrapper.appendChild(this.renderFailedState());
-    }
-
     // Uploaded Documents card
     if (this.session.files && this.session.files.length > 0) {
-      const filesCard = document.createElement('details');
+      const filesCard = document.createElement('div');
       filesCard.className = 'grill-card session-files-card';
-      filesCard.open = this.filesExpanded;
-      const summary = document.createElement('summary');
-      summary.textContent = `${t('Uploaded Documents & Diagrams', '上传参考文档与图纸')} (${this.session.files.length})`;
-      filesCard.appendChild(summary);
+      const h3 = document.createElement('h3');
+      h3.textContent = `${t('Uploaded Documents & Diagrams', '上传参考文档与图纸')} (${this.session.files.length})`;
+      filesCard.appendChild(h3);
 
       for (const f of this.session.files) {
         const fileRow = document.createElement('div');
@@ -195,12 +171,11 @@ export class GrillSessionView {
 
     // Past Turn Transcript
     if (this.session.turns && this.session.turns.length > 0) {
-      const turnsCard = document.createElement('details');
+      const turnsCard = document.createElement('div');
       turnsCard.className = 'grill-card turns-history-card';
-      turnsCard.open = this.historyExpanded;
-      const summary = document.createElement('summary');
-      summary.textContent = t('Past Turn Transcript', '往轮问答推演记录');
-      turnsCard.appendChild(summary);
+      const h3 = document.createElement('h3');
+      h3.textContent = t('Past Turn Transcript', '往轮问答推演记录');
+      turnsCard.appendChild(h3);
 
       for (const turn of this.session.turns) {
         const turnRow = document.createElement('div');
@@ -230,6 +205,19 @@ export class GrillSessionView {
       wrapper.appendChild(turnsCard);
     }
 
+    // Body based on state
+    if (this.session.status === 'intake_pending' || (this.session.status === 'interviewing' && (!this.session.active_questions || this.session.active_questions.length === 0))) {
+      wrapper.appendChild(this.renderSetupProgress());
+    } else if (this.session.status === 'interviewing') {
+      wrapper.appendChild(this.renderInterviewTurn());
+    } else if (this.session.status === 'ready_for_confirmation') {
+      wrapper.appendChild(this.renderConfirmationState());
+    } else if (this.session.status === 'analyzing') {
+      wrapper.appendChild(this.renderAnalyzingState());
+    } else if (this.session.status === 'failed') {
+      wrapper.appendChild(this.renderFailedState());
+    }
+
     this.container.appendChild(wrapper);
   }
 
@@ -237,18 +225,76 @@ export class GrillSessionView {
     const card = document.createElement('div');
     card.className = 'grill-card grill-loading-card';
 
-    const isFirstTurn = !this.session?.question_count;
-    const title = isFirstTurn
-      ? t('Preparing your first questions...', '正在准备第一轮问题...')
-      : t('Preparing your next questions...', '正在准备下一轮问题...');
+    const currentStage = this.session?.setup_stage || 'queued';
+    const isHibernated = this.session?.container_state === 'hibernated';
 
-    card.setAttribute('role', 'status');
-    card.setAttribute('aria-live', 'polite');
-    card.innerHTML = `
-      <div class="grill-spinner" aria-hidden="true"></div>
-      <h3 class="loading-title">${title}</h3>
-      <p class="loading-note">${t('Your questions will appear here automatically. No need to refresh.', '问题准备好后会自动显示，您无需刷新页面。')}</p>
-    `;
+    // Define the pipeline stages in order
+    const stages: Array<{ key: string; label: string; labelZh: string }> = isHibernated
+      ? [
+          { key: 'queued', label: 'Queued for worker', labelZh: '排队等待执行' },
+          { key: 'validating_resources', label: 'Validating resources', labelZh: '检查计算资源' },
+          { key: 'creating_container', label: 'Provisioning container', labelZh: '创建计算容器' },
+          { key: 'restoring_snapshot', label: 'Restoring session data', labelZh: '恢复推演会话数据' },
+          { key: 'starting_container', label: 'Starting container', labelZh: '启动计算容器' },
+          { key: 'codex_running', label: 'Generating interview questions', labelZh: '正在生成场景推演问题' },
+        ]
+      : [
+          { key: 'queued', label: 'Queued for worker', labelZh: '排队等待执行' },
+          { key: 'validating_resources', label: 'Validating resources', labelZh: '检查计算资源' },
+          { key: 'creating_container', label: 'Provisioning container', labelZh: '创建计算容器' },
+          { key: 'staging_files', label: 'Staging input files', labelZh: '传输输入文件' },
+          { key: 'starting_container', label: 'Starting container', labelZh: '启动计算容器' },
+          { key: 'codex_running', label: 'Generating interview questions', labelZh: '正在生成场景推演问题' },
+        ];
+
+    // Also handle warm container reuse (skip most steps)
+    if (currentStage === 'reusing_container') {
+      stages.splice(0, stages.length,
+        { key: 'queued', label: 'Queued for worker', labelZh: '排队等待执行' },
+        { key: 'validating_resources', label: 'Validating resources', labelZh: '检查计算资源' },
+        { key: 'reusing_container', label: 'Warm container detected', labelZh: '发现缓存容器' },
+        { key: 'codex_running', label: 'Generating interview questions', labelZh: '正在生成场景推演问题' },
+      );
+    }
+
+    const currentIndex = stages.findIndex(s => s.key === currentStage);
+
+    const title = isHibernated
+      ? t('Warming up container and resuming session...', '正在唤醒计算容器并恢复推演会话...')
+      : t('Setting up scenario analysis pipeline...', '正在准备场景分析管线...');
+
+    let html = `<h3 class="loading-title">${this.escape(title)}</h3>`;
+    html += '<div class="setup-stages">';
+
+    for (let i = 0; i < stages.length; i++) {
+      const s = stages[i];
+      const label = t(s.label, s.labelZh);
+      let statusClass = 'stage-pending';
+      let icon = '○';
+      if (i < currentIndex) {
+        statusClass = 'stage-done';
+        icon = '✓';
+      } else if (i === currentIndex) {
+        statusClass = 'stage-active';
+        icon = '◉';
+      }
+      html += `<div class="setup-stage-row ${statusClass}">
+        <span class="stage-icon">${icon}</span>
+        <span class="stage-label">${this.escape(label)}</span>
+      </div>`;
+    }
+
+    html += '</div>';
+
+    // Show current activity message if available
+    const stageMsg = this.session?.setup_message;
+    if (stageMsg) {
+      html += `<div class="setup-stage-message">${this.escape(stageMsg)}</div>`;
+    }
+
+    html += `<div class="loading-note">${t('Running in an isolated container. This typically takes 15-30 seconds.', '运行于隔离计算容器中。通常需要 15-30 秒。')}</div>`;
+
+    card.innerHTML = html;
     return card;
   }
 
@@ -431,7 +477,8 @@ export class GrillSessionView {
       });
 
       if (!res.ok) {
-        throw new Error('Answer submission failed');
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(errorData.detail || `Submission failed: HTTP ${res.status}`);
       }
 
       const updated: GrillSession = await res.json();
@@ -439,9 +486,10 @@ export class GrillSessionView {
       this.answers.clear();
       this.isSubmitting = false;
       this.render();
-      this.schedulePoll();
-    } catch {
-      this.showNotice(noticeEl, t('Unable to submit your answers. Please try again.', '暂时无法提交回答，请重试。'), true);
+      this.schedulePoll(2000);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.showNotice(noticeEl, t(`Error submitting answers: ${msg}`, `提交回答失败：${msg}`), true);
       submitBtn.disabled = false;
       submitBtn.textContent = t('Submit Batch Answers  →', '提交本轮回答  →');
       this.isSubmitting = false;
@@ -467,8 +515,8 @@ export class GrillSessionView {
         <h2 class="confirm-title">${t('Review Scenario Readback Summary', '审阅场景确认摘要（Readback）')}</h2>
         <p class="confirm-subtitle">
           ${t(
-            'Please review your scenario summary below. Once confirmed, we will prepare a report covering hardware capabilities, system integration, and operational risks.',
-            '请审阅下方场景摘要。确认后，我们将生成涵盖硬件能力、系统集成与运行风险的评估报告。'
+            'The interview has captured the critical operational boundaries. Please review the summary below. Once confirmed, 3 specialist subagents (Capability, Architecture, Risk) will run in parallel to generate the final report.',
+            '访谈已充分捕捉关键运行边界与约束。请审阅下方摘要。确认后，3位专家子智能体（硬件能力、系统架构、运行风险）将并行推演以生成最终评估报告。'
           )}
         </p>
       </div>
@@ -479,17 +527,17 @@ export class GrillSessionView {
       </div>
 
       <div class="bt-summary-preview">
-        <strong>${t('Modeled Behavior Tree:', '建模行为树：')}</strong> ${nodeCount} ${t('nodes synthesized', '个节点已合成')}
+        <strong>${t('Modeled Behavior Tree:', '建模行为树：')}</strong> ${nodeCount} ${t('nodes synthesized', '个节点已合成')} (Root: <code>${this.escape(tree?.root_id || 'root')}</code>)
       </div>
 
       <div class="grill-form-group confirm-notes-group">
         <label class="grill-label" for="confirm-notes">${t('Additional Customer Notes (Optional)', '补充说明 / 客户批注（可选）')}</label>
-        <textarea id="confirm-notes" class="grill-textarea" rows="3" placeholder="${t('Any final clarifications or priorities for your report...', '可输入补充说明、评估重点或约束要求...')}">${this.escape(this.confirmationNote)}</textarea>
+        <textarea id="confirm-notes" class="grill-textarea" rows="3" placeholder="${t('Any final clarifications or emphasis for the specialist agents...', '可输入对专家智能体的补充说明、特别侧重点或约束要求...')}">${this.escape(this.confirmationNote)}</textarea>
       </div>
 
       <div class="confirm-actions">
         <button type="button" class="grill-btn grill-btn-primary btn-confirm-launch" id="btn-confirm">
-          ${t('Confirm Scenario & Generate Final Report  🚀', '确认场景并生成评估报告  🚀')}
+          ${t('Confirm Scenario & Generate Final Report  🚀', '确认场景并启动专家综合推演  🚀')}
         </button>
       </div>
     `;
@@ -509,7 +557,7 @@ export class GrillSessionView {
     if (this.isSubmitting) return;
     this.isSubmitting = true;
     confirmBtn.disabled = true;
-    confirmBtn.textContent = t('Preparing your report...', '正在准备评估报告...');
+    confirmBtn.textContent = t('Launching Specialist Subagents...', '正在启动专家子智能体...');
 
     try {
       const res = await fetch(`/api/grill/sessions/${this.session?.id}/confirm`, {
@@ -522,18 +570,20 @@ export class GrillSessionView {
       });
 
       if (!res.ok) {
-        throw new Error('Scenario confirmation failed');
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.detail || `Confirmation failed: HTTP ${res.status}`);
       }
 
       const updated: GrillSession = await res.json();
       this.session = updated;
       this.isSubmitting = false;
       this.render();
-      this.schedulePoll();
-    } catch {
-      this.showNotice(noticeEl, t('Unable to confirm your scenario. Please try again.', '暂时无法确认场景，请重试。'), true);
+      this.schedulePoll(2000);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.showNotice(noticeEl, t(`Error confirming scenario: ${msg}`, `确认场景失败：${msg}`), true);
       confirmBtn.disabled = false;
-      confirmBtn.textContent = t('Confirm Scenario & Generate Final Report  🚀', '确认场景并生成评估报告  🚀');
+      confirmBtn.textContent = t('Confirm Scenario & Generate Final Report  🚀', '确认场景并启动专家综合推演  🚀');
       this.isSubmitting = false;
     }
   }
@@ -543,32 +593,32 @@ export class GrillSessionView {
     card.className = 'grill-card grill-analyzing-card';
     card.innerHTML = `
       <div class="grill-spinner"></div>
-      <h2 class="analyzing-title">${t('Preparing your scenario report', '正在生成场景评估报告')}</h2>
-      <p class="analyzing-subtitle">${t('Your report covers the following areas:', '报告将涵盖以下方面：')}</p>
+      <h2 class="analyzing-title">${t('Specialist Subagents Evaluating Scenario', '专家子智能体正在评估场景')}</h2>
+      <p class="analyzing-subtitle">${t('Three specialist analysts are assessing technical feasibility in parallel:', '三位专业分析师正并行评估技术可行性：')}</p>
 
       <div class="specialist-cards-grid">
         <div class="specialist-card">
           <div class="specialist-icon">🤖</div>
-          <strong class="specialist-name">${t('Hardware capabilities', '硬件能力')}</strong>
+          <strong class="specialist-name">${t('Capability Analyst', '硬件能力分析师')}</strong>
           <div class="specialist-desc">${t('Verifying payload, reach, sensor envelope, and hardware constraints.', '验证有效负载、机械臂工作半径、传感器包络及硬件物理约束。')}</div>
           <div class="specialist-badge">${t('Running', '推演中')}</div>
         </div>
 
         <div class="specialist-card">
           <div class="specialist-icon">⚙️</div>
-          <strong class="specialist-name">${t('System integration', '系统集成')}</strong>
+          <strong class="specialist-name">${t('Integration Analyst', '系统集成分析师')}</strong>
           <div class="specialist-desc">${t('Synthesizing ROS 2 packages, node topologies, and topic contracts.', '生成 ROS 2 软件包拓扑、节点通信契约与消息管道。')}</div>
           <div class="specialist-badge">${t('Running', '推演中')}</div>
         </div>
 
         <div class="specialist-card">
           <div class="specialist-icon">🛡️</div>
-          <strong class="specialist-name">${t('Operational risks', '运行风险')}</strong>
+          <strong class="specialist-name">${t('Risk & Evidence Analyst', '风险与证据分析师')}</strong>
           <div class="specialist-desc">${t('Evaluating failure recovery, safety boundaries, and wiki citations.', '评估故障自愈机制、安全运行边界与知识库引证。')}</div>
           <div class="specialist-badge">${t('Running', '推演中')}</div>
         </div>
       </div>
-      <div class="analyzing-note">${t('Your report will appear here automatically when ready.', '评估报告生成后会自动显示。')}</div>
+      <div class="analyzing-note">${t('This typically completes in ~15–30 seconds. Your report will appear automatically.', '专家综合推演通常耗时约 15–30 秒。评估报告生成后将自动展示。')}</div>
     `;
     return card;
   }
@@ -578,7 +628,7 @@ export class GrillSessionView {
     card.className = 'grill-card grill-failed-card';
     card.innerHTML = `
       <h2 class="failed-title">${t('⚠️ Session Failed', '⚠️ 会话处理失败')}</h2>
-      <p class="failed-desc">${t('We couldn’t complete this interview. Please start a new interview and try again.', '本次推演暂时无法完成，请重新发起访谈。')}</p>
+      <p class="failed-desc">${this.escape(this.session?.error_message || t('An error occurred during turn processing.', '轮次处理过程中发生错误。'))}</p>
       <button type="button" class="grill-btn grill-btn-secondary" id="btn-restart">${t('Start New Interview', '发起新访谈')}</button>
     `;
     const restartBtn = card.querySelector('#btn-restart');

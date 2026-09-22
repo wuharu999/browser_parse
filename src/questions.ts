@@ -127,9 +127,7 @@ export class QuestionsPanel {
     } else {
       this.context.textContent = `${this.contextMode === 'report_only' ? t('Report-only context', '仅报告上下文') : t('Report + investigation notes', '报告 + 调查笔记')} · ${t('Shared conversation · saved findings only', '共享对话 · 仅依据已保存的分析')}`;
     }
-    const unavailable = isGrill ? t('Q&A is temporarily unavailable. Please try again later.', '问答暂时不可用，请稍后重试。') : t('Q&A is unavailable until the server is configured.', '服务端配置完成后即可使用问答。');
-    const ready = isGrill ? t('Ask a follow-up question about your report.', '您可以继续提问，进一步了解评估报告。') : t('No daily question limit. Questions do not use analysis slots.', '提问次数不限，不消耗分析额度。');
-    this.status.textContent = this.error || (!this.loaded ? t('Loading questions…', '正在加载问答…') : !this.available ? unavailable : this.streaming || this.active ? t('An answer is being written…', '正在生成回答…') : ready);
+    this.status.textContent = this.error || (!this.loaded ? t('Loading questions…', '正在加载问答…') : !this.available ? t('Q&A is unavailable until the server is configured.', '服务端配置完成后即可使用问答。') : this.streaming || this.active ? t('An answer is being written…', '正在生成回答…') : t('No daily question limit. Questions do not use analysis slots.', '提问次数不限，不消耗分析额度。'));
     for (const retry of this.transcript.querySelectorAll<HTMLButtonElement>('button')) retry.disabled = !this.available || this.loading || this.streaming || !!this.active;
   }
 
